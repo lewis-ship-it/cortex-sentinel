@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  # 1. REDIS: The Message Broker
+  redis:
+    image: redis:8.0-alpine
+    container_name: sentinel_redis
+    ports:
+      - "6379:6379"
+    restart: always
+
+  # 2. API: The Entry Point
+  api:
+    build: .
+    container_name: sentinel_api
+    command: fastapi run api/main.py --port 8000
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    depends_on:
+      - redis
+    restart: always
+
+  # 3. WORKER: The "Heavy Lifter"
+  worker:
+    build: .
+    container_name: sentinel_worker
+    command: python workers/worker.py
+    env_file:
+      - .env
+    depends_on:
+      - redis
+    restart: always
+
+  # 4. DASHBOARD: The UI
+  dashboard:
+    build: .
+    container_name: sentinel_dashboard
+    command: streamlit run app/dashboard.py --server.port 8501
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    depends_on:
+      - api
+    restart: always

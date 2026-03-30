@@ -1,8 +1,20 @@
+# Web Framework & API
+fastapi[all]
+uvicorn
+python-dotenv
+
+# Dashboard & UI
+streamlit
+pandas
+plotly
+
+# Networking & Scraper
 requests
+httpx
 beautifulsoup4
 validators
 urllib3
+
+# Database & Queue
 supabase
-python-dotenv
-streamlit
-requests
+redis

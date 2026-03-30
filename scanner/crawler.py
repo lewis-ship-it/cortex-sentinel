@@ -1,34 +1,54 @@
-import requests
+import httpx
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 
 class Crawler:
-    def __init__(self, base_url):
+    def __init__(self, base_url, max_pages=30):
         self.base_url = base_url
-        self.visited_urls = set()
-        self.discovered_endpoints = set()
+        self.visited = set()
+        self.endpoints = set()
+        self.forms = []
+        self.max_pages = max_pages
 
     def is_internal(self, url):
         return urlparse(url).netloc == urlparse(self.base_url).netloc
 
-    def crawl(self, url=None):
+    async def crawl(self, client, url=None):
         if url is None:
             url = self.base_url
-        
-        if url in self.visited_urls or len(self.visited_urls) > 50: # Limit for MVP
+
+        if url in self.visited or len(self.visited) >= self.max_pages:
             return
 
-        self.visited_urls.add(url)
-        try:
-            response = requests.get(url, timeout=5)
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
-            for link in soup.find_all('a', href=True):
-                full_url = urljoin(self.base_url, link['href'])
-                if self.is_internal(full_url) and full_url not in self.visited_urls:
-                    self.discovered_endpoints.add(full_url)
-                    self.crawl(full_url) # Recursive discovery
-        except Exception as e:
-            print(f"Error crawling {url}: {e}")
+        self.visited.add(url)
 
-        return self.discovered_endpoints
+        try:
+            res = await client.get(url)
+            soup = BeautifulSoup(res.text, "html.parser")
+
+            for link in soup.find_all("a", href=True):
+                full = urljoin(self.base_url, link["href"])
+                if self.is_internal(full):
+                    self.endpoints.add(full)
+                    await self.crawl(client, full)
+
+            for form in soup.find_all("form"):
+                action = form.get("action") or url
+                method = form.get("method", "get").lower()
+
+                inputs = [
+                    inp.get("name")
+                    for inp in form.find_all(["input", "textarea"])
+                    if inp.get("name")
+                ]
+
+                self.forms.append({
+                    "url": urljoin(self.base_url, action),
+                    "method": method,
+                    "inputs": inputs
+                })
+
+        except:
+            pass
+
+        return self.endpoints, self.forms

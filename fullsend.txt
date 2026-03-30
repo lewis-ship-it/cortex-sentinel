@@ -1,0 +1,669 @@
+
+
+===== core\config.py =====
+
+
+
+===== core\database.py =====
+
+import os
+from supabase import create_client
+from dotenv import load_dotenv
+
+load_dotenv()
+
+class DatabaseManager:
+    def __init__(self):
+        url = os.getenv("SUPABASE_URL")
+        key = os.getenv("SUPABASE_KEY")
+
+        if not url or not key:
+            raise Exception("Missing Supabase credentials")
+
+        self.db = create_client(url, key)
+
+    # JOBS
+    def insert_job(self, job_id, url, status, progress):
+        self.db.table("jobs").insert({
+            "id": job_id,
+            "url": url,
+            "status": status,
+            "progress": progress
+        }).execute()
+
+    def update_job(self, job_id, status=None, progress=None):
+        data = {}
+        if status: data["status"] = status
+        if progress is not None: data["progress"] = progress
+
+        self.db.table("jobs").update(data).eq("id", job_id).execute()
+
+    def get_job(self, job_id):
+        res = self.db.table("jobs").select("*").eq("id", job_id).execute()
+        return res.data[0] if res.data else None
+
+    # RESULTS
+    def save_vulnerabilities(self, job_id, vulns):
+        for v in vulns:
+            self.db.table("vulnerabilities").insert({
+                "job_id": job_id,
+                "type": v["type"],
+                "severity": v["severity"],
+                "endpoint": v.get("url"),
+                "payload": v.get("payload")
+            }).execute()
+
+    def get_results(self, job_id):
+        res = self.db.table("vulnerabilities").select("*").eq("job_id", job_id).execute()
+        return res.data
+
+===== core\job_manager.py =====
+
+from core.database import DatabaseManager
+
+db = DatabaseManager()
+
+def create_job(job_id, url):
+    db.insert_job(job_id, url, "queued", 0)
+
+def update_job(job_id, status=None, progress=None):
+    db.update_job(job_id, status, progress)
+
+def get_job(job_id):
+    return db.get_job(job_id)
+
+===== core\rate_limiter.py =====
+
+import time
+from urllib.parse import urlparse
+
+last_request = {}
+
+def allow_request(url, delay=1):
+    domain = urlparse(url).netloc
+    now = time.time()
+
+    if domain in last_request and now - last_request[domain] < delay:
+        return False
+
+    last_request[domain] = now
+    return True
+
+===== scanner\active_engine.py =====
+
+import asyncio
+import httpx
+import time
+
+from scanner.crawler import Crawler
+from scanner.param_engine import ParamEngine
+from scanner.detector import Detector
+from core.rate_limiter import allow_request
+
+class ActiveScanner:
+    def __init__(self):
+        self.param_engine = ParamEngine()
+        self.detector = Detector()
+
+        self.sql_payloads = [
+            ("' OR '1'='1", "error"),
+            ("'; WAITFOR DELAY '0:0:5'--", "time")
+        ]
+
+        self.xss_payloads = [
+            "<script>alert(1)</script>",
+            "<img src=x onerror=alert(1)>"
+        ]
+
+    async def scan(self, base_url):
+        findings = []
+
+        async with httpx.AsyncClient(timeout=10) as client:
+            crawler = Crawler(base_url)
+            endpoints, forms = await crawler.crawl(client)
+
+            tasks = []
+
+            for url in endpoints:
+                params = self.param_engine.extract_params(url)
+
+                for param in params:
+                    for payload, mode in self.sql_payloads:
+                        tasks.append(self.test_sqli(client, url, param, payload, mode))
+
+                    for payload in self.xss_payloads:
+                        tasks.append(self.test_xss(client, url, param, payload))
+
+            for form in forms:
+                tasks.append(self.test_form(client, form))
+
+            results = await asyncio.gather(*tasks)
+
+            findings = [r for r in results if r]
+
+        return findings
+
+    async def test_sqli(self, client, url, param, payload, mode):
+        if not allow_request(url):
+            return None
+
+        try:
+            baseline = await client.get(url)
+            start = time.time()
+
+            test_url = self.param_engine.inject_payload(url, param, payload)
+            res = await client.get(test_url)
+
+            duration = time.time() - start
+
+            if self.detector.detect_sqli(res.text, baseline.text, duration, mode):
+                return {
+                    "type": "SQL Injection",
+                    "url": test_url,
+                    "payload": payload,
+                    "severity": "Critical"
+                }
+        except:
+            return None
+
+    async def test_xss(self, client, url, param, payload):
+        if not allow_request(url):
+            return None
+
+        try:
+            test_url = self.param_engine.inject_payload(url, param, payload)
+            res = await client.get(test_url)
+
+            if self.detector.detect_xss(res.text, payload):
+                return {
+                    "type": "XSS",
+                    "url": test_url,
+                    "payload": payload,
+                    "severity": "High"
+                }
+        except:
+            return None
+
+    async def test_form(self, client, form):
+        try:
+            data = {i: "test" for i in form["inputs"]}
+
+            if form["method"] == "post":
+                res = await client.post(form["url"], data=data)
+            else:
+                res = await client.get(form["url"], params=data)
+
+            if "error" in res.text.lower():
+                return {
+                    "type": "Form Issue",
+                    "url": form["url"],
+                    "severity": "Medium"
+                }
+        except:
+            return None
+
+===== scanner\crawler.py =====
+
+import httpx
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse
+
+class Crawler:
+    def __init__(self, base_url, max_pages=30):
+        self.base_url = base_url
+        self.visited = set()
+        self.endpoints = set()
+        self.forms = []
+        self.max_pages = max_pages
+
+    def is_internal(self, url):
+        return urlparse(url).netloc == urlparse(self.base_url).netloc
+
+    async def crawl(self, client, url=None):
+        if url is None:
+            url = self.base_url
+
+        if url in self.visited or len(self.visited) >= self.max_pages:
+            return
+
+        self.visited.add(url)
+
+        try:
+            res = await client.get(url)
+            soup = BeautifulSoup(res.text, "html.parser")
+
+            for link in soup.find_all("a", href=True):
+                full = urljoin(self.base_url, link["href"])
+                if self.is_internal(full):
+                    self.endpoints.add(full)
+                    await self.crawl(client, full)
+
+            for form in soup.find_all("form"):
+                action = form.get("action") or url
+                method = form.get("method", "get").lower()
+
+                inputs = [
+                    inp.get("name")
+                    for inp in form.find_all(["input", "textarea"])
+                    if inp.get("name")
+                ]
+
+                self.forms.append({
+                    "url": urljoin(self.base_url, action),
+                    "method": method,
+                    "inputs": inputs
+                })
+
+        except:
+            pass
+
+        return self.endpoints, self.forms
+
+===== scanner\detector.py =====
+
+class Detector:
+    def detect_sqli(self, text, baseline, duration, mode):
+        if mode == "time" and duration > 4:
+            return True
+        if "sql" in text.lower() and text != baseline:
+            return True
+        return False
+
+    def detect_xss(self, text, payload):
+        return payload in text
+
+===== scanner\param_engine.py =====
+
+from urllib.parse import urlparse, parse_qs
+
+class ParamEngine:
+    def extract_params(self, url):
+        parsed = urlparse(url)
+        return list(parse_qs(parsed.query).keys())
+
+    def inject_payload(self, url, param, payload):
+        if "?" not in url:
+            return f"{url}?{param}={payload}"
+        return f"{url}&{param}={payload}"
+
+===== scanner\safety.py =====
+
+import requests
+import ssl
+import socket
+
+class SafetyAuditor:
+    def __init__(self, url):
+        self.url = url
+        self.hostname = urlparse(url).netloc
+
+    def audit_headers(self):
+        # Security Checks: Security Headers [cite: 9]
+        required_headers = [
+            "Content-Security-Policy", 
+            "Strict-Transport-Security", 
+            "X-Frame-Options"
+        ]
+        try:
+            res = requests.get(self.url, timeout=5)
+            report = {h: res.headers.get(h, "MISSING") for h in required_headers}
+            return report
+        except Exception as e:
+            return {"error": str(e)}
+
+    def check_ssl(self):
+        # Security Checks: SSL/TLS Issues [cite: 9]
+        try:
+            context = ssl.create_default_context()
+            with socket.create_connection((self.hostname, 443), timeout=5) as sock:
+                with context.wrap_socket(sock, server_hostname=self.hostname) as ssock:
+                    cert = ssock.getpeercert()
+                    return {"status": "Valid", "issuer": cert.get('issuer')}
+        except Exception as e:
+            return {"status": "Issue Detected", "details": str(e)}
+
+===== scanner\validator.py =====
+
+
+
+===== scanner\__innit__.py =====
+
+
+
+===== app\dashboard.py =====
+
+import streamlit as st
+import requests
+import pandas as pd
+import time
+
+# CONFIG
+API_BASE = "http://localhost:8000"
+API_KEY = "test-key-123"  # change this in production
+
+HEADERS = {
+    "x-api-key": API_KEY,
+    "Content-Type": "application/json"
+}
+
+st.set_page_config(page_title="Cortex Sentinel", layout="wide")
+
+st.title("🛡️ Cortex Sentinel")
+st.caption("Production Security Scanner Dashboard")
+
+# SIDEBAR
+st.sidebar.header("Scan Configuration")
+
+target_url = st.sidebar.text_input(
+    "Target URL",
+    "http://testphp.vulnweb.com"
+)
+
+scan_mode = st.sidebar.selectbox(
+    "Scan Mode",
+    ["fast", "deep"]
+)
+
+start_scan = st.sidebar.button("🚀 Start Scan")
+load_report = st.sidebar.button("📂 Load Last Report")
+
+# -----------------------------
+# START SCAN
+# -----------------------------
+if start_scan:
+    with st.spinner("Submitting scan job..."):
+        try:
+            res = requests.post(
+                f"{API_BASE}/scan",
+                json={"url": target_url, "mode": scan_mode},
+                headers=HEADERS,
+                timeout=10
+            )
+
+            data = res.json()
+            job_id = data.get("job_id")
+
+            if not job_id:
+                st.error("Failed to create job")
+                st.stop()
+
+            st.success(f"Job queued: {job_id}")
+
+        except Exception as e:
+            st.error(f"API Error: {e}")
+            st.stop()
+
+    # -----------------------------
+    # TRACK JOB
+    # -----------------------------
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    log_box = st.empty()
+
+    logs = []
+
+    def log(msg):
+        logs.append(msg)
+        log_box.text("\n".join(logs[-10:]))
+
+    # POLL LOOP
+    while True:
+        try:
+            job_res = requests.get(
+                f"{API_BASE}/job/{job_id}",
+                headers=HEADERS,
+                timeout=5
+            )
+
+            job_data = job_res.json()
+
+            status = job_data.get("status", "unknown")
+            progress = job_data.get("progress", 0)
+
+            progress_bar.progress(progress)
+            status_text.info(f"Status: {status} ({progress}%)")
+
+            log(f"{time.strftime('%H:%M:%S')} → {status}")
+
+            if status == "done":
+                st.success("Scan complete")
+                break
+
+            if status == "failed":
+                st.error("Scan failed")
+                break
+
+            time.sleep(2)
+
+        except Exception as e:
+            st.error(f"Tracking error: {e}")
+            break
+
+    # -----------------------------
+    # FETCH RESULTS
+    # -----------------------------
+    try:
+        result_res = requests.get(
+            f"{API_BASE}/result/{target_url}",
+            headers=HEADERS
+        )
+
+        result_data = result_res.json()
+
+        vulns = result_data.get("vulnerabilities", [])
+
+        st.divider()
+        st.subheader("📊 Scan Results")
+
+        if vulns:
+            df = pd.DataFrame(vulns)
+
+            # Metrics
+            col1, col2, col3 = st.columns(3)
+
+            col1.metric("Critical", len(df[df["severity"] == "Critical"]))
+            col2.metric("High", len(df[df["severity"] == "High"]))
+            col3.metric("Medium", len(df[df["severity"] == "Medium"]))
+
+            st.divider()
+
+            st.subheader("🔎 Detailed Findings")
+            st.dataframe(df, use_container_width=True)
+
+        else:
+            st.success("No vulnerabilities found")
+
+    except Exception as e:
+        st.error(f"Failed to fetch results: {e}")
+
+
+# -----------------------------
+# LOAD PREVIOUS REPORT
+# -----------------------------
+if load_report:
+    with st.spinner("Loading report..."):
+        try:
+            res = requests.get(
+                f"{API_BASE}/result/{target_url}",
+                headers=HEADERS
+            )
+
+            data = res.json()
+
+            if "status" in data and data["status"] == "not_found":
+                st.error("No previous scan found")
+                st.stop()
+
+            st.success(f"Loaded report for {target_url}")
+
+            score = data.get("severity_score", 0)
+
+            # GRADE SYSTEM
+            if score >= 9:
+                grade = "F (Critical)"
+            elif score >= 7:
+                grade = "D (High Risk)"
+            elif score >= 4:
+                grade = "C (Moderate)"
+            elif score > 0:
+                grade = "B (Low Risk)"
+            else:
+                grade = "A (Secure)"
+
+            st.metric("Security Grade", grade)
+
+            st.divider()
+
+            vulns = data.get("vulnerabilities", [])
+
+            if vulns:
+                df = pd.DataFrame(vulns)
+                st.dataframe(df, use_container_width=True)
+            else:
+                st.success("No vulnerabilities recorded")
+
+        except Exception as e:
+            st.error(f"Error loading report: {e}")
+
+===== api\auth.py =====
+
+import uuid
+import hashlib
+from fastapi import APIRouter, HTTPException
+from core.database import DatabaseManager
+
+router = APIRouter()
+db = DatabaseManager()
+
+def hash_password(pw):
+    return hashlib.sha256(pw.encode()).hexdigest()
+
+def generate_api_key():
+    return str(uuid.uuid4())
+
+@router.post("/signup")
+def signup(email: str, password: str):
+    user_id = str(uuid.uuid4())
+
+    db.db.table("users").insert({
+        "id": user_id,
+        "email": email,
+        "password_hash": hash_password(password),
+        "api_key": generate_api_key(),
+        "plan": "free"
+    }).execute()
+
+    return {"message": "User created"}
+
+@router.post("/login")
+def login(email: str, password: str):
+    res = db.db.table("users").select("*").eq("email", email).execute()
+
+    if not res.data:
+        raise HTTPException(404, "User not found")
+
+    user = res.data[0]
+
+    if user["password_hash"] != hash_password(password):
+        raise HTTPException(403, "Invalid password")
+
+    return {
+        "api_key": user["api_key"],
+        "user_id": user["id"]
+    }
+
+===== api\main.py =====
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+import uuid
+
+from queue.redis_queue import enqueue_scan
+from core.job_manager import create_job, get_job
+from core.database import DatabaseManager
+
+app = FastAPI()
+db = DatabaseManager()
+
+API_KEYS = {"test-key-123"}
+
+@app.middleware("http")
+async def auth(request: Request, call_next):
+    if request.url.path.startswith("/auth"):
+        return await call_next(request)
+    key = request.headers.get("x-api-key")
+    if key not in API_KEYS:
+        return JSONResponse(status_code=403, content={"error": "Unauthorized"})
+    return await call_next(request)
+
+@app.post("/scan")
+def scan(req: dict):
+    job_id = str(uuid.uuid4())
+    create_job(job_id, req["url"])
+    enqueue_scan({
+        "job_id": job_id,
+        "url": req["url"]
+    })
+    return {"job_id": job_id}
+
+@app.get("/job/{job_id}")
+def job(job_id: str):
+    return get_job(job_id)
+
+@app.get("/result/{job_id}")
+def result(job_id: str):
+    vulns = db.get_results(job_id)
+    return {"vulnerabilities": vulns}
+
+
+===== queue\redis_scanner.py =====
+
+import redis
+import json
+import os
+
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+QUEUE_NAME = "scan_queue"
+
+r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+
+def enqueue_scan(job):
+    r.rpush(QUEUE_NAME, json.dumps(job))
+
+def dequeue_scan():
+    _, job = r.blpop(QUEUE_NAME)
+    return json.loads(job)
+
+===== workers\worker.py =====
+
+import asyncio
+from queue.redis_queue import dequeue_scan
+from scanner.active_engine import ActiveScanner
+from core.database import DatabaseManager
+from core.job_manager import update_job
+
+scanner = ActiveScanner()
+db = DatabaseManager()
+
+async def process(job):
+    job_id = job["job_id"]
+    url = job["url"]
+
+    update_job(job_id, "running", 10)
+
+    results = await scanner.scan(url)
+
+    update_job(job_id, "running", 90)
+
+    db.save_vulnerabilities(job_id, results)
+
+    update_job(job_id, "done", 100)
+
+def run():
+    print("🚀 Worker started")
+    while True:
+        job = dequeue_scan()
+        asyncio.run(process(job))
+
+if __name__ == "__main__":
+    run()
