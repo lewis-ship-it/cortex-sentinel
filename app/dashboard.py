@@ -16,53 +16,46 @@ st.title("🛡️ Cortex Sentinel: Security Report")
 
 target_url = st.sidebar.text_input("Enter Target URL", "http://zero.webappsecurity.com")
 
-# 1. LIVE SCAN BUTTON
+# 1. LIVE SCAN LOGIC
 if st.sidebar.button("🚀 Run Live Scan"):
     with st.status(f"Scanning {target_url}...", expanded=True) as status_box:
         def update_status(msg):
             st.write(msg)
         
-        # Trigger the merged scan logic
         findings = scanner.scan_url(target_url, progress_callback=update_status)
         
-        status_box.write("💾 Saving results to database...")
-        db.save_scan(target_url, {}, {}, vulnerabilities=findings)
-        status_box.update(label="Scan Complete!", state="complete", expanded=False)
+        status_box.write("💾 Attempting to save to Supabase...")
+        try:
+            # We send empty dicts for headers/ssl to avoid schema conflicts for now
+            db.save_scan(target_url, {}, {}, vulnerabilities=findings)
+            status_box.update(label="Scan Complete & Saved!", state="complete", expanded=False)
+        except Exception as e:
+            st.error(f"Database Save Failed: {e}")
+            status_box.update(label="Scan Finished (Save Error)", state="error")
     st.rerun()
 
-# 2. FETCH HISTORY BUTTON
+# 2. FETCH HISTORY LOGIC
 if st.sidebar.button("Fetch Latest Report"):
     data = db.get_cached_result(target_url)
     if data:
         st.success(f"Analysis for: {data['url']}")
         
-        # Severity Grade
-        total_score = data.get('severity_score', 0)
-        if total_score >= 9: grade, color = "F (CRITICAL)", "normal"
-        elif total_score >= 7: grade, color = "D (HIGH RISK)", "normal"
-        elif total_score >= 4: grade, color = "C (WARNING)", "off"
-        elif total_score > 0: grade, color = "B (FAIR)", "off"
+        score = data.get('severity_score', 0)
+        # Grade Logic
+        if score >= 9: grade, color = "F (CRITICAL)", "normal"
+        elif score >= 7: grade, color = "D (HIGH)", "normal"
+        elif score > 0: grade, color = "B (FAIR)", "off"
         else: grade, color = "A (SECURE)", "inverse"
 
-        st.metric(label="Safety Grade", value=grade, delta="-Risk Identified" if total_score > 0 else "Safe", delta_color=color)
-
-        col1, col2 = st.columns(2)
-        with col1:
-            st.subheader("🌐 Security Headers")
-            st.json(data.get('headers', {}))
-        with col2:
-            st.subheader("🔒 SSL/TLS Status")
-            ssl = data.get('ssl_info', {})
-            st.info(f"Status: {ssl.get('status', 'Unknown')}")
+        st.metric(label="Safety Grade", value=grade, delta_color=color)
 
         st.divider()
-        st.subheader("🚀 Active Injection Results")
+        st.subheader("🚀 Vulnerability Table")
         vulns = data.get('vulnerabilities', [])
         if vulns:
             df = pd.DataFrame(vulns)
-            df = df[['type', 'severity', 'score', 'description']]
-            st.dataframe(df.style.background_gradient(cmap='Reds', subset=['score']), use_container_width=True)
+            st.dataframe(df, use_container_width=True)
         else:
-            st.success("Target passed all active tests.")
+            st.success("No vulnerabilities found.")
     else:
-        st.error("No scan history found.")
+        st.error("No record found for this URL.")
