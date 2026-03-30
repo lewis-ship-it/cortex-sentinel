@@ -1,5 +1,10 @@
 import streamlit as st
+import sys
+import os
 import pandas as pd
+
+# Add the root directory to the Python path so it can find 'core'
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.database import DatabaseManager
 
 # Initialize Database
