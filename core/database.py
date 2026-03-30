@@ -1,17 +1,32 @@
 import os
+import streamlit as st
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
-load_dotenv() # Loads variables from your .env file
-
 class DatabaseManager:
     def __init__(self):
-        url: str = os.environ.get("SUPABASE_URL")
-        key: str = os.environ.get("SUPABASE_KEY")
+        # 1. Try to get keys from Streamlit Secrets (for Cloud hosting)
+        # Use .get() to avoid errors if the 'secrets' object isn't initialized
+        url = st.secrets.get("SUPABASE_URL")
+        key = st.secrets.get("SUPABASE_KEY")
+
+        # 2. Fallback to local Environment/.env (for local development)
+        if not url or not key:
+            load_dotenv()
+            url = os.environ.get("SUPABASE_URL")
+            key = os.environ.get("SUPABASE_KEY")
+
+        # 3. Validation: Ensure we actually have the credentials
+        if not url or not key:
+            raise ValueError(
+                "Cortex Sentinel Error: Supabase credentials not found. "
+                "Ensure SUPABASE_URL and SUPABASE_KEY are set in Streamlit Secrets or a .env file."
+            )
+
         self.supabase: Client = create_client(url, key)
 
     def get_cached_result(self, target_url):
-        # Implementation of "Cache scan results and avoid re-scanning"
+        """Implementation of 'Cache scan results and avoid re-scanning'"""
         try:
             response = self.supabase.table("scan_results") \
                 .select("*") \
@@ -21,15 +36,19 @@ class DatabaseManager:
                 .execute()
             return response.data[0] if response.data else None
         except Exception as e:
-            print(f"Database Error: {e}")
+            st.error(f"Database Retrieval Error: {e}")
             return None
 
-    def save_scan(self, url, header_data, ssl_data):
-        # Save results for future incremental scanning
+    def save_scan_result(self, url, headers, ssl, vulns=None):
+        """Save results for future incremental scanning and reporting"""
         data = {
             "url": url,
-            "headers": header_data,
-            "ssl_info": ssl_data,
-            "severity_score": 0 # Logic to be added later
+            "headers": headers,
+            "ssl_info": ssl,
+            "vulnerabilities": vulns if vulns else [],
+            "severity_score": 0  # Logic for scoring can be added here later
         }
-        self.supabase.table("scan_results").insert(data).execute()
+        try:
+            self.supabase.table("scan_results").insert(data).execute()
+        except Exception as e:
+            st.error(f"Database Save Error: {e}")
