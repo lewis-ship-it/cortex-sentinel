@@ -1,0 +1,6 @@
+requests
+beautifulsoup4
+validators
+urllib3
+supabase
+python-dotenv
