@@ -3,16 +3,43 @@ import sys
 import os
 import pandas as pd
 
+# Fix pathing for core imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.database import DatabaseManager
+from scanner.active_engine import ActiveScanner
 
 db = DatabaseManager()
+scanner = ActiveScanner()
+
 st.set_page_config(page_title="Cortex Sentinel Dashboard", layout="wide")
 
 st.title("🛡️ Cortex Sentinel: Security Report")
 
-target_url = st.sidebar.text_input("Enter Target URL", "https://example.com")
+# Sidebar Controls
+target_url = st.sidebar.text_input("Enter Target URL", "http://zero.webappsecurity.com")
 
+# NEW: LIVE SCAN BUTTON
+if st.sidebar.button("🚀 Run Live Scan"):
+    # Using st.status to show live progress
+    with st.status(f"Scanning {target_url}...", expanded=True) as status_box:
+        
+        # This function is passed to the scanner to update the UI
+        def update_status(msg):
+            st.write(msg)
+
+        # Run the scan with the callback
+        findings = scanner.scan_url(target_url, status_callback=update_status)
+        
+        # Save to database
+        status_box.write("💾 Saving results to database...")
+        db.save_scan(target_url, {}, {}, vulnerabilities=findings)
+        
+        status_box.update(label="Scan Complete!", state="complete", expanded=False)
+    
+    # Force refresh to show results below
+    st.rerun()
+
+# EXISTING FETCH BUTTON
 if st.sidebar.button("Fetch Latest Report"):
     data = db.get_cached_result(target_url)
 
@@ -20,10 +47,8 @@ if st.sidebar.button("Fetch Latest Report"):
         st.success(f"Analysis for: {data['url']}")
 
         # 1. SECURITY GRADE METRIC
-        # Sum the scores to get a total risk profile
         total_score = data.get('severity_score', 0)
 
-        # Grade Logic
         if total_score >= 9:
             grade, color = "F (CRITICAL)", "normal"
         elif total_score >= 7:
@@ -59,11 +84,11 @@ if st.sidebar.button("Fetch Latest Report"):
 
         if vulns:
             df = pd.DataFrame(vulns)
-            # Reorder columns for better reading
-            df = df[['type', 'severity', 'score', 'description']]
+            # Ensure columns exist before styling
+            cols_to_show = [c for c in ['type', 'severity', 'score', 'description'] if c in df.columns]
+            df_display = df[cols_to_show]
 
-            # Style the table: Highlight the 'score' column
-            st.dataframe(df.style.background_gradient(cmap='Reds', subset=['score']), use_container_width=True)
+            st.dataframe(df_display.style.background_gradient(cmap='Reds', subset=['score']), use_container_width=True)
         else:
             st.success("Target passed all active SQLi/XSS injection tests.")
     else:
