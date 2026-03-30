@@ -1,0 +1,26 @@
+name: Cortex Sentinel Scan
+
+on:
+  workflow_dispatch: # This lets you start a scan manually from the "Actions" tab
+
+jobs:
+  run-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install Dependencies
+        run: pip install -r requirements.txt
+
+      - name: Execute Sentinel
+        env:
+          # This pulls the keys from the "Vault" we just set up
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python main.py
