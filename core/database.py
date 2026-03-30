@@ -8,31 +8,25 @@ class DatabaseManager:
         url = None
         key = None
 
-        # 1. Try Streamlit Secrets
+        # 1. Try Streamlit Secrets (for Cloud)
         try:
             url = st.secrets.get("SUPABASE_URL")
             key = st.secrets.get("SUPABASE_KEY")
         except Exception:
             pass
 
-        # 2. Try Environment Variables (Local/.env/GitHub Actions)
+        # 2. Fallback to local .env (for Local/GitHub Actions)
         if not url or not key:
             load_dotenv()
             url = os.environ.get("SUPABASE_URL")
             key = os.environ.get("SUPABASE_KEY")
 
-        # 3. CRITICAL: Clean the strings to prevent [Errno -2]
+        # 3. Clean and Validate
         if url:
-            # Removes spaces and trailing slashes
             url = url.strip().rstrip('/')
-        if key:
-            key = key.strip()
-
-        # 4. Final Validation
         if not url or not key:
             raise ValueError("Cortex Sentinel Error: Supabase credentials not found.")
 
-        # 5. Initialize the Client
         self.supabase: Client = create_client(url, key)
 
     def get_cached_result(self, target_url):
@@ -45,18 +39,26 @@ class DatabaseManager:
                 .execute()
             return response.data[0] if response.data else None
         except Exception as e:
-            st.error(f"Database Retrieval Error: {e}")
+            print(f"Database Error: {e}")
             return None
 
-    def save_scan_result(self, url, headers, ssl, vulns=None):
+    def calculate_grade(self, total_score):
+        """Logic to turn a numeric score into a letter grade"""
+        if total_score >= 9: return "F (Critical)"
+        if total_score >= 7: return "D (Poor)"
+        if total_score >= 4: return "C (Average)"
+        if total_score > 0: return "B (Fair)"
+        return "A (Secure)"
+
+    def save_scan(self, url, header_data, ssl_data, vulnerabilities=None):
+        # Calculate total severity score based on findings
+        total_score = sum([v.get('score', 0) for v in vulnerabilities]) if vulnerabilities else 0
+        
         data = {
             "url": url,
-            "headers": headers,
-            "ssl_info": ssl,
-            "vulnerabilities": vulns if vulns else [],
-            "severity_score": 0 
+            "headers": header_data,
+            "ssl_info": ssl_data,
+            "vulnerabilities": vulnerabilities if vulnerabilities else [],
+            "severity_score": total_score
         }
-        try:
-            self.supabase.table("scan_results").insert(data).execute()
-        except Exception as e:
-            st.error(f"Database Save Error: {e}")
+        self.supabase.table("scan_results").insert(data).execute()

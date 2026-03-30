@@ -4,3 +4,5 @@ validators
 urllib3
 supabase
 python-dotenv
+streamlit
+requests
