@@ -1,3 +1,5 @@
+# scanner/param_engine.py
+
 from urllib.parse import urlparse, parse_qs
 
 class ParamEngine:

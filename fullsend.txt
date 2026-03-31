@@ -94,7 +94,6 @@ def allow_request(url, delay=1):
 import asyncio
 import httpx
 import time
-
 from scanner.crawler import Crawler
 from scanner.param_engine import ParamEngine
 from scanner.detector import Detector
@@ -105,159 +104,236 @@ class ActiveScanner:
         self.param_engine = ParamEngine()
         self.detector = Detector()
 
+        # Expanded payloads for better detection on test sites
         self.sql_payloads = [
             ("' OR '1'='1", "error"),
-            ("'; WAITFOR DELAY '0:0:5'--", "time")
+            ("admin'--", "error"),
+            ("'; WAITFOR DELAY '0:0:5'--", "time"),
+            ("SLEEP(5)", "time")
         ]
 
         self.xss_payloads = [
             "<script>alert(1)</script>",
-            "<img src=x onerror=alert(1)>"
+            "';alert(1)//",
+            "<img src=x onerror=alert(1)>",
+            "javascript:alert(1)"
+        ]
+
+    class ActiveScanner:
+     def __init__(self):
+        self.param_engine = ParamEngine()
+        self.detector = Detector()
+
+        # Added more aggressive payloads for testphp.vulnweb.com
+        self.sql_payloads = [
+            ("' OR '1'='1", "error"),
+            ("'--", "error"),
+            ("\" OR \"1\"=\"1", "error"),
+            ("'; WAITFOR DELAY '0:0:5'--", "time"),
+            ("SLEEP(5)", "time") # MySQL specific
+        ]
+
+        self.xss_payloads = [
+            "<script>alert(1)</script>",
+            "\" onclick=\"alert(1)",
+            "<img src=x onerror=alert(1)>",
+            "javascript:alert(1)"
         ]
 
     async def scan(self, base_url):
-        findings = []
-
-        async with httpx.AsyncClient(timeout=10) as client:
+        print(f"[*] Starting scan on: {base_url}")
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
             crawler = Crawler(base_url)
             endpoints, forms = await crawler.crawl(client)
 
+            print(f"[*] Crawler found {len(endpoints)} links and {len(forms)} forms.")
             tasks = []
 
             for url in endpoints:
                 params = self.param_engine.extract_params(url)
-
                 for param in params:
+                    # Test SQLi
                     for payload, mode in self.sql_payloads:
                         tasks.append(self.test_sqli(client, url, param, payload, mode))
-
+                    # Test XSS
                     for payload in self.xss_payloads:
                         tasks.append(self.test_xss(client, url, param, payload))
 
             for form in forms:
                 tasks.append(self.test_form(client, form))
 
+            # Execute all tests
             results = await asyncio.gather(*tasks)
-
-            findings = [r for r in results if r]
-
-        return findings
+            
+            # Filter out None results and return
+            final_results = [r for r in results if r is not None]
+            print(f"[+] Found {len(final_results)} vulnerabilities.")
+            return final_results
 
     async def test_sqli(self, client, url, param, payload, mode):
-        if not allow_request(url):
-            return None
-
         try:
-            baseline = await client.get(url)
             start = time.time()
-
             test_url = self.param_engine.inject_payload(url, param, payload)
+            
+            # baseline request
+            baseline = await client.get(url)
             res = await client.get(test_url)
-
             duration = time.time() - start
 
             if self.detector.detect_sqli(res.text, baseline.text, duration, mode):
+                print(f"!!! FOUND SQLi on {param} with payload {payload}")
                 return {
                     "type": "SQL Injection",
                     "url": test_url,
                     "payload": payload,
-                    "severity": "Critical"
+                    "severity": "Critical",
+                    "description": f"Parameter '{param}' is vulnerable to {mode}-based SQLi."
                 }
         except:
             return None
+        return None
 
     async def test_xss(self, client, url, param, payload):
-        if not allow_request(url):
-            return None
-
         try:
             test_url = self.param_engine.inject_payload(url, param, payload)
             res = await client.get(test_url)
 
             if self.detector.detect_xss(res.text, payload):
+                print(f"[!] XSS FOUND: {test_url}")
                 return {
-                    "type": "XSS",
+                    "type": "Cross-Site Scripting (XSS)",
                     "url": test_url,
                     "payload": payload,
-                    "severity": "High"
+                    "severity": "High",
+                    "description": f"Injected script reflected in page via parameter '{param}'"
                 }
-        except:
-            return None
+        except Exception as e:
+            print(f"[?] XSS Test Error: {e}")
+        return None
 
     async def test_form(self, client, form):
         try:
-            data = {i: "test" for i in form["inputs"]}
+            # Simple test data for form fields
+            data = {i: f"'{payload}'" for i, payload in zip(form["inputs"], [p[0] for p in self.sql_payloads])}
 
-            if form["method"] == "post":
+            if form.get("method", "get").lower() == "post":
                 res = await client.post(form["url"], data=data)
             else:
                 res = await client.get(form["url"], params=data)
 
-            if "error" in res.text.lower():
+            # Check if form submission triggers a database error
+            error_keywords = ["sql syntax", "mysql_fetch", "oci_parse", "postgre", "sqlite3"]
+            if any(err in res.text.lower() for err in error_keywords):
+                print(f"[!] FORM VULNERABILITY: {form['url']}")
                 return {
-                    "type": "Form Issue",
+                    "type": "Vulnerable Form",
                     "url": form["url"],
-                    "severity": "Medium"
+                    "payload": "Multiple SQL Payloads",
+                    "severity": "High",
+                    "description": "Form submission triggered a database error message."
                 }
-        except:
-            return None
+        except Exception as e:
+            print(f"[?] Form Test Error: {e}")
+        return None
 
 ===== scanner\crawler.py =====
 
 import httpx
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
+import asyncio
 
 class Crawler:
-    def __init__(self, base_url, max_pages=30):
+    def __init__(self, base_url, max_pages=15):
         self.base_url = base_url
         self.visited = set()
         self.endpoints = set()
         self.forms = []
         self.max_pages = max_pages
+        self.queue = [base_url]
+        
+        # Headers to prevent being blocked as a bot
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        }
 
     def is_internal(self, url):
-        return urlparse(url).netloc == urlparse(self.base_url).netloc
+        base_netloc = urlparse(self.base_url).netloc.replace("www.", "")
+        target_netloc = urlparse(url).netloc.replace("www.", "")
+        return base_netloc == target_netloc
 
-    async def crawl(self, client, url=None):
-        if url is None:
-            url = self.base_url
+    async def crawl(self, client):
+        """Iterative crawler that avoids recursion depth issues."""
+        print(f"[*] Starting crawl at {self.base_url}")
+        
+        # Ensure we always test the base URL even if crawling fails
+        self.endpoints.add(self.base_url)
 
-        if url in self.visited or len(self.visited) >= self.max_pages:
-            return
+        while self.queue and len(self.visited) < self.max_pages:
+            current_url = self.queue.pop(0)
+            
+            
+            if current_url in self.visited:
+                continue
+                
+            self.visited.add(current_url)
 
-        self.visited.add(url)
+            try:
+                # verify=False prevents SSL certificate errors
+                res = await client.get(
+                    current_url, 
+                    headers=self.headers, 
+                    timeout=20.0,
+                    follow_redirects=True
+                )
+                
+                if res.status_code != 200:
+                    print(f"[!] Skip {current_url} - Status: {res.status_code}")
+                    continue
 
-        try:
-            res = await client.get(url)
-            soup = BeautifulSoup(res.text, "html.parser")
+                soup = BeautifulSoup(res.text, "html.parser")
 
-            for link in soup.find_all("a", href=True):
-                full = urljoin(self.base_url, link["href"])
-                if self.is_internal(full):
-                    self.endpoints.add(full)
-                    await self.crawl(client, full)
+                # 1. Extract Links
+                for link in soup.find_all("a", href=True):
+                    full_path = urljoin(self.base_url, link["href"])
+                    clean_url = full_path.split('#')[0]
 
-            for form in soup.find_all("form"):
-                action = form.get("action") or url
-                method = form.get("method", "get").lower()
+                    if self.is_internal(clean_url) and clean_url not in self.visited:
+                        self.endpoints.add(clean_url)
+                        self.queue.append(clean_url)
 
-                inputs = [
-                    inp.get("name")
-                    for inp in form.find_all(["input", "textarea"])
-                    if inp.get("name")
-                ]
+                # 2. Extract Forms
+                for form in soup.find_all("form"):
+                    action = form.get("action")
+                    method = form.get("method", "get").lower()
+                    
+                    # Target the form's action URL or current URL if action is empty
+                    form_url = urljoin(current_url, action) if action else current_url
 
-                self.forms.append({
-                    "url": urljoin(self.base_url, action),
-                    "method": method,
-                    "inputs": inputs
-                })
+                    inputs = [
+                        inp.get("name")
+                        for inp in form.find_all(["input", "textarea", "select"])
+                        if inp.get("name")
+                    ]
 
-        except:
-            pass
+                    form_entry = {
+                        "url": form_url,
+                        "method": method,
+                        "inputs": inputs
+                    }
+                    
+                    if form_entry not in self.forms:
+                        self.forms.append(form_entry)
 
-        return self.endpoints, self.forms
+            except Exception as e:
+                # This will now print the actual error (e.g. ConnectionTimeout)
+                print(f"[!] Error crawling {current_url}: {type(e).__name__} - {e}")
+                continue
+
+        print(f"[*] Finished. Found {len(self.endpoints)} links and {len(self.forms)} forms.")
+        # Return as list for the scanner to iterate
+        return list(self.endpoints), self.forms
 
 ===== scanner\detector.py =====
 
@@ -336,42 +412,68 @@ import streamlit as st
 import requests
 import pandas as pd
 import time
+import os
+from datetime import datetime
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # CONFIG
 API_BASE = "http://localhost:8000"
-API_KEY = "test-key-123"  # change this in production
+# Priority: .env file, then default fallback
+API_KEY = os.getenv("SENTINEL_API_KEY", "test-key-123")
 
 HEADERS = {
     "x-api-key": API_KEY,
     "Content-Type": "application/json"
 }
 
-st.set_page_config(page_title="Cortex Sentinel", layout="wide")
+# Page Setup
+st.set_page_config(
+    page_title="Cortex Sentinel | Production Security",
+    page_icon="🛡️",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Custom CSS for better look
+st.markdown("""
+    <style>
+    .main { background-color: #0e1117; }
+    .stMetric { background-color: #161b22; padding: 15px; border-radius: 10px; border: 1px solid #30363d; }
+    </style>
+    """, unsafe_allow_html=True)
 
 st.title("🛡️ Cortex Sentinel")
-st.caption("Production Security Scanner Dashboard")
-
-# SIDEBAR
-st.sidebar.header("Scan Configuration")
-
-target_url = st.sidebar.text_input(
-    "Target URL",
-    "http://testphp.vulnweb.com"
-)
-
-scan_mode = st.sidebar.selectbox(
-    "Scan Mode",
-    ["fast", "deep"]
-)
-
-start_scan = st.sidebar.button("🚀 Start Scan")
-load_report = st.sidebar.button("📂 Load Last Report")
+st.caption(f"Enterprise Vulnerability Scanner | Connected to: {API_BASE}")
 
 # -----------------------------
-# START SCAN
+# SIDEBAR
+# -----------------------------
+with st.sidebar:
+    st.header("Scan Configuration")
+    target_url = st.text_input("Target URL", "http://testphp.vulnweb.com")
+    scan_mode = st.selectbox("Scan Mode", ["fast", "deep", "stealth"])
+    
+    st.divider()
+    
+    col1, col2 = st.columns(2)
+    start_scan = col1.button("🚀 Start Scan", use_container_width=True)
+    load_report = col2.button("📂 Last Report", use_container_width=True)
+    
+    st.divider()
+    st.info("System Status: Operational")
+
+# -----------------------------
+# MAIN LOGIC: START SCAN
 # -----------------------------
 if start_scan:
-    with st.spinner("Submitting scan job..."):
+    if not target_url.startswith("http"):
+        st.error("Invalid URL: Please include http:// or https://")
+        st.stop()
+
+    with st.spinner("Submitting scan job to API..."):
         try:
             res = requests.post(
                 f"{API_BASE}/scan",
@@ -380,150 +482,120 @@ if start_scan:
                 timeout=10
             )
 
+            if res.status_code == 403:
+                st.error("403 Forbidden: Check your API Key in .env")
+                st.stop()
+
             data = res.json()
             job_id = data.get("job_id")
 
             if not job_id:
-                st.error("Failed to create job")
+                st.error("Failed to create job: API did not return a Job ID")
                 st.stop()
 
-            st.success(f"Job queued: {job_id}")
+            st.toast(f"Job Created Successfully", icon="✅")
+            st.success(f"Job UUID: {job_id}")
 
         except Exception as e:
-            st.error(f"API Error: {e}")
+            st.error(f"API Connection Error: {e}")
             st.stop()
 
-    # -----------------------------
-    # TRACK JOB
-    # -----------------------------
+    # --- TRACKING UI ---
+    st.divider()
     progress_bar = st.progress(0)
     status_text = st.empty()
-    log_box = st.empty()
+    log_container = st.container()
+    
+    with log_container:
+        st.subheader("📡 Real-time Scan Logs")
+        log_box = st.empty()
+        logs = []
 
-    logs = []
+    def log_update(msg):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        logs.append(f"[{timestamp}] {msg}")
+        log_box.code("\n".join(logs[-8:]))
 
-    def log(msg):
-        logs.append(msg)
-        log_box.text("\n".join(logs[-10:]))
-
-    # POLL LOOP
-    while True:
+    # POLLING LOOP
+    max_retries = 30
+    retries = 0
+    
+    while retries < max_retries:
         try:
-            job_res = requests.get(
-                f"{API_BASE}/job/{job_id}",
-                headers=HEADERS,
-                timeout=5
-            )
-
+            # Polling the specific Job ID
+            job_res = requests.get(f"{API_BASE}/job/{job_id}", headers=HEADERS, timeout=5)
             job_data = job_res.json()
 
-            status = job_data.get("status", "unknown")
+            status = job_data.get("status", "pending")
             progress = job_data.get("progress", 0)
 
-            progress_bar.progress(progress)
-            status_text.info(f"Status: {status} ({progress}%)")
-
-            log(f"{time.strftime('%H:%M:%S')} → {status}")
+            progress_bar.progress(progress / 100)
+            status_text.info(f"Worker Status: **{status.upper()}** | Progress: {progress}%")
+            log_update(f"Status check: {status}")
 
             if status == "done":
-                st.success("Scan complete")
+                st.balloons()
                 break
-
             if status == "failed":
-                st.error("Scan failed")
+                st.error("Worker reported a failure during scan.")
                 break
 
-            time.sleep(2)
-
+            time.sleep(3)
+            retries += 1
         except Exception as e:
-            st.error(f"Tracking error: {e}")
-            break
+            log_update(f"Polling error: {e}")
+            time.sleep(5)
 
-    # -----------------------------
-    # FETCH RESULTS
-    # -----------------------------
+    # --- FETCH RESULTS ---
     try:
-        result_res = requests.get(
-            f"{API_BASE}/result/{target_url}",
-            headers=HEADERS
-        )
-
+        # FIX: We query by job_id, NOT target_url
+        result_res = requests.get(f"{API_BASE}/result/{job_id}", headers=HEADERS)
         result_data = result_res.json()
-
         vulns = result_data.get("vulnerabilities", [])
 
         st.divider()
-        st.subheader("📊 Scan Results")
+        st.subheader("📊 Scan Findings")
 
         if vulns:
             df = pd.DataFrame(vulns)
+            
+            # Display Metrics
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Total Findings", len(df))
+            m2.metric("Critical", len(df[df["severity"] == "Critical"]))
+            m3.metric("High", len(df[df["severity"] == "High"]))
+            m4.metric("Medium", len(df[df["severity"] == "Medium"]))
 
-            # Metrics
-            col1, col2, col3 = st.columns(3)
-
-            col1.metric("Critical", len(df[df["severity"] == "Critical"]))
-            col2.metric("High", len(df[df["severity"] == "High"]))
-            col3.metric("Medium", len(df[df["severity"] == "Medium"]))
-
-            st.divider()
-
-            st.subheader("🔎 Detailed Findings")
-            st.dataframe(df, use_container_width=True)
-
+            st.dataframe(df, use_container_width=True, hide_index=True)
+            
+            # Export Option
+            csv = df.to_csv(index=False).encode('utf-8')
+            st.download_button("📥 Download CSV Report", data=csv, file_name=f"scan_{job_id}.csv")
         else:
-            st.success("No vulnerabilities found")
+            st.success("✨ Clean Scan: No vulnerabilities detected in the target.")
 
     except Exception as e:
-        st.error(f"Failed to fetch results: {e}")
-
+        st.error(f"Error displaying results: {e}")
 
 # -----------------------------
 # LOAD PREVIOUS REPORT
 # -----------------------------
 if load_report:
-    with st.spinner("Loading report..."):
+    st.info(f"Searching for most recent scan of: {target_url}")
+    with st.spinner("Accessing Supabase records..."):
         try:
-            res = requests.get(
-                f"{API_BASE}/result/{target_url}",
-                headers=HEADERS
-            )
-
+            # Note: For 'Last Report' we might still use URL if your API supports it,
+            # but usually we want to fetch the most recent data.
+            res = requests.get(f"{API_BASE}/result/{target_url}", headers=HEADERS)
             data = res.json()
 
-            if "status" in data and data["status"] == "not_found":
-                st.error("No previous scan found")
-                st.stop()
-
-            st.success(f"Loaded report for {target_url}")
-
-            score = data.get("severity_score", 0)
-
-            # GRADE SYSTEM
-            if score >= 9:
-                grade = "F (Critical)"
-            elif score >= 7:
-                grade = "D (High Risk)"
-            elif score >= 4:
-                grade = "C (Moderate)"
-            elif score > 0:
-                grade = "B (Low Risk)"
+            if not data.get("vulnerabilities"):
+                st.warning("No previous reports found for this URL.")
             else:
-                grade = "A (Secure)"
-
-            st.metric("Security Grade", grade)
-
-            st.divider()
-
-            vulns = data.get("vulnerabilities", [])
-
-            if vulns:
-                df = pd.DataFrame(vulns)
-                st.dataframe(df, use_container_width=True)
-            else:
-                st.success("No vulnerabilities recorded")
-
+                st.subheader(f"History: {target_url}")
+                st.dataframe(pd.DataFrame(data["vulnerabilities"]), use_container_width=True)
         except Exception as e:
-            st.error(f"Error loading report: {e}")
+            st.error(f"Report Load Failed: {e}")
 
 ===== api\auth.py =====
 
@@ -574,70 +646,66 @@ def login(email: str, password: str):
 
 ===== api\main.py =====
 
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Request, Security, HTTPException, Depends
+from fastapi.security.api_key import APIKeyHeader
 import uuid
+import os
+from dotenv import load_dotenv
 
-from queue.redis_queue import enqueue_scan
+from task_queue.redis_scanner import enqueue_scan
 from core.job_manager import create_job, get_job
 from core.database import DatabaseManager
 
-app = FastAPI()
-db = DatabaseManager()
+load_dotenv()
 
-API_KEYS = {"test-key-123"}
+# 1. Security Setup for Swagger UI
+api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
+API_KEYS = {os.getenv("SENTINEL_API_KEY", "test-key-123")}
 
-@app.middleware("http")
-async def auth(request: Request, call_next):
-    if request.url.path.startswith("/auth"):
-        return await call_next(request)
-    key = request.headers.get("x-api-key")
+def verify_api_key(key: str = Security(api_key_header)):
     if key not in API_KEYS:
-        return JSONResponse(status_code=403, content={"error": "Unauthorized"})
-    return await call_next(request)
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    return key
+
+app = FastAPI(dependencies=[Depends(verify_api_key)])
+db = DatabaseManager()
 
 @app.post("/scan")
 def scan(req: dict):
+    target_url = req.get("url")
+    if not target_url:
+        raise HTTPException(status_code=400, detail="Missing url")
+        
     job_id = str(uuid.uuid4())
-    create_job(job_id, req["url"])
-    enqueue_scan({
-        "job_id": job_id,
-        "url": req["url"]
-    })
-    return {"job_id": job_id}
+    
+    try:
+        create_job(job_id, target_url)
+        enqueue_scan({"job_id": job_id, "url": target_url})
+        return {"job_id": job_id}
+    except Exception as e:
+        print(f"DATABASE ERROR: {e}")
+        raise HTTPException(status_code=500, detail="RLS or Database Error")
 
 @app.get("/job/{job_id}")
-def job(job_id: str):
+def job_status(job_id: str):
     return get_job(job_id)
 
 @app.get("/result/{job_id}")
 def result(job_id: str):
+    # This now correctly searches by the UUID
     vulns = db.get_results(job_id)
-    return {"vulnerabilities": vulns}
-
-
-===== queue\redis_scanner.py =====
-
-import redis
-import json
-import os
-
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-QUEUE_NAME = "scan_queue"
-
-r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
-
-def enqueue_scan(job):
-    r.rpush(QUEUE_NAME, json.dumps(job))
-
-def dequeue_scan():
-    _, job = r.blpop(QUEUE_NAME)
-    return json.loads(job)
+    if not vulns:
+        return {"status": "not_found", "vulnerabilities": []}
+    return {"status": "done", "vulnerabilities": vulns}
 
 ===== workers\worker.py =====
 
+import sys
+import os
 import asyncio
-from queue.redis_queue import dequeue_scan
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from task_queue.redis_scanner import dequeue_scan
 from scanner.active_engine import ActiveScanner
 from core.database import DatabaseManager
 from core.job_manager import update_job
@@ -648,22 +716,22 @@ db = DatabaseManager()
 async def process(job):
     job_id = job["job_id"]
     url = job["url"]
+    print(f"[*] Processing: {url} (ID: {job_id})")
 
     update_job(job_id, "running", 10)
-
     results = await scanner.scan(url)
-
+    
     update_job(job_id, "running", 90)
-
     db.save_vulnerabilities(job_id, results)
-
     update_job(job_id, "done", 100)
+    print(f"[+] Finished: {job_id}")
 
 def run():
-    print("🚀 Worker started")
+    print("🚀 Worker started and listening...")
     while True:
         job = dequeue_scan()
-        asyncio.run(process(job))
+        if job:
+            asyncio.run(process(job))
 
 if __name__ == "__main__":
     run()
