@@ -7,6 +7,10 @@ python-dotenv
 streamlit
 pandas
 plotly
+psutil          # Required for the 'No-Terminal' System Monitor logic
+
+# AI & Intelligence Layer
+google-generativeai
 
 # Networking & Scraper
 requests
@@ -14,8 +18,8 @@ httpx
 beautifulsoup4
 validators
 urllib3
+playwright
 
 # Database & Queue
 supabase
 redis
-playwright

@@ -2,27 +2,37 @@ version: '3.8'
 
 services:
   # 1. REDIS: The Message Broker
+  # This serves as your "Inbox" for scan requests.
   redis:
     image: redis:8.0-alpine
     container_name: sentinel_redis
     ports:
       - "6379:6379"
     restart: always
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
   # 2. API: The Entry Point
+  # Handles the logic from main.py and pushes jobs to Redis.
   api:
     build: .
     container_name: sentinel_api
+    # Ensure this points to your specific main.py location
     command: fastapi run api/main.py --port 8000
     ports:
       - "8000:8000"
     env_file:
       - .env
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     restart: always
 
   # 3. WORKER: The "Heavy Lifter"
+  # This runs the SAST_Engine and AI_Report logic.
   worker:
     build: .
     container_name: sentinel_worker
@@ -30,14 +40,21 @@ services:
     env_file:
       - .env
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     restart: always
+    # In production/Railway, this service is set to "autoscale" based on the queue
+    deploy:
+      resources:
+        limits:
+          memory: 1G
 
   # 4. DASHBOARD: The UI
+  # Your Streamlit interface for non-terminal management.
   dashboard:
     build: .
     container_name: sentinel_dashboard
-    command: streamlit run app/dashboard.py --server.port 8501
+    command: streamlit run app/dashboard.py --server.port 8501 --server.address 0.0.0.0
     ports:
       - "8501:8501"
     env_file:
