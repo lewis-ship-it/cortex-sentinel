@@ -9,6 +9,8 @@ streamlit
 pandas
 plotly
 psutil          # Required for the 'No-Terminal' System Monitor logic
+streamlit-lottie
+
 
 # AI & Intelligence Layer
 google-generativeai

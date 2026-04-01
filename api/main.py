@@ -18,12 +18,21 @@ def run_worker_in_background():
     from workers.worker import start_worker_loop 
     print("🛠️  Worker Thread: Starting...")
     start_worker_loop()
-
+    # main.py
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    worker_thread = threading.Thread(target=run_worker_in_background, daemon=True)
-    worker_thread.start()
+    # Use a try-block to catch import errors in the logs!
+    try:
+        from workers.worker import start_worker_loop
+        worker_thread = threading.Thread(target=start_worker_loop, daemon=True)
+        worker_thread.start()
+        print("✅ Background Worker Thread Started Successfully")
+    except Exception as e:
+        print(f"❌ CRITICAL: Worker failed to start: {e}")
     yield
+
+    # Cleanup actions if needed
+    print("🛠️  Worker Thread: Stopping...")
 
 api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
 API_KEYS = {os.getenv("SENTINEL_API_KEY", "test-key-123")}
