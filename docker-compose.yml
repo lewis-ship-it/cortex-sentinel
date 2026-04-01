@@ -21,7 +21,7 @@ services:
     build: .
     container_name: sentinel_api
     # Ensure this points to your specific main.py location
-    command: fastapi run api/main.py --port 8000
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000
     ports:
       - "8000:8000"
     env_file:
