@@ -1,21 +1,28 @@
 import redis
 import os
+import json
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# THE FIX: Change "redis://" to "rediss://" (with two 's' for SSL)
-# This forces the client to use a secure encrypted connection required by Upstash.
+# Use 'rediss://' for Upstash SSL compatibility
 REDIS_URL = os.getenv("REDIS_URL", "rediss://default:AZk4AAIncDE5ODg1MThmZDVhZDY0Y2I1OWI2Yjg1YmQ5M2ZjNTJiMXAxMzkyMjQ@related-gopher-39224.upstash.io:6379")
 
-# Initialize the client with SSL certificate requirements disabled (common for Upstash)
 redis_client = redis.from_url(
     REDIS_URL, 
-    ssl_cert_reqs=None, 
+    ssl_cert_reqs=None, # Required for cloud environments to connect to Upstash
     decode_responses=True
 )
 
 def enqueue_scan(data):
-    # This pushes your scan job into the Upstash cloud queue
-    redis_client.lpush("scan_queue", str(data))
-    print(f"DEBUG: Job sent to Upstash Cloud: {data.get('job_id')}")
+    """Pushes a job into the queue."""
+    # Convert dict to string for Redis storage
+    redis_client.lpush("scan_queue", json.dumps(data))
+    print(f"DEBUG: Job sent to Upstash: {data.get('job_id')}")
+
+def dequeue_scan():
+    """Pops a job from the queue. This was the missing function."""
+    data = redis_client.rpop("scan_queue")
+    if data:
+        return json.loads(data)
+    return None
