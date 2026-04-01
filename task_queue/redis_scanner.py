@@ -1,36 +1,21 @@
 import redis
-import json
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-QUEUE_NAME = "scan_queue"
+# THE FIX: Change "redis://" to "rediss://" (with two 's' for SSL)
+# This forces the client to use a secure encrypted connection required by Upstash.
+REDIS_URL = os.getenv("REDIS_URL", "rediss://default:AZk4AAIncDE5ODg1MThmZDVhZDY0Y2I1OWI2Yjg1YmQ5M2ZjNTJiMXAxMzkyMjQ@related-gopher-39224.upstash.io:6379")
 
-# We use a very clean initialization. 
-# If your URL starts with rediss:// (SSL), the library handles it automatically.
-try:
-    r = redis.from_url(
-        REDIS_URL, 
-        decode_responses=True
-    )
-    # Ping to check connection immediately
-    r.ping()
-    print("✅ Successfully connected to Redis")
-except Exception as e:
-    print(f"❌ Redis Connection Error: {e}")
+# Initialize the client with SSL certificate requirements disabled (common for Upstash)
+redis_client = redis.from_url(
+    REDIS_URL, 
+    ssl_cert_reqs=None, 
+    decode_responses=True
+)
 
-def enqueue_scan(job):
-    r.rpush(QUEUE_NAME, json.dumps(job))
-
-def dequeue_scan():
-    print(f"[*] Monitoring queue: {QUEUE_NAME}...")
-    try:
-        # blpop returns (queue_name, data)
-        res = r.blpop(QUEUE_NAME, timeout=0) 
-        if res:
-            return json.loads(res[1])
-    except Exception as e:
-        print(f"[!] Worker Error during dequeue: {e}")
-    return None
+def enqueue_scan(data):
+    # This pushes your scan job into the Upstash cloud queue
+    redis_client.lpush("scan_queue", str(data))
+    print(f"DEBUG: Job sent to Upstash Cloud: {data.get('job_id')}")

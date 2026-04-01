@@ -3,6 +3,7 @@
 import asyncio
 from playwright.async_api import async_playwright
 import logging
+from urllib.parse import urlparse
 
 class PlaywrightScanner:
 
@@ -11,80 +12,94 @@ class PlaywrightScanner:
 
     async def scan(self, url, auth_config=None):
         findings = []
+        endpoints = set()
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             context = await browser.new_context()
             page = await context.new_page()
 
-            # -----------------------
-            # AUTH HANDLING
-            # -----------------------
-            if auth_config:
-                if auth_config.get("type") == "login":
-                    await page.goto(auth_config["login_url"])
+            try:
+                # -----------------------
+                # AUTH HANDLING
+                # -----------------------
+                if auth_config:
+                    try:
+                        if auth_config.get("type") == "login":
+                            await page.goto(auth_config.get("login_url"))
 
-                    await page.fill('input[name="username"]', auth_config["username"])
-                    await page.fill('input[name="password"]', auth_config["password"])
+                            await page.fill('input[name="username"]', auth_config.get("username", ""))
+                            await page.fill('input[name="password"]', auth_config.get("password", ""))
 
-                    await page.click("button[type=submit]")
-                    await page.wait_for_load_state("networkidle")
+                            await page.click("button[type=submit]")
+                            await page.wait_for_load_state("networkidle")
 
-                    logging.info("[PLAYWRIGHT] Logged in")
+                            logging.info("[PLAYWRIGHT] Logged in")
 
-                elif auth_config.get("type") == "cookie":
-                    cookies = [
-                        {
-                            "name": k,
-                            "value": v,
-                            "domain": url.split("//")[1]
-                        }
-                        for k, v in auth_config["cookies"].items()
-                    ]
-                    await context.add_cookies(cookies)
+                        elif auth_config.get("type") == "cookie":
+                            domain = urlparse(url).netloc
 
-            # -----------------------
-            # NETWORK LISTENER (API DISCOVERY)
-            # -----------------------
-            endpoints = set()
+                            cookies = [
+                                {
+                                    "name": k,
+                                    "value": v,
+                                    "domain": domain,
+                                    "path": "/"
+                                }
+                                for k, v in auth_config.get("cookies", {}).items()
+                            ]
 
-            def handle_request(request):
-                endpoints.add(request.url)
+                            await context.add_cookies(cookies)
+                            logging.info("[PLAYWRIGHT] Cookies injected")
 
-            page.on("request", handle_request)
+                    except Exception as e:
+                        logging.error(f"[PLAYWRIGHT AUTH ERROR] {e}")
 
-            # -----------------------
-            # LOAD PAGE
-            # -----------------------
-            await page.goto(url)
-            await page.wait_for_load_state("networkidle")
+                # -----------------------
+                # NETWORK LISTENER
+                # -----------------------
+                def handle_request(request):
+                    endpoints.add(request.url)
 
-            logging.info(f"[PLAYWRIGHT] Loaded {url}")
+                page.on("request", handle_request)
 
-            # -----------------------
-            # DOM XSS TEST
-            # -----------------------
-            await page.evaluate(f"""
-                let inputs = document.querySelectorAll('input, textarea');
-                inputs.forEach(i => i.value = `{self.xss_payload}`);
-            """)
+                # -----------------------
+                # LOAD PAGE
+                # -----------------------
+                await page.goto(url, timeout=20000)
+                await page.wait_for_load_state("networkidle")
 
-            await page.keyboard.press("Enter")
-            await page.wait_for_timeout(2000)
+                logging.info(f"[PLAYWRIGHT] Loaded {url}")
 
-            content = await page.content()
+                # -----------------------
+                # DOM XSS TEST
+                # -----------------------
+                await page.evaluate(f"""
+                    (() => {{
+                        let inputs = document.querySelectorAll('input, textarea');
+                        inputs.forEach(i => i.value = `{self.xss_payload}`);
+                    }})();
+                """)
 
-            if self.xss_payload in content:
-                findings.append({
-                    "type": "DOM XSS",
-                    "url": url,
-                    "severity": "Critical"
-                })
-                logging.warning(f"[PLAYWRIGHT] DOM XSS detected at {url}")
+                # try to trigger events
+                await page.keyboard.press("Enter")
+                await page.wait_for_timeout(2000)
 
-            # -----------------------
-            # RETURN DISCOVERED ENDPOINTS
-            # -----------------------
-            browser.close()
+                content = await page.content()
+
+                if self.xss_payload in content:
+                    findings.append({
+                        "type": "DOM XSS",
+                        "url": url,
+                        "severity": "Critical",
+                        "description": "Payload reflected in DOM after JS execution"
+                    })
+                    logging.warning(f"[PLAYWRIGHT] DOM XSS detected at {url}")
+
+            except Exception as e:
+                logging.error(f"[PLAYWRIGHT ERROR] {e}")
+
+            finally:
+                await browser.close()
 
         return findings, list(endpoints)

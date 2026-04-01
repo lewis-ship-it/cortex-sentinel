@@ -10,8 +10,7 @@ TARGET_FOLDERS = [
     "app",
     "api",
     "queue",
-    "workers",
-    "main.py",
+    "workers"
 ]
 
 def dump():

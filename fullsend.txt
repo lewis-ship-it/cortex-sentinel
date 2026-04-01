@@ -16,42 +16,34 @@ class DatabaseManager:
     def __init__(self):
         url = os.getenv("SUPABASE_URL")
         key = os.getenv("SUPABASE_KEY")
-
         if not url or not key:
             raise Exception("Missing Supabase credentials")
-
         self.db = create_client(url, key)
 
-    # JOBS
-    def insert_job(self, job_id, url, status, progress):
-        self.db.table("jobs").insert({
-            "id": job_id,
-            "url": url,
-            "status": status,
-            "progress": progress
+    def save_vulnerabilities(self, job_id, results):
+        if not results: return
+        data = []
+        for r in results:
+            data.append({
+                "job_id": job_id,
+                "type": r.get("type"),
+                "severity": r.get("severity"),
+                "url": r.get("url"),
+                "description": r.get("description", "Vulnerability detected by scanner")
+            })
+        self.db.table("vulnerabilities").insert(data).execute()
+
+    def save_report(self, job_id, content):
+        # Assumes you have a 'reports' table or a 'report' column in 'jobs'
+        # Adjust table name if necessary
+        self.db.table("reports").insert({
+            "job_id": job_id,
+            "content": content
         }).execute()
 
-    def update_job(self, job_id, status=None, progress=None):
-        data = {}
-        if status: data["status"] = status
-        if progress is not None: data["progress"] = progress
-
-        self.db.table("jobs").update(data).eq("id", job_id).execute()
-
-    def get_job(self, job_id):
-        res = self.db.table("jobs").select("*").eq("id", job_id).execute()
+    def get_report(self, job_id):
+        res = self.db.table("reports").select("*").eq("job_id", job_id).execute()
         return res.data[0] if res.data else None
-
-    # RESULTS
-    def save_vulnerabilities(self, job_id, vulns):
-        for v in vulns:
-            self.db.table("vulnerabilities").insert({
-                "job_id": job_id,
-                "type": v["type"],
-                "severity": v["severity"],
-                "endpoint": v.get("url"),
-                "payload": v.get("payload")
-            }).execute()
 
     def get_results(self, job_id):
         res = self.db.table("vulnerabilities").select("*").eq("job_id", job_id).execute()
@@ -91,7 +83,6 @@ def allow_request(url, delay=1):
 
 ===== scanner\active_engine.py =====
 
-# scanner/active_engine.py
 import asyncio
 import httpx
 import time
@@ -101,9 +92,6 @@ from scanner.crawler import Crawler
 from scanner.param_engine import ParamEngine
 from scanner.detector import Detector
 from scanner.auth_handler import AuthHandler
-from scanner.playwright_engine import PlaywrightScanner
-from scanner.priority_engine import PriorityEngine
-from scanner.cvss import CVSS
 
 logging.basicConfig(level=logging.INFO)
 
@@ -111,80 +99,49 @@ class ActiveScanner:
     def __init__(self):
         self.param_engine = ParamEngine()
         self.detector = Detector()
-        self.auth = AuthHandler() # Your added AuthHandler
-        self.browser = PlaywrightScanner()  # Your added PlaywrightScanner
+        self.auth = AuthHandler()
 
+        # Vulnerability Payloads
         self.true_payload = "' OR 1=1--"
         self.false_payload = "' AND 1=2--"
         self.time_payload = "'; WAITFOR DELAY '0:0:5'--"
 
         self.xss_payloads = [
             "<script>alert(1)</script>",
-            "\"><script>alert(1)</script>"
+            "\"><script>alert(1)</script>",
+            "<img src=x onerror=alert(1)>"
         ]
 
-        self.common_params = ["id", "q", "search"]
-        self.priority = PriorityEngine()
-        self.cvss = CVSS()
+        self.common_params = ["id", "q", "search", "page", "cat"]
 
     async def scan(self, base_url, auth_config=None):
         findings = []
 
-        # We use one client session for both Auth and Scanning to persist cookies/tokens
-        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+        # Maintain one session for the entire scan to preserve cookies
+        async with httpx.AsyncClient(timeout=15, verify=False, follow_redirects=True) as client:
             
-            # -------------------------
-            # AUTH HANDLING (Integrated)
-            # -------------------------
+            # --- AUTHENTICATION PHASE ---
             if auth_config:
+                logging.info(f"[AUTH] Attempting {auth_config.get('type')} authentication...")
                 if auth_config.get("type") == "login":
-                    success = await self.auth.login(
-                        client,
-                        auth_config["login_url"],
-                        auth_config["username"],
+                    await self.auth.login(
+                        client, 
+                        auth_config["login_url"], 
+                        auth_config["username"], 
                         auth_config["password"]
                     )
-                    if not success:
-                        logging.warning("[AUTH] Login failed. Proceeding unauthenticated")
-                    else:
-                        logging.info("[AUTH] Login successful")
-
                 elif auth_config.get("type") == "cookie":
                     self.auth.inject_cookies(client, auth_config["cookies"])
-                    logging.info("[AUTH] Cookies injected")
 
-            # -------------------------
-            # CRAWLING & TESTING
-            # -------------------------
+            # --- CRAWLING PHASE ---
             crawler = Crawler(base_url)
             endpoints, forms = await crawler.crawl(client)
-            # -----------------------
-            # PLAYWRIGHT SCAN
-            # -----------------------
-            try:
-                pw_findings, pw_endpoints = await self.browser.scan(
-                    base_url, auth_config
-                )
+            logging.info(f"[CRAWL] Found {len(endpoints)} endpoints and {len(forms)} forms")
 
-                logging.info(f"[PLAYWRIGHT] Found {len(pw_endpoints)} endpoints")
-
-                endpoints.update(pw_endpoints)
-                findings.extend(pw_findings)
-
-            except Exception as e:
-                logging.error(f"[PLAYWRIGHT ERROR] {e}")
-
-            logging.info(f"[CRAWL] endpoints={len(endpoints)} forms={len(forms)}")
-
+            # --- TESTING PHASE ---
             tasks = []
-            endpoints = self.priority.prioritize(endpoints)
-
-            logging.info(f"[PRIORITY] Top targets: {endpoints[:5]}")
             for url in endpoints:
-                params = self.param_engine.extract_params(url)
-                if not params:
-                    params = self.common_params
-
+                params = self.param_engine.extract_params(url) or self.common_params
                 for param in params:
                     tasks.append(self.test_sqli(client, url, param))
                     tasks.append(self.test_xss(client, url, param))
@@ -192,15 +149,19 @@ class ActiveScanner:
             for form in forms:
                 tasks.append(self.test_form(client, form))
 
+            # Gather all concurrent scan results
             results = await asyncio.gather(*tasks)
 
+            # Flatten results and filter None
             for r in results:
                 if r:
-                    findings.extend(r if isinstance(r, list) else [r])
+                    if isinstance(r, list):
+                        findings.extend(r)
+                    else:
+                        findings.append(r)
 
         return findings
 
-    # --- KEEPING ALL YOUR TEST METHODS BELOW ---
     async def test_sqli(self, client, url, param):
         try:
             baseline = await client.get(url)
@@ -210,40 +171,42 @@ class ActiveScanner:
             true_res = await client.get(true_url)
             false_res = await client.get(false_url)
 
+            # Time-based check
             start = time.time()
             delay_url = self.param_engine.inject_payload(url, param, self.time_payload)
             await client.get(delay_url)
-            delay = time.time() - start
+            duration = time.time() - start
 
-            if self.detector.detect_sqli(baseline, true_res, false_res, {"delay": delay}):
-                logging.warning(f"[SQLi VERIFIED] {true_url}")
-                score = self.cvss.calculate("SQL Injection")
+            if self.detector.detect_sqli(baseline, true_res, false_res, {"delay": duration}):
                 return {
                     "type": "SQL Injection",
                     "url": true_url,
-                    "cvss": score,
-                    "severity": self.cvss.severity_label(score)
-        }
-                
+                    "severity": "Critical",
+                    "description": f"Boolean or Time-based SQLi detected on parameter: {param}"
+                }
         except Exception as e:
-            logging.error(f"[SQLi ERROR] {e}")
+            logging.error(f"SQLi Error on {url}: {e}")
         return None
 
     async def test_xss(self, client, url, param):
-        findings = []
+        results = []
         for payload in self.xss_payloads:
             try:
                 test_url = self.param_engine.inject_payload(url, param, payload)
                 res = await client.get(test_url)
                 if self.detector.detect_xss(res.text, payload):
-                    logging.warning(f"[XSS VERIFIED] {test_url}")
-                    findings.append({"type": "XSS", "url": test_url, "payload": payload, "severity": "High"})
+                    results.append({
+                        "type": "Cross-Site Scripting (XSS)",
+                        "url": test_url,
+                        "payload": payload,
+                        "severity": "High"
+                    })
             except Exception as e:
-                logging.error(f"[XSS ERROR] {e}")
-        return findings if findings else None
+                logging.error(f"XSS Error on {url}: {e}")
+        return results if results else None
 
     async def test_form(self, client, form):
-        findings = []
+        results = []
         for payload in self.xss_payloads:
             data = {i: payload for i in form["inputs"]}
             try:
@@ -251,150 +214,136 @@ class ActiveScanner:
                     res = await client.post(form["url"], data=data)
                 else:
                     res = await client.get(form["url"], params=data)
+                
                 if self.detector.detect_xss(res.text, payload):
-                    logging.warning(f"[FORM XSS VERIFIED] {form['url']}")
-                    findings.append({"type": "XSS", "url": form["url"], "payload": payload, "severity": "High"})
+                    results.append({
+                        "type": "Form-based XSS",
+                        "url": form["url"],
+                        "payload": payload,
+                        "severity": "High"
+                    })
             except Exception as e:
-                logging.error(f"[FORM ERROR] {e}")
-        return findings if findings else None
+                logging.error(f"Form Error on {form['url']}: {e}")
+        return results if results else None
 
 ===== scanner\ai_report.py =====
 
-# scanner/ai_report.py
-
 import os
-from datetime import datetime
+import json
+import asyncio
+import google.generativeai as genai
+from dotenv import load_dotenv
+
+load_dotenv()
+
+class ExploitGenerator:
+    def __init__(self, model):
+        self.model = model
+
+    async def generate_poc(self, vuln_type, url, evidence=None):
+        """
+        Generates a functional, technical Proof of Concept (PoC) for a verified finding.
+        """
+        prompt = f"""
+        Target: {url}
+        Vulnerability: {vuln_type}
+        Context/Evidence: {evidence}
+
+        Task:
+        1. Provide a specific, contextual payload (e.g., encoded if needed).
+        2. Provide a 'curl' command to demonstrate the vulnerability.
+        3. Explain why this specific payload is likely to bypass basic filters.
+
+        Return ONLY a JSON object with keys: 'payload', 'curl_command', 'explanation'.
+        Do not include markdown code blocks.
+        """
+        try:
+            # We use to_thread because the generativeai library is synchronous
+            response = await asyncio.to_thread(self.model.generate_content, prompt)
+            raw_text = response.text.strip()
+            # Basic cleanup if AI returns markdown
+            if "{" in raw_text:
+                raw_text = raw_text[raw_text.find("{"):raw_text.rfind("}") + 1]
+            return json.loads(raw_text)
+        except Exception as e:
+            return {"error": f"PoC generation failed: {str(e)}"}
 
 class AIReportGenerator:
-
     def __init__(self):
-        pass
+        # Setup Gemini
+        api_key = os.getenv("GEMINI_API_KEY")
+        genai.configure(api_key=api_key)
+        self.model = genai.GenerativeModel('gemini-1.5-flash')
+        self.exploit_gen = ExploitGenerator(self.model)
 
-    # -----------------------
-    # MAIN ENTRY
-    # -----------------------
-    def generate_report(self, findings, target):
-        report = {
-            "target": target,
-            "generated_at": str(datetime.utcnow()),
-            "summary": self.build_summary(findings),
-            "details": []
-        }
+    async def generate_report(self, vulnerabilities, target):
+        """
+        Uses Gemini to perform security reasoning and automated exploit generation.
+        """
+        if not vulnerabilities:
+            return {"summary": "No vulnerabilities found.", "findings": []}
 
-        for vuln in findings:
-            report["details"].append(
-                self.analyze_vulnerability(vuln)
-            )
+        vuln_data = json.dumps(vulnerabilities, indent=2)
+        
+        # Phase 1: Reasoning and Filtering
+        prompt = f"""
+        You are a Senior Security Auditor. Analyze these findings for {target}.
+        
+        INSTRUCTIONS:
+        - Identify REAL threats vs False Positives (e.g. test keys, generic samples).
+        - For REAL threats, provide 'impact', 'exploitation' (general steps), and 'remediation'.
+        - Assign a 'confidence' score (0.1 to 1.0).
 
-        return report
+        DATA:
+        {vuln_data}
 
-    # -----------------------
-    # SUMMARY
-    # -----------------------
-    def build_summary(self, findings):
-        summary = {
-            "total": len(findings),
-            "critical": 0,
-            "high": 0,
-            "medium": 0,
-            "low": 0
-        }
+        Return a VALID JSON object with the key 'findings'. No markdown formatting.
+        """
 
-        for f in findings:
-            sev = f.get("severity", "low").lower()
-            if sev in summary:
-                summary[sev] += 1
+        try:
+            # Step 1: Initial AI Analysis
+            response = await asyncio.to_thread(self.model.generate_content, prompt)
+            raw_text = response.text.strip()
+            if "{" in raw_text:
+                raw_text = raw_text[raw_text.find("{"):raw_text.rfind("}") + 1]
+            
+            ai_data = json.loads(raw_text)
+            findings = ai_data.get("findings", [])
 
-        return summary
+            # Phase 2: Autonomous Exploit Generation
+            # We enrich findings with live PoCs for high-confidence issues
+            enriched_findings = []
+            for f in findings:
+                if f.get("confidence", 0) >= 0.7:
+                    print(f"[*] Generating Exploit PoC for: {f['title']}")
+                    poc = await self.exploit_gen.generate_poc(
+                        f['title'], 
+                        f.get('url', target), 
+                        f.get('evidence')
+                    )
+                    f['poc_details'] = poc
+                enriched_findings.append(f)
 
-    # -----------------------
-    # CORE ANALYSIS
-    # -----------------------
-    def analyze_vulnerability(self, vuln):
-        vuln_type = vuln.get("type", "Unknown")
-
-        return {
-            "type": vuln_type,
-            "url": vuln.get("url"),
-            "severity": vuln.get("severity"),
-            "cvss": vuln.get("cvss"),
-
-            "description": self.describe(vuln_type),
-            "impact": self.impact(vuln_type),
-            "exploit": self.exploit(vuln),
-            "fix": self.fix(vuln_type)
-        }
-
-    # -----------------------
-    # DESCRIPTIONS
-    # -----------------------
-    def describe(self, vuln_type):
-        descriptions = {
-            "SQL Injection": "Unsanitized user input is directly used in SQL queries.",
-            "XSS": "User input is reflected into the page without proper escaping.",
-            "DOM XSS": "JavaScript dynamically injects unsafe data into the DOM."
-        }
-        return descriptions.get(vuln_type, "Unknown vulnerability")
-
-    # -----------------------
-    # IMPACT
-    # -----------------------
-    def impact(self, vuln_type):
-        impacts = {
-            "SQL Injection": "Attackers can access, modify, or delete database data.",
-            "XSS": "Attackers can execute scripts in victims' browsers.",
-            "DOM XSS": "Client-side scripts can be hijacked."
-        }
-        return impacts.get(vuln_type, "Unknown impact")
-
-    # -----------------------
-    # EXPLOIT GENERATION
-    # -----------------------
-    def exploit(self, vuln):
-        if vuln["type"] == "SQL Injection":
-            return {
-                "example_payload": "' OR 1=1--",
-                "steps": [
-                    "Inject payload into parameter",
-                    "Observe altered response",
-                    "Extract database data using UNION queries"
-                ]
+            report = {
+                "target": target,
+                "summary": {
+                    "total_raw": len(vulnerabilities),
+                    "verified": len(enriched_findings),
+                    "critical": len([v for v in enriched_findings if v.get('severity') == 'Critical']),
+                    "high": len([v for v in enriched_findings if v.get('severity') == 'High'])
+                },
+                "findings": enriched_findings
             }
+            return report
 
-        if vuln["type"] == "XSS":
+        except Exception as e:
+            print(f"[!] Intelligence System Error: {e}")
             return {
-                "example_payload": "<script>alert(document.cookie)</script>",
-                "steps": [
-                    "Inject script into input field",
-                    "Wait for victim to load page",
-                    "Steal session cookies"
-                ]
+                "target": target, 
+                "status": "error",
+                "message": "AI System failed to process findings.",
+                "raw_data": vulnerabilities
             }
-
-        return {"note": "No exploit available"}
-
-    # -----------------------
-    # FIXES
-    # -----------------------
-    def fix(self, vuln_type):
-        fixes = {
-            "SQL Injection": [
-                "Use parameterized queries",
-                "Validate input strictly",
-                "Use ORM frameworks"
-            ],
-            "XSS": [
-                "Escape all user input",
-                "Use CSP headers",
-                "Sanitize output"
-            ],
-            "DOM XSS": [
-                "Avoid innerHTML",
-                "Use safe DOM APIs"
-            ]
-        }
-
-        return fixes.get(vuln_type, ["Manual review required"])
 
 ===== scanner\auth_handler.py =====
 
@@ -717,6 +666,89 @@ class Detector:
 
         return False
 
+===== scanner\exploit_gen.py =====
+
+import os
+import json
+import google.generativeai as genai
+from dotenv import load_dotenv
+
+load_dotenv()
+
+class AIReportGenerator:
+    def __init__(self):
+        # Setup Gemini
+        api_key = os.getenv("GEMINI_API_KEY")
+        genai.configure(api_key=api_key)
+        # Using 1.5-Flash for speed and high context window
+        self.model = genai.GenerativeModel('gemini-1.5-flash')
+
+    async def generate_report(self, vulnerabilities, target):
+        """
+        Uses Gemini to perform high-level security reasoning.
+        Now supports 'evidence' snippets from SAST and DAST for deeper analysis.
+        """
+        if not vulnerabilities:
+            return {"summary": "No vulnerabilities found.", "findings": []}
+
+        # Create a structured prompt for the AI
+        vuln_data = json.dumps(vulnerabilities, indent=2)
+        
+        prompt = f"""
+        You are a Senior Security Auditor and Penetration Tester. 
+        Analyze the following security findings for the target: {target}.
+
+        INSTRUCTIONS:
+        1. Review the 'type' and 'evidence' (code snippets or URLs) for each finding.
+        2. Differentiate between real threats and false positives (e.g., 'test' keys or example code).
+        3. For each REAL threat, provide:
+           - 'impact': The business/technical risk if exploited.
+           - 'exploitation': A step-by-step guide on how an attacker would use this.
+           - 'remediation': Precise code-level instructions to fix the issue.
+           - 'confidence': A score from 0.1 to 1.0.
+
+        DATA TO ANALYZE:
+        {vuln_data}
+
+        Return the result as a VALID JSON object with the key 'findings' containing the list of analyzed results.
+        Do not include markdown formatting like ```json in the final output.
+        """
+
+        try:
+            # Gemini call
+            response = self.model.generate_content(prompt)
+            
+            # Clean and parse JSON
+            raw_text = response.text.strip()
+            if "{" in raw_text:
+                start_index = raw_text.find("{")
+                end_index = raw_text.rfind("}") + 1
+                raw_text = raw_text[start_index:end_index]
+            
+            ai_data = json.loads(raw_text)
+
+            report = {
+                "target": target,
+                "summary": {
+                    "total_raw_findings": len(vulnerabilities),
+                    "verified_findings": len(ai_data.get("findings", [])),
+                    "critical": len([v for v in ai_data.get("findings", []) if v.get('severity') == 'Critical']),
+                    "high": len([v for v in ai_data.get("findings", []) if v.get('severity') == 'High'])
+                },
+                "findings": ai_data.get("findings", [])
+            }
+            return report
+
+        except Exception as e:
+            print(f"[!] Gemini Reasoning Error: {e}")
+            # Graceful degradation: Return raw findings if AI fails
+            return {
+                "target": target, 
+                "status": "partial_success",
+                "note": "AI reasoning failed, returning raw data.",
+                "findings": vulnerabilities
+            }
+
 ===== scanner\js_parser.py =====
 
 # scanner/js_parser.py
@@ -930,6 +962,97 @@ class SafetyAuditor:
         except Exception as e:
             return {"status": "Issue Detected", "details": str(e)}
 
+===== scanner\sast_engine.py =====
+
+import zipfile
+import os
+import re
+import logging
+import shutil
+
+class SASTScanner:
+    def __init__(self):
+        # 1. Expanded Patterns (The "Pattern Matcher" Limb)
+        self.patterns = {
+            "AWS Access Key": r"AKIA[0-9A-Z]{16}",
+            "AWS Secret Key": r"([^A-Z0-9+/]|[A-Z0-9+/]{40}(?![A-Z0-9+/]))",
+            "Google API Key": r"AIza[0-9A-Za-z\\-_]{35}",
+            "Firebase URL": r"https://.*\.firebaseio\.com",
+            "Generic Password Variable": r"(?i)(password|passwd|pwd|secret|auth_token)\s*[:=]\s*['\"](.*)['\"]",
+            "Database Connection String": r"(mongodb\+srv|postgres|mysql|sqlite):\/\/[^\s]+"
+        }
+        
+        # 2. Dangerous Function Detection (Language Specific)
+        self.dangerous_functions = {
+            ".py": [r"eval\(", r"exec\(", r"os\.system\(", r"subprocess\.popen\("],
+            ".js": [r"eval\(", r"innerHTML", r"document\.write\(", r"child_process\.exec\("],
+            ".php": [r"shell_exec\(", r"system\(", r"passthru\(", r"base64_decode\("]
+        }
+
+    def scan_zip(self, zip_path, extract_to="temp_extraction"):
+        findings = []
+        # Ensure clean extraction directory
+        if os.path.exists(extract_to):
+            shutil.rmtree(extract_to)
+        
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(extract_to)
+
+            for root, _, files in os.walk(extract_to):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    # Ignore non-text files and binary data
+                    if any(file.endswith(ext) for ext in ['.png', '.jpg', '.exe', '.pyc']):
+                        continue
+                        
+                    findings.extend(self.analyze_file(file_path))
+        
+        except Exception as e:
+            logging.error(f"[SAST ERROR] Failed to process zip: {e}")
+        finally:
+            # We keep files temporarily for Gemini to read later if needed
+            pass
+            
+        return findings
+
+    def analyze_file(self, path):
+        results = []
+        ext = os.path.splitext(path)[1]
+        
+        try:
+            with open(path, 'r', errors='ignore') as f:
+                content = f.read()
+                
+                # Check for Hardcoded Secrets
+                for name, pattern in self.patterns.items():
+                    matches = re.finditer(pattern, content)
+                    for match in matches:
+                        results.append({
+                            "type": "Hardcoded Secret",
+                            "item": name,
+                            "file": os.path.basename(path),
+                            "severity": "High",
+                            "evidence": match.group(0)[:50] # Snippet for the report
+                        })
+
+                # Check for Dangerous Functions (Code Injection Risks)
+                if ext in self.dangerous_functions:
+                    for pattern in self.dangerous_functions[ext]:
+                        if re.search(pattern, content):
+                            results.append({
+                                "type": "Dangerous Function Call",
+                                "item": pattern.replace('\\', ''),
+                                "file": os.path.basename(path),
+                                "severity": "Medium",
+                                "description": "Potentially insecure function that could lead to Command Injection."
+                            })
+                            
+        except Exception as e:
+            logging.error(f"[SAST ERROR] Could not read {path}: {e}")
+            
+        return results
+
 ===== scanner\validator.py =====
 
 
@@ -945,189 +1068,164 @@ import requests
 import pandas as pd
 import time
 import os
+import json  # Added for safe cookie parsing
+import plotly.express as px
 from datetime import datetime
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# CONFIG
-API_BASE = "http://localhost:8000"
-API_KEY = os.getenv("SENTINEL_API_KEY", "test-key-123")
-
-HEADERS = {
-    "x-api-key": API_KEY,
-    "Content-Type": "application/json"
-}
+# --- CONFIG ---
+# Pulls from Streamlit Cloud Secrets, falls back to localhost for your PC
+API_BASE = st.secrets.get("API_URL", "http://localhost:8000")
+API_KEY = st.secrets.get("SENTINEL_API_KEY", "test-key-123")
+HEADERS = {"x-api-key": API_KEY, "Content-Type": "application/json"}
 
 st.set_page_config(
-    page_title="Cortex Sentinel | Production Security",
+    page_title="Sentinel AI | Security Command Center",
     page_icon="🛡️",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-st.title("🛡️ Cortex Sentinel")
-st.caption("Authenticated Vulnerability Scanner")
+# --- CUSTOM CSS FOR MODERN DARK THEME ---
+st.markdown("""
+    <style>
+    .stMetric { background-color: #161b22; border: 1px solid #30363d; padding: 15px; border-radius: 10px; }
+    .stButton>button { width: 100%; border-radius: 5px; height: 3em; background-color: #238636; color: white; border: none; }
+    .stButton>button:hover { background-color: #2ea043; border: none; }
+    .report-card { background-color: #0d1117; border: 1px solid #30363d; padding: 20px; border-radius: 10px; margin-bottom: 10px; }
+    </style>
+    """, unsafe_allow_html=True)
 
-# -----------------------------
-# SIDEBAR
-# -----------------------------
+# --- SESSION STATE INITIALIZATION ---
+if 'job_id' not in st.session_state:
+    st.session_state.job_id = None
+if 'scan_results' not in st.session_state:
+    st.session_state.scan_results = None
+
+# --- SIDEBAR: CONFIGURATION ---
 with st.sidebar:
-    st.header("Scan Configuration")
-
-    target_url = st.text_input("Target URL", "http://testphp.vulnweb.com")
-    scan_mode = st.selectbox("Scan Mode", ["fast", "deep", "stealth"])
-
+    st.image("https://img.icons8.com/fluency/96/shield.png", width=60)
+    st.title("Sentinel AI")
+    st.caption("v2.0 | Autonomous Auditor")
     st.divider()
-
-    # 🔐 AUTH CONFIG UI
+    
+    target_url = st.text_input("🎯 Target URL", "http://testphp.vulnweb.com")
+    scan_mode = st.select_slider("Scan Intensity", options=["stealth", "fast", "deep"], value="fast")
+    
     st.subheader("🔐 Authentication")
-
-    auth_type = st.selectbox("Auth Type", ["None", "Login", "Cookie"])
-
+    auth_type = st.selectbox("Method", ["None", "Login Form", "Session Cookie"])
+    
     auth_config = None
-
-    if auth_type == "Login":
-        login_url = st.text_input("Login URL", "http://testphp.vulnweb.com/login.php")
-        username = st.text_input("Username", "test")
-        password = st.text_input("Password", "test", type="password")
-
-        auth_config = {
-            "type": "login",
-            "login_url": login_url,
-            "username": username,
-            "password": password
-        }
-
-    elif auth_type == "Cookie":
-        cookie_input = st.text_area("Cookies (JSON)", '{"PHPSESSID":"abc123"}')
-
-        try:
-            cookies = eval(cookie_input)
-            auth_config = {
-                "type": "cookie",
-                "cookies": cookies
-            }
-        except:
-            st.warning("Invalid cookie format")
+    if auth_type == "Login Form":
+        u = st.text_input("Username Field", "user")
+        p = st.text_input("Password Field", "pass", type="password")
+        l_url = st.text_input("Login URL", f"{target_url}/login")
+        auth_config = {"type": "form", "url": l_url, "fields": {"user": u, "pass": p}}
+    
+    elif auth_type == "Session Cookie":
+        c_name = st.text_input("Cookie Name", "PHPSESSID")
+        c_val = st.text_input("Value (JSON format)", '{"ID": "12345"}')
+        
+        # --- THE FIX: SAFE PARSING ---
+        if c_val:
+            try:
+                # Replaced eval() with safe json.loads()
+                parsed_val = json.loads(c_val)
+                auth_config = {"type": "cookie", "name": c_name, "value": parsed_val}
+            except json.JSONDecodeError:
+                st.error("❌ Invalid JSON in Cookie Value. Use format: {\"key\": \"value\"}")
+                auth_config = None
 
     st.divider()
-
-    start_scan = st.button("🚀 Start Scan")
-    load_report = st.button("📂 Last Report")
-
-# -----------------------------
-# START SCAN
-# -----------------------------
-if start_scan:
-
-    payload = {
-        "url": target_url,
-        "mode": scan_mode,
-        "auth": auth_config  # 🔥 SEND TO BACKEND
-    }
-
-    with st.spinner("Submitting scan job..."):
+    
+    if st.button("🚀 LAUNCH FULL AUDIT"):
+        payload = {
+            "url": target_url,
+            "mode": scan_mode,
+            "auth": auth_config
+        }
         try:
-            res = requests.post(
-                f"{API_BASE}/scan",
-                json=payload,
-                headers=HEADERS,
-                timeout=10
-            )
-
-            data = res.json()
-            job_id = data.get("job_id")
-
-            if not job_id:
-                st.error("Failed to create job")
-                st.stop()
-
-            st.success(f"Job started: {job_id}")
-
+            res = requests.post(f"{API_BASE}/scan", json=payload, headers=HEADERS)
+            if res.status_code == 200:
+                st.session_state.job_id = res.json().get("job_id")
+                st.session_state.scan_results = None # Reset for new scan
+                st.toast("Scan enqueued successfully!", icon="🛡️")
+            else:
+                st.error(f"Launch Failed: {res.text}")
         except Exception as e:
-            st.error(f"API Error: {e}")
-            st.stop()
+            st.error(f"Connection Error: {e}")
 
-    # -----------------------------
-    # TRACK JOB
-    # -----------------------------
+# --- MAIN INTERFACE ---
+if not st.session_state.job_id:
+    st.info("👋 Welcome. Enter a target URL in the sidebar to begin an autonomous security audit.")
+    st.image("https://raw.githubusercontent.com/streamlit/fluent-ui-components/master/docs/assets/banner.png")
+else:
+    # --- LIVE MONITORING SECTION ---
+    st.subheader(f"🛰️ Active Job: {st.session_state.job_id}")
+    
     progress_bar = st.progress(0)
-    status_text = st.empty()
-    log_box = st.empty()
-
-    logs = []
-
-    def log(msg):
-        logs.append(msg)
-        log_box.code("\n".join(logs[-10:]))
-
-    while True:
-        try:
-            job_res = requests.get(
-                f"{API_BASE}/job/{job_id}",
-                headers=HEADERS,
-                timeout=5
-            )
-
-            job_data = job_res.json()
-
-            status = job_data.get("status", "unknown")
-            progress = job_data.get("progress", 0)
-
-            progress_bar.progress(progress / 100)
-            status_text.info(f"{status} ({progress}%)")
-
-            log(f"{datetime.now().strftime('%H:%M:%S')} → {status}")
-
-            if status == "done":
-                st.success("Scan complete")
-                break
-
-            if status == "failed":
-                st.error("Scan failed")
-                break
-
-            time.sleep(2)
-
-        except Exception as e:
-            st.error(f"Tracking error: {e}")
-            break
-
-    # -----------------------------
-    # FETCH RESULTS
-    # -----------------------------
+    status_msg = st.empty()
+    
+    # Poll API for status
     try:
-        result_res = requests.get(
-            f"{API_BASE}/result/{job_id}",
-            headers=HEADERS
-        )
-
-        result_data = result_res.json()
-        vulns = result_data.get("vulnerabilities", [])
-
-        st.subheader("📊 Results")
-
-        if vulns:
-            df = pd.DataFrame(vulns)
-
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Critical", len(df[df["severity"] == "Critical"]))
-            col2.metric("High", len(df[df["severity"] == "High"]))
-            col3.metric("Medium", len(df[df["severity"] == "Medium"]))
-
-            st.dataframe(df, use_container_width=True)
-
-        else:
-            st.success("No vulnerabilities found")
-
+        status_res = requests.get(f"{API_BASE}/job/{st.session_state.job_id}", headers=HEADERS)
+        if status_res.status_code == 200:
+            data = status_res.json()
+            # Assuming data returns {"status": "...", "progress": 50}
+            p_val = data.get("progress", 0)
+            progress_bar.progress(p_val)
+            status_msg.markdown(f"**Current Task:** {data.get('status', 'Initializing...')}")
+            
+            if data.get("status") == "done" or p_val == 100:
+                if not st.session_state.scan_results:
+                    res_res = requests.get(f"{API_BASE}/result/{st.session_state.job_id}", headers=HEADERS)
+                    st.session_state.scan_results = res_res.json()
+        
     except Exception as e:
-        st.error(f"Result error: {e}")
+        st.error(f"Status Polling Error: {e}")
 
-# -----------------------------
-# LOAD REPORT
-# -----------------------------
-if load_report:
-    st.info("Feature coming: scan history by user")
+    # --- RESULTS TABS ---
+    if st.session_state.scan_results:
+        results = st.session_state.scan_results
+        findings = results.get("vulnerabilities", [])
+        
+        t1, t2, t3 = st.tabs(["📊 Overview", "🧠 AI Reasoning", "⚙️ Raw Data"])
+        
+        with t1:
+            m1, m2, m3, m4 = st.columns(4)
+            criticals = [f for f in findings if f.get('severity') == 'Critical']
+            highs = [f for f in findings if f.get('severity') == 'High']
+            
+            m1.metric("Critical", len(criticals))
+            m2.metric("High", len(highs))
+            m3.metric("Verified", len(findings))
+            m4.metric("Status", "Complete")
+
+            if findings:
+                df = pd.DataFrame(findings)
+                fig = px.pie(df, names='severity', title='Risk Distribution', 
+                             color_discrete_map={'Critical':'#ff4b4b', 'High':'#ff9f1c', 'Medium':'#ffeb3b'})
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.success("No vulnerabilities detected in this scan.")
+
+        with t2:
+            st.subheader("AI Auditor Analysis")
+            for f in findings:
+                with st.expander(f"{f.get('title', 'Unknown Issue')} - {f.get('severity', 'Low')}"):
+                    st.markdown("### Impact")
+                    st.write(f.get('description', 'No description provided.'))
+                    
+                    st.markdown("### 🧪 Proof of Concept")
+                    st.code(f.get('poc', 'N/A'))
+                    
+                    st.markdown("### 🛠️ Remediation")
+                    st.info(f.get('remediation', 'Apply latest security patches.'))
+
+        with t3:
+            st.json(results)
 
 ===== api\auth.py =====
 
@@ -1285,42 +1383,98 @@ async def upload_zip(file: UploadFile):
 import sys
 import os
 import asyncio
+import logging
+
+# Ensure project root is in the python path for imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from task_queue.redis_scanner import dequeue_scan
 from scanner.active_engine import ActiveScanner
+from scanner.sast_engine import SASTScanner
+from scanner.ai_report import AIReportGenerator
 from core.database import DatabaseManager
 from core.job_manager import update_job
-from scanner.ai_report import AIReportGenerator
 
-scanner = ActiveScanner()
+# Initialize global system components
+dast_engine = ActiveScanner()
+sast_engine = SASTScanner()
 db = DatabaseManager()
 reporter = AIReportGenerator()
-report = reporter.generate_report(results, url)
-db.save_report(job_id, report)
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 async def process(job):
+    """
+    Main Orchestrator: Decides whether to run SAST or DAST, 
+    then triggers the Gemini Reasoning Engine.
+    """
     job_id = job["job_id"]
-    url = job["url"]
-    print(f"[*] Processing: {url} (ID: {job_id})")
-
-    update_job(job_id, "running", 10)
-    results = await scanner.scan(
-    url,
-    auth_config=job.get("auth")
-  )
+    url = job.get("url")
+    zip_path = job.get("zip_path")
+    auth_config = job.get("auth")
     
-    update_job(job_id, "running", 90)
-    db.save_vulnerabilities(job_id, results)
-    update_job(job_id, "done", 100)
-    print(f"[+] Finished: {job_id}")
+    logging.info(f"[*] Starting Job {job_id} for {url or zip_path}")
 
-def run():
-    print("🚀 Worker started and listening...")
+    try:
+        # 1. Update status to started
+        update_job(job_id, "running", 10)
+        all_findings = []
+
+        # 2. TRIGGER DAST (Dynamic Website Scanning)
+        if url:
+            logging.info(f"[*] Running DAST Engine on {url}...")
+            dast_results = await dast_engine.scan(url, auth_config=auth_config)
+            if dast_results:
+                all_findings.extend(dast_results)
+            update_job(job_id, "running", 50)
+
+        # 3. TRIGGER SAST (Static Code/ZIP Scanning)
+        if zip_path and os.path.exists(zip_path):
+            logging.info(f"[*] Running SAST Engine on {zip_path}...")
+            sast_results = sast_engine.scan_zip(zip_path)
+            if sast_results:
+                all_findings.extend(sast_results)
+            update_job(job_id, "running", 80)
+
+        # 4. SAVE RAW DATA
+        if all_findings:
+            db.save_vulnerabilities(job_id, all_findings)
+
+        # 5. BRAIN PHASE: Gemini Reasoning & Exploit Generation
+        logging.info(f"[*] Intelligence Layer: Reasoning with Gemini AI...")
+        # Note: generate_report is now async to handle the Gemini API call
+        report_content = await reporter.generate_report(all_findings, url or zip_path)
+        
+        # 6. SAVE FINAL REPORT
+        db.save_report(job_id, report_content)
+        
+        update_job(job_id, "done", 100)
+        logging.info(f"[+] Job {job_id} completed successfully.")
+
+    except Exception as e:
+        logging.error(f"[!] Critical Error in Worker: {e}")
+        update_job(job_id, "failed", 100)
+
+async def main():
+    logging.info("🚀 Sentinel AI Worker is live. Monitoring Redis queue...")
+    
     while True:
-        job = dequeue_scan()
-        if job:
-            asyncio.run(process(job))
+        try:
+            # Pull the next job from Redis
+            job = dequeue_scan()
+            
+            if job:
+                await process(job)
+            
+            # Small sleep to prevent CPU spiking
+            await asyncio.sleep(1)
+            
+        except Exception as e:
+            logging.error(f"Queue Error: {e}")
+            await asyncio.sleep(5)
 
 if __name__ == "__main__":
-    run()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("Worker stopped by user.")
