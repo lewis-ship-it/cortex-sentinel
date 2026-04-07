@@ -12,6 +12,7 @@ pandas
 plotly
 psutil
 streamlit-lottie
+streamlit-agraph==0.0.45
 
 # AI & Intelligence Layer
 google-generativeai
