@@ -6,18 +6,11 @@ OUTPUT_FILE = "fullsend.txt"
 
 # 1. Add specific root files here
 TARGET_FILES = [
-    "app.py",
-    "docker-compose.yml",
-    "dockerfile",
-    "main.py",
-    "procfile",
-    "requirements.txt",
-    "test_redis.py"
 ]
 
 # 2. Folders you want to deep-crawl
 TARGET_FOLDERS = [
-    "core", "scanner", "api", "workers", "task_queue" , "workers" , "workers_orchestrator"
+    "core", "scanner", "api", "workers" , "workers_orchestrator"
 ]
 
 # 3. Things to ignore (crucial for clean dumps)
