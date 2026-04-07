@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
 class DatabaseManager:
     def __init__(self):
         url = os.getenv("SUPABASE_URL")
@@ -73,3 +74,20 @@ class DatabaseManager:
     def get_report(self, job_id):
         res = self.db.table("reports").select("*").eq("job_id", job_id).execute()
         return res.data[0] if res.data else None
+
+    # -----------------------
+    # LOGS
+    # -----------------------
+    def add_log(self, job_id, message):
+        self.db.table("scan_logs").insert({
+            "job_id": job_id,
+            "message": message
+        }).execute()
+
+    def get_logs(self, job_id):
+        res = self.db.table("scan_logs") \
+            .select("*") \
+            .eq("job_id", job_id) \
+            .order("created_at", desc=False) \
+            .execute()
+        return res.data

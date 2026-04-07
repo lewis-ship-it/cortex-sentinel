@@ -1,140 +1,312 @@
 import streamlit as st
 import requests
 import pandas as pd
-import time
-import os
 import json
 import plotly.express as px
-from streamlit_lottie import st_lottie
-from datetime import datetime
-from dotenv import load_dotenv
 
-load_dotenv()
+from streamlit_agraph import agraph, Node, Edge, Config
 
-# --- 1. CONFIG & ASSETS ---
-API_BASE = st.secrets.get("API_URL", "https://sentinel-api-0qde.onrender.com")
+# -------------------------
+# CONFIG
+# -------------------------
+API_BASE = st.secrets.get("API_URL", "http://localhost:8000")
 API_KEY = st.secrets.get("SENTINEL_API_KEY", "test-key-123")
-HEADERS = {"x-api-key": API_KEY, "Content-Type": "application/json"}
+HEADERS = {"x-api-key": API_KEY}
 
-st.set_page_config(page_title="Sentinel AI | Security Command Center", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Sentinel AI | Command Center", layout="wide")
+if st.button("📄 Generate PDF Report"):
+    res = requests.get(f"{API_BASE}/report/pdf/{job_id}", headers=HEADERS)
 
-def load_lottie(url):
-    r = requests.get(url)
-    return r.json() if r.status_code == 200 else None
+    if res.status_code == 200:
+        file_path = res.json()["file"]
 
-radar_anim = load_lottie("https://lottie.host/80783363-f938-4e58-958b-0803c400490b/O6fX8FhG1m.json")
+        with open(file_path, "rb") as f:
+            st.download_button(
+                label="⬇️ Download Report",
+                data=f,
+                file_name="security_report.pdf",
+                mime="application/pdf"
+            )
 
-# --- 2. CUSTOM CSS ---
-st.markdown("""
-    <style>
-    .stMetric { background-color: #161b22; border: 1px solid #30363d; padding: 15px; border-radius: 10px; }
-    .stButton>button { width: 100%; border-radius: 5px; height: 3em; background-color: #238636; color: white; border: none; }
-    .report-card { background-color: #0d1117; border: 1px solid #30363d; padding: 20px; border-radius: 10px; margin-bottom: 10px; }
-    </style>
-    """, unsafe_allow_html=True)
+# -------------------------
+# STATE
+# -------------------------
+if "job_id" not in st.session_state:
+    st.session_state.job_id = None
+if "report" not in st.session_state:
+    st.session_state.report = None
+if "selected_node" not in st.session_state:
+    st.session_state.selected_node = None
 
-# --- 3. SIDEBAR: SCAN CONFIGURATION ---
+# -------------------------
+# SIDEBAR
+# -------------------------
 with st.sidebar:
-    st.image("https://img.icons8.com/fluency/96/shield.png", width=60)
-    st.title("Sentinel AI")
-    st.caption("v2.0 | Autonomous Auditor")
-    st.divider()
-    
-    target_url = st.text_input("🎯 Target URL", "http://testphp.vulnweb.com")
-    scan_mode = st.select_slider("Scan Intensity", options=["stealth", "fast", "deep"], value="fast")
-    
-    st.subheader("🔐 Authentication")
-    auth_type = st.selectbox("Method", ["None", "Login Form", "Session Cookie"])
-    
-    auth_config = None
-    if auth_type == "Login Form":
-        u = st.text_input("Username Field", "user")
-        p = st.text_input("Password Field", "pass", type="password")
-        l_url = st.text_input("Login URL", f"{target_url}/login")
-        auth_config = {"type": "form", "url": l_url, "fields": {"user": u, "pass": p}}
-    elif auth_type == "Session Cookie":
-        c_name = st.text_input("Cookie Name", "PHPSESSID")
-        c_val = st.text_input("Value (JSON)", '{"ID": "12345"}')
-        if c_val:
-            try: auth_config = {"type": "cookie", "name": c_name, "value": json.loads(c_val)}
-            except: st.error("❌ Invalid JSON")
+    st.title("🛡️ Sentinel AI")
+    target = st.text_input("Target URL", "http://testphp.vulnweb.com")
 
-    st.divider()
-    if st.button("🚀 LAUNCH FULL AUDIT"):
-        payload = {"url": target_url, "mode": scan_mode, "auth": auth_config}
-        res = requests.post(f"{API_BASE}/scan", json=payload, headers=HEADERS)
+    if st.button("🚀 Launch Scan"):
+        res = requests.post(
+            f"{API_BASE}/scan",
+            json={"url": target},
+            headers=HEADERS
+        )
         if res.status_code == 200:
-            st.session_state.job_id = res.json().get("job_id")
-            st.session_state.scan_results = None
-            st.toast("Scan enqueued!", icon="🛡️")
+            st.session_state.job_id = res.json()["job_id"]
+            st.session_state.report = None
 
-# --- 4. MAIN INTERFACE & LIVE PROGRESS ---
-if not st.session_state.get("job_id"):
-    st.info("👋 Welcome. Enter a target URL in the sidebar to begin.")
-else:
-    status_container = st.empty()
-    
-    # --- POLLING LOOP ---
-    while True:
-        try:
-            # Get latest status from your Render API
-            resp = requests.get(f"{API_BASE}/job/{st.session_state.job_id}", headers=HEADERS).json()
-            status = resp.get("status", "queued")
-            progress = resp.get("progress", 0)
+# -------------------------
+# MAIN
+# -------------------------
+if not st.session_state.job_id:
+    st.info("Start a scan to view results.")
+    st.stop()
 
-            with status_container.container():
-                if status == "done":
-                    st.success("✅ Audit Complete!")
-                    st.balloons()
-                    # Fetch and store final findings
-                    final_res = requests.get(f"{API_BASE}/result/{st.session_state.job_id}", headers=HEADERS).json()
-                    st.session_state.scan_results = final_res.get("vulnerabilities", [])
-                    break 
-                
-                elif "failed" in status.lower():
-                    st.error(f"❌ Scan Error: {status}")
-                    break
+job_id = st.session_state.job_id
 
+# -------------------------
+# FETCH REPORT
+# -------------------------
+try:
+    res = requests.get(f"{API_BASE}/report/{job_id}", headers=HEADERS)
+    if res.status_code == 200:
+        st.session_state.report = res.json()["content"]
+except:
+    pass
+
+report = st.session_state.report
+
+if not report:
+    st.warning("Scan running... waiting for report.")
+    st.stop()
+
+# -------------------------
+# OVERVIEW
+# -------------------------
+st.title("🛰️ Security Command Center")
+
+summary = report.get("summary", {})
+
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Findings", summary.get("validated_findings", 0))
+c2.metric("Critical", summary.get("critical", 0))
+c3.metric("High", summary.get("high", 0))
+c4.metric("Chains", summary.get("chains_detected", 0))
+
+# -------------------------
+# TABS
+# -------------------------
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+    "📊 Risk",
+    "🎯 Priority",
+    "🔗 Chains",
+    "🧠 Critical Paths",
+    "🌐 Attack Graph",
+    "📡 Live Feed",
+    "📦 Code Audit",
+    "⚙️ Raw"
+])
+
+# -------------------------
+# TAB 1: RISK
+# -------------------------
+with tab1:
+    findings = report.get("findings", [])
+    if findings:
+        df = pd.DataFrame(findings)
+        fig = px.pie(df, names="severity", title="Risk Distribution")
+        st.plotly_chart(fig, use_container_width=True)
+        st.dataframe(df)
+
+# -------------------------
+# TAB 2: prioritization
+# -------------------------
+with tab2:
+    st.subheader("🎯 Risk Prioritization")
+
+    prioritized = report.get("prioritized", [])
+
+    if not prioritized:
+        st.info("No prioritized findings available")
+    else:
+        df = pd.DataFrame(prioritized)
+
+        st.dataframe(df[[
+            "type",
+            "url",
+            "severity",
+            "priority_score",
+            "fix_first"
+        ]])
+
+        # TOP RISK
+        top = report.get("summary", {}).get("top_risk")
+
+        if top:
+            st.markdown("## 🚨 Fix This First")
+            st.json(top)        
+
+# -------------------------
+# TAB 3: CHAINS
+# -------------------------
+with tab3:
+    chains = report.get("chains", [])
+    if not chains:
+        st.info("No chains found")
+    else:
+        for i, chain in enumerate(chains):
+            st.markdown(f"### Chain {i+1}")
+            for step in chain:
+                st.write(f"➡️ {step}")
+
+# -------------------------
+# TAB 4: CRITICAL PATHS
+# -------------------------
+with tab4:
+    paths = report.get("critical_paths", [])
+    if not paths:
+        st.info("No critical paths")
+    else:
+        for p in paths:
+            st.markdown("### ⚠️ Attack Path")
+            st.write(p)
+
+# -------------------------
+# TAB 5: INTERACTIVE GRAPH
+# -------------------------
+with tab5:
+    st.subheader("🌐 Interactive Attack Graph")
+
+    graph = report.get("attack_graph", {})
+
+    if not graph:
+        st.info("No graph data available")
+    else:
+        # FILTER
+        severity_filter = st.multiselect(
+            "Filter by severity",
+            ["Critical", "High", "Medium", "Low"],
+            default=["Critical", "High", "Medium", "Low"]
+        )
+
+        nodes = []
+        edges = []
+
+        for node_id, data in graph.items():
+            vuln = data["vuln"]
+            severity = vuln.get("severity", "Low")
+
+            if severity not in severity_filter:
+                continue
+
+            color = {
+                "Critical": "red",
+                "High": "orange",
+                "Medium": "yellow",
+                "Low": "green"
+            }.get(severity, "gray")
+
+            nodes.append(Node(
+                id=node_id,
+                label=vuln.get("type", "Vuln"),
+                size=25,
+                color=color
+            ))
+
+            for edge in data.get("edges", []):
+                edges.append(Edge(source=node_id, target=edge["to"]))
+
+        config = Config(
+            width="100%",
+            height=600,
+            directed=True,
+            physics=True,
+            hierarchical=False
+        )
+
+        selected = agraph(nodes=nodes, edges=edges, config=config)
+
+        # -------------------------
+        # NODE DETAILS PANEL
+        # -------------------------
+        if selected:
+            st.session_state.selected_node = selected
+
+        if st.session_state.selected_node:
+            node_data = graph.get(st.session_state.selected_node, {}).get("vuln", {})
+
+            st.markdown("### 🔍 Vulnerability Details")
+            st.json(node_data)
+# -------------------------
+# TAB 6: CODE AUDIT
+# -------------------------
+with tab7:
+    st.subheader("📦 Static Code Analysis")
+
+    uploaded_file = st.file_uploader("Upload ZIP", type=["zip"])
+
+    if uploaded_file:
+        with st.spinner("Analyzing code..."):
+            files = {
+                "file": (uploaded_file.name, uploaded_file, "application/zip")
+            }
+
+            res = requests.post(f"{API_BASE}/upload", files=files)
+
+            if res.status_code == 200:
+                data = res.json()
+                findings = data.get("findings", [])
+                path = data.get("path")
+
+                st.success(f"Scan complete: {len(findings)} findings")
+
+                if findings:
+                    df = pd.DataFrame(findings)
+                    st.dataframe(df)
+
+                    selected_file = st.selectbox(
+                        "Select file to view",
+                        list(set(f.get("file") for f in findings))
+                    )
+
+                    if selected_file:
+                        full_path = os.path.join(path, selected_file)
+
+                        try:
+                            with open(full_path, "r", errors="ignore") as f:
+                                content = f.read()
+
+                            st.code(content, language="python")
+
+                        except Exception as e:
+                            st.error(f"Cannot open file: {e}")
                 else:
-                    # PROGRESS UI
-                    c1, c2 = st.columns([1, 2])
-                    with c1:
-                        st_lottie(radar_anim, height=250, key="scanning")
-                    with c2:
-                        st.header(f"🛡️ Scan in Progress...")
-                        st.subheader(f"Current Phase: {status}")
-                        st.progress(progress / 100)
-                        st.write("Sentinel AI is analyzing attack vectors and testing payloads.")
-            
-            time.sleep(2) # Refresh UI every 2 seconds
-        except Exception as e:
-            st.warning("Reconnecting to Sentinel API...")
-            time.sleep(5)
+                    st.success("No issues found")
 
-# --- 5. RESULTS DASHBOARD (ORIGINAL DESIGN) ---
-if st.session_state.get("scan_results"):
-    findings = st.session_state.scan_results
-    
-    t1, t2 = st.tabs(["📊 Executive Summary", "🔍 Technical Findings"])
-    
-    with t1:
-        m1, m2, m3, m4 = st.columns(4)
-        crit = [f for f in findings if f.get('severity') == 'Critical']
-        high = [f for f in findings if f.get('severity') == 'High']
-        
-        m1.metric("Critical", len(crit))
-        m2.metric("High", len(high))
-        m3.metric("Verified", len(findings))
-        m4.metric("Status", "Complete")
+            else:
+                st.error("Upload failed")
 
-        if findings:
-            df = pd.DataFrame(findings)
-            fig = px.pie(df, names='severity', title='Risk Distribution', 
-                         color_discrete_map={'Critical':'#ff4b4b', 'High':'#ff9f1c'})
-            st.plotly_chart(fig, use_container_width=True)
+# -------------------------
+# TAB 8: RAW
+# -------------------------
+with tab8:
+    st.subheader("📡 Live Scan Feed")
 
-    with t2:
-        for f in findings:
-            with st.expander(f"{f.get('title', 'Issue')} - {f.get('severity', 'Medium')}"):
-                st.markdown(f"**Description**: {f.get('description')}")
-                st.code(f.get('poc', 'N/A'), language="http")
+    auto_refresh = st.checkbox("Auto refresh", True)
+
+    logs_container = st.container()
+
+    try:
+        res = requests.get(f"{API_BASE}/logs/{job_id}", headers=HEADERS)
+
+        if res.status_code == 200:
+            logs = res.json()
+
+            for log in logs:
+                logs_container.write(f"{log['created_at']} - {log['message']}")
+
+    except Exception as e:
+        st.error(f"Log error: {e}")
+
+    if auto_refresh:
+        st.experimental_rerun()

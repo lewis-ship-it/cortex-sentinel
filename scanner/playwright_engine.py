@@ -1,105 +1,74 @@
-# scanner/playwright_engine.py
-
 import asyncio
-from playwright.async_api import async_playwright
 import logging
-from urllib.parse import urlparse
+
+try:
+    from playwright.async_api import async_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+    logging.warning("[PLAYWRIGHT] playwright not installed. Browser scanning disabled.")
+
 
 class PlaywrightScanner:
+    """
+    Headless browser scanner for DOM-based XSS and JS-rendered content.
+    """
 
     def __init__(self):
-        self.xss_payload = "<script>alert(1)</script>"
+        self.xss_payloads = [
+            "<script>alert(1)</script>",
+            "\"><script>alert(1)</script>",
+            "<img src=x onerror=alert(1)>",
+        ]
 
-    async def scan(self, url, auth_config=None):
+    async def scan(self, url):
+        """
+        Returns (findings, endpoints) tuple.
+        findings: list of vulnerability dicts
+        endpoints: list of discovered URLs
+        """
+        if not PLAYWRIGHT_AVAILABLE:
+            logging.warning("[PLAYWRIGHT] Skipping browser scan - playwright not available.")
+            return [], []
+
         findings = []
         endpoints = set()
 
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context()
-            page = await context.new_page()
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                page = await browser.new_page()
 
-            try:
-                # -----------------------
-                # AUTH HANDLING
-                # -----------------------
-                if auth_config:
+                await page.goto(url, timeout=15000)
+
+                # Collect all links visible after JS renders
+                links = await page.eval_on_selector_all(
+                    "a[href]",
+                    "els => els.map(e => e.href)"
+                )
+                endpoints.update(links)
+
+                # Test XSS via URL param injection
+                for payload in self.xss_payloads:
+                    test_url = f"{url}?q={payload}"
                     try:
-                        if auth_config.get("type") == "login":
-                            await page.goto(auth_config.get("login_url"))
+                        await page.goto(test_url, timeout=10000)
+                        content = await page.content()
+                        if payload in content:
+                            findings.append({
+                                "type": "DOM XSS",
+                                "url": test_url,
+                                "payload": payload,
+                                "severity": "High",
+                                "confidence": 0.75,
+                                "evidence": payload
+                            })
+                    except Exception:
+                        pass
 
-                            await page.fill('input[name="username"]', auth_config.get("username", ""))
-                            await page.fill('input[name="password"]', auth_config.get("password", ""))
-
-                            await page.click("button[type=submit]")
-                            await page.wait_for_load_state("networkidle")
-
-                            logging.info("[PLAYWRIGHT] Logged in")
-
-                        elif auth_config.get("type") == "cookie":
-                            domain = urlparse(url).netloc
-
-                            cookies = [
-                                {
-                                    "name": k,
-                                    "value": v,
-                                    "domain": domain,
-                                    "path": "/"
-                                }
-                                for k, v in auth_config.get("cookies", {}).items()
-                            ]
-
-                            await context.add_cookies(cookies)
-                            logging.info("[PLAYWRIGHT] Cookies injected")
-
-                    except Exception as e:
-                        logging.error(f"[PLAYWRIGHT AUTH ERROR] {e}")
-
-                # -----------------------
-                # NETWORK LISTENER
-                # -----------------------
-                def handle_request(request):
-                    endpoints.add(request.url)
-
-                page.on("request", handle_request)
-
-                # -----------------------
-                # LOAD PAGE
-                # -----------------------
-                await page.goto(url, timeout=20000)
-                await page.wait_for_load_state("networkidle")
-
-                logging.info(f"[PLAYWRIGHT] Loaded {url}")
-
-                # -----------------------
-                # DOM XSS TEST
-                # -----------------------
-                await page.evaluate(f"""
-                    (() => {{
-                        let inputs = document.querySelectorAll('input, textarea');
-                        inputs.forEach(i => i.value = `{self.xss_payload}`);
-                    }})();
-                """)
-
-                # try to trigger events
-                await page.keyboard.press("Enter")
-                await page.wait_for_timeout(2000)
-
-                content = await page.content()
-
-                if self.xss_payload in content:
-                    findings.append({
-                        "type": "DOM XSS",
-                        "url": url,
-                        "severity": "Critical",
-                        "description": "Payload reflected in DOM after JS execution"
-                    })
-                    logging.warning(f"[PLAYWRIGHT] DOM XSS detected at {url}")
-
-            except Exception as e:
-                logging.error(f"[PLAYWRIGHT ERROR] {e}")
-
-            finally:
                 await browser.close()
+
+        except Exception as e:
+            logging.error(f"[PLAYWRIGHT ERROR] {url} -> {e}")
 
         return findings, list(endpoints)

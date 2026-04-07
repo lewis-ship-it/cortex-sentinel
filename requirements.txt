@@ -1,3 +1,5 @@
+# requirements.txt
+
 # Web Framework & API
 fastapi[all]
 uvicorn
@@ -8,14 +10,13 @@ python-multipart
 streamlit
 pandas
 plotly
-psutil          # Required for the 'No-Terminal' System Monitor logic
+psutil
 streamlit-lottie
-
 
 # AI & Intelligence Layer
 google-generativeai
 
-# Networking & Scraper
+# Networking & Scraping
 requests
 httpx
 beautifulsoup4
@@ -23,6 +24,16 @@ validators
 urllib3
 playwright
 
+# PDF Report Generation
+reportlab
+
 # Database & Queue
 supabase
 redis
+
+# Mobile Scanning
+androguard
+
+# NOTE: apktool is a Java binary, not a pip package.
+# It is installed via the Dockerfile automatically.
+# For local dev: https://apktool.org/docs/install

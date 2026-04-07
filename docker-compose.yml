@@ -1,8 +1,10 @@
+# docker-compose.yml
+
 version: '3.8'
 
 services:
-  # 1. REDIS: The Message Broker
-  # This serves as your "Inbox" for scan requests.
+
+  # 1. REDIS
   redis:
     image: redis:8.0-alpine
     container_name: sentinel_redis
@@ -15,12 +17,10 @@ services:
       timeout: 3s
       retries: 5
 
-  # 2. API: The Entry Point
-  # Handles the logic from main.py and pushes jobs to Redis.
+  # 2. API
   api:
     build: .
     container_name: sentinel_api
-    # Ensure this points to your specific main.py location
     command: uvicorn api.main:app --host 0.0.0.0 --port 8000
     ports:
       - "8000:8000"
@@ -31,30 +31,27 @@ services:
         condition: service_healthy
     restart: always
 
-  # 3. WORKER: The "Heavy Lifter"
-  # This runs the SAST_Engine and AI_Report logic.
+  # 3. WORKER  (fixed: was workers/worker.py, correct file is workers/workers.py)
   worker:
     build: .
     container_name: sentinel_worker
-    command: python workers/worker.py
+    command: python workers/workers.py
     env_file:
       - .env
     depends_on:
       redis:
         condition: service_healthy
     restart: always
-    # In production/Railway, this service is set to "autoscale" based on the queue
     deploy:
       resources:
         limits:
           memory: 1G
 
-  # 4. DASHBOARD: The UI
-  # Your Streamlit interface for non-terminal management.
+  # 4. DASHBOARD  (fixed: was app/dashboard.py, correct entry point is app.py)
   dashboard:
     build: .
     container_name: sentinel_dashboard
-    command: streamlit run app/dashboard.py --server.port 8501 --server.address 0.0.0.0
+    command: streamlit run app.py --server.port 8501 --server.address 0.0.0.0
     ports:
       - "8501:8501"
     env_file:
