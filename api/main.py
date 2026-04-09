@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 
 from task_queue.redis_scanner import enqueue_scan
 from task_queue.redis_client import push
-from task_queue.queues import NETWORK_QUEUE, MOBILE_QUEUE, API_QUEUE
+from task_queue.queues import NETWORK_QUEUE, MOBILE_QUEUE, API_QUEUE, SCAN_QUEUE
 from core.job_tracker import create_job, get_job
 from storage.database import DatabaseManager
 from scanner.report_builder import ReportBuilder
@@ -21,10 +21,10 @@ from scanner.dast.rate_limiter import RateLimiter
 
 load_dotenv()
 
-builder  = ReportBuilder()
-guard    = SafetyGuard()
+builder = ReportBuilder()
+guard = SafetyGuard()
 verifier = DomainVerifier()
-limiter  = RateLimiter()
+limiter = RateLimiter()
 
 # FIX: detect Docker by checking for the container sentinel env var or hostname
 # Only start an inline worker thread when running locally (not in Docker),
@@ -34,18 +34,15 @@ _IS_DOCKER = os.path.exists("/.dockerenv") or os.getenv("RUNNING_IN_DOCKER") == 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if not _IS_DOCKER:
-        try:
-            from workers.workers import start_worker_loop
-            worker_thread = threading.Thread(target=start_worker_loop, daemon=True)
-            worker_thread.start()
-            print("Background Worker Thread Started (local mode)")
-        except Exception as e:
-            print(f"CRITICAL: Worker failed to start: {e}")
-    else:
-        print("Docker mode: worker managed by separate container service")
+    """
+    API Lifecycle Manager.
+    Note: We no longer start an internal worker thread here.
+    The Scanner and Aggregator are now run as independent processes.
+    """
+    print("🚀 Cortex Sentinel API: Online")
+    # You can initialize database connections here if needed
     yield
-    print("Shutting down...")
+    print("🛠️  Cortex Sentinel API: Shutting down...")
 
 
 api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
@@ -69,8 +66,9 @@ db = DatabaseManager()
 @app.post("/scan")
 async def scan(req: dict, key: str = Depends(verify_api_key)):
     target_url = req.get("url")
-    user_id    = key
+    user_id = key
 
+    # 1. Safety Guards (All pass or raise Exception)
     if not target_url:
         raise HTTPException(400, "Missing URL")
     if not limiter.allow(user_id):
@@ -80,16 +78,23 @@ async def scan(req: dict, key: str = Depends(verify_api_key)):
     if not req.get("verified", False):
         raise HTTPException(403, "Domain not verified")
 
+    # 2. JOB EXECUTION (Must be at this indentation level)
     job_id = str(uuid.uuid4())
     create_job(job_id, target_url)
-    enqueue_scan({"job_id": job_id, "url": target_url, "auth": req.get("auth")})
+
+    from task_queue.queues import SCAN_QUEUE
+    push(SCAN_QUEUE, {
+        "job_id": job_id,
+        "url": target_url,
+        "auth": req.get("auth")
+    })
 
     return {"job_id": job_id, "type": "web_scan"}
 
 
 @app.post("/scan/network")
 async def scan_network(req: dict, key: str = Depends(verify_api_key)):
-    host    = req.get("host") or req.get("url")
+    host = req.get("host") or req.get("url")
     user_id = key
 
     if not host:
@@ -102,8 +107,8 @@ async def scan_network(req: dict, key: str = Depends(verify_api_key)):
     job_id = str(uuid.uuid4())
     create_job(job_id, host)
     push(NETWORK_QUEUE, {
-        "job_id":     job_id,
-        "url":        host,
+        "job_id": job_id,
+        "url": host,
         "port_range": req.get("port_range"),
     })
 
@@ -113,7 +118,7 @@ async def scan_network(req: dict, key: str = Depends(verify_api_key)):
 @app.post("/scan/api")
 async def scan_api(req: dict, key: str = Depends(verify_api_key)):
     target_url = req.get("url")
-    user_id    = key
+    user_id = key
 
     if not target_url:
         raise HTTPException(400, "Missing URL")
@@ -127,10 +132,10 @@ async def scan_api(req: dict, key: str = Depends(verify_api_key)):
     job_id = str(uuid.uuid4())
     create_job(job_id, target_url)
     push(API_QUEUE, {
-        "job_id":     job_id,
-        "url":        target_url,
+        "job_id": job_id,
+        "url": target_url,
         "auth_token": req.get("auth_token"),
-        "spec_url":   req.get("spec_url"),
+        "spec_url": req.get("spec_url"),
     })
 
     return {"job_id": job_id, "type": "api_scan"}
