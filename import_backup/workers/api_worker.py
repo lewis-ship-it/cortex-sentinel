@@ -5,7 +5,7 @@ import logging
 
 from task_queue.redis_client import pop, push, retry
 from task_queue.queues import API_QUEUE, AGGREGATION_QUEUE
-from scanner.api.api_engine import APIEngine
+from scanner.api_engine import APIEngine
 from core.job_tracker import update_stage
 
 engine = APIEngine()

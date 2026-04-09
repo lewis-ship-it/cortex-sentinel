@@ -3,7 +3,7 @@ import subprocess
 import psutil
 import os
 import time
-from storage.database import DatabaseManager
+from core.database import DatabaseManager
 from dotenv import load_dotenv
 
 load_dotenv()

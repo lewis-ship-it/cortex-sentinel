@@ -4,7 +4,7 @@ import uuid
 import hashlib
 import os
 from fastapi import APIRouter, HTTPException
-from storage.database import DatabaseManager
+from core.database import DatabaseManager
 
 router = APIRouter()
 db     = DatabaseManager()

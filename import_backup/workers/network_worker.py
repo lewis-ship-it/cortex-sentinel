@@ -5,7 +5,7 @@ import logging
 
 from task_queue.redis_client import pop, push, retry
 from task_queue.queues import NETWORK_QUEUE, AGGREGATION_QUEUE
-from scanner.network.network_engine import NetworkEngine
+from scanner.network_engine import NetworkEngine
 from core.job_tracker import update_stage
 
 engine = NetworkEngine()

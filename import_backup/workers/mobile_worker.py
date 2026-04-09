@@ -2,7 +2,7 @@ import asyncio
 
 from task_queue.redis_client import pop, retry
 from task_queue.queues import EXPLOIT_QUEUE
-from scanner.exploit.exploit_engine import ExploitEngine
+from scanner.exploit_engine import ExploitEngine
 from core.orchestrator import Orchestrator
 
 engine = ExploitEngine()

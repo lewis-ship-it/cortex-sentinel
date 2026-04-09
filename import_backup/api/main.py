@@ -13,11 +13,11 @@ from task_queue.redis_scanner import enqueue_scan
 from task_queue.redis_client import push
 from task_queue.queues import NETWORK_QUEUE, MOBILE_QUEUE, API_QUEUE
 from core.job_tracker import create_job, get_job
-from storage.database import DatabaseManager
+from core.database import DatabaseManager
 from scanner.report_builder import ReportBuilder
 from scanner.safety_guard import SafetyGuard
 from api.domain_verification import DomainVerifier
-from scanner.dast.rate_limiter import RateLimiter
+from scanner.rate_limiter import RateLimiter
 
 load_dotenv()
 

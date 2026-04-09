@@ -4,10 +4,10 @@ import time
 import logging
 
 from scanner.crawler import Crawler
-from scanner.dast.param_engine import ParamEngine
+from scanner.param_engine import ParamEngine
 from scanner.detector import Detector
 from scanner.auth_handler import AuthHandler
-from scanner.dast.priority_engine import PriorityEngine
+from scanner.priority_engine import PriorityEngine
 from scanner.learning_engine import LearningEngine
 from scanner.ai_brain import AIBrain
 

@@ -1,4 +1,4 @@
-from storage.database import DatabaseManager
+from core.database import DatabaseManager
 
 db = DatabaseManager()
 
