@@ -20,24 +20,21 @@ def update_job(job_id, status=None, progress=None):
 
 def update_stage(job_id, stage, progress):
     """Alias used by worker modules for stage-based progress updates."""
-    db.db.table("jobs").update({
-        "status": stage,
-        "progress": progress
-    }).eq("id", job_id).execute()
+    db.update_job(job_id, status=stage, progress=progress)
 
 
 def append_findings(job_id, findings):
+    # FIX: added "payload" field to match the vulnerabilities table schema
     if not findings:
         return
-
     data = []
     for f in findings:
         data.append({
-            "job_id": job_id,
-            "type": f.get("type"),
-            "severity": f.get("severity"),
-            "url": f.get("url"),
-            "description": f.get("description", "")
+            "job_id":      job_id,
+            "type":        f.get("type"),
+            "severity":    f.get("severity"),
+            "url":         f.get("url"),
+            "description": f.get("description", ""),
+            "payload":     f.get("payload"),
         })
-
     db.db.table("vulnerabilities").insert(data).execute()

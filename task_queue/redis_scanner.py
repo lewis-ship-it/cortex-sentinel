@@ -1,34 +1,18 @@
-import redis
-import os
-import json
-from dotenv import load_dotenv
+# task_queue/redis_scanner.py
+# Thin wrapper kept for backward compatibility with workers/workers.py.
+# All actual queue logic lives in task_queue/redis_client.py.
 
-load_dotenv()
-
-# Use 'rediss://' for Upstash SSL compatibility.
-# NEVER hardcode credentials here — always use .env
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-
-redis_client = redis.from_url(
-    REDIS_URL,
-    ssl_cert_reqs=None,  # Required for cloud environments (e.g. Upstash)
-    decode_responses=True
-)
+import logging
+from task_queue.redis_client import push, pop
+from task_queue.queues import SCAN_QUEUE
 
 
-def enqueue_scan(data):
-    """Pushes a job into the queue."""
-    redis_client.lpush("scan_queue", json.dumps(data))
-    print(f"DEBUG: Job sent to Redis: {data.get('job_id')}")
+def enqueue_scan(data: dict) -> None:
+    """Push a web-scan job onto the scan queue."""
+    push(SCAN_QUEUE, data)
+    logging.debug(f"[REDIS] Job enqueued: {data.get('job_id')}")
 
 
-def dequeue_scan():
-    """Pops a job from the queue."""
-    data = redis_client.rpop("scan_queue")
-    if data:
-        try:
-            return json.loads(data)
-        except json.JSONDecodeError as e:
-            print(f"[REDIS] Failed to parse job: {e}")
-            return None
-    return None
+def dequeue_scan() -> dict:
+    """Pop a web-scan job from the scan queue."""
+    return pop(SCAN_QUEUE)

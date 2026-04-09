@@ -13,21 +13,12 @@ class AIBrain:
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel("gemini-1.5-flash")
 
-    # -------------------------
-    # VALIDATE FINDING
-    # -------------------------
-    async def validate_finding(self, finding):
-        """
-        AI decides:
-        - Is this real?
-        - How dangerous is it?
-        """
-
+    # ── Validate Finding ────────────────────────────────────────────────────
+    async def validate_finding(self, finding) -> dict:
         prompt = f"""
         You are a senior penetration tester.
 
         Analyze this finding:
-
         {json.dumps(finding, indent=2)}
 
         Answer STRICTLY in JSON:
@@ -38,70 +29,50 @@ class AIBrain:
           "severity": "Low/Medium/High/Critical"
         }}
         """
-
         try:
             res = await asyncio.to_thread(self.model.generate_content, prompt)
             text = res.text.strip()
-
             if "{" in text:
                 text = text[text.find("{"):text.rfind("}") + 1]
-
             return json.loads(text)
-
         except Exception as e:
             return {
                 "valid": True,
                 "confidence": 0.5,
                 "reason": f"AI error: {str(e)}",
-                "severity": finding.get("severity", "Medium")
+                "severity": finding.get("severity", "Medium"),
             }
 
-    # -------------------------
-    # GENERATE SMART PAYLOADS
-    # -------------------------
-    async def generate_payloads(self, context):
-        """
-        AI creates new payloads based on target behavior
-        """
-
+    # ── Generate Smart Payloads ─────────────────────────────────────────────
+    async def generate_payloads(self, context) -> list:
         prompt = f"""
         You are an advanced exploit developer.
 
         Target context:
         {context}
 
-        Generate 5 advanced payloads for:
-        - SQL Injection OR
-        - XSS
+        Generate 5 advanced payloads for SQL Injection OR XSS.
 
         Return JSON:
         {{
           "payloads": ["...", "..."]
         }}
         """
-
         try:
             res = await asyncio.to_thread(self.model.generate_content, prompt)
             text = res.text.strip()
-
             if "{" in text:
                 text = text[text.find("{"):text.rfind("}") + 1]
-
-            data = json.loads(text)
-            return data.get("payloads", [])
-
-        except:
+            return json.loads(text).get("payloads", [])
+        except Exception:
             return []
 
-    # -------------------------
-    # ANALYZE ATTACK CHAIN
-    # -------------------------
-    async def analyze_attack_chain(self, findings):
+    # ── Analyze Attack Chain ────────────────────────────────────────────────
+    async def analyze_attack_chain(self, findings) -> dict:
         prompt = f"""
         You are an elite penetration tester.
 
         These vulnerabilities were found:
-
         {json.dumps(findings, indent=2)}
 
         Identify REAL attack chains.
@@ -117,32 +88,21 @@ class AIBrain:
           ]
         }}
         """
-
         try:
             res = await asyncio.to_thread(self.model.generate_content, prompt)
             text = res.text.strip()
-
             if "{" in text:
                 text = text[text.find("{"):text.rfind("}") + 1]
-
             return json.loads(text)
-
-        except:
+        except Exception:
             return {"chains": []}
 
-    # -------------------------
-    # DECIDE NEXT TARGETS
-    # -------------------------
-    async def prioritize_targets(self, endpoints):
-        """
-        AI chooses high-risk endpoints
-        """
-
+    # ── Prioritize Targets ──────────────────────────────────────────────────
+    async def prioritize_targets(self, endpoints) -> list:
         prompt = f"""
         You are a web security expert.
 
         Rank these endpoints by likelihood of vulnerability:
-
         {json.dumps(endpoints[:50], indent=2)}
 
         Return JSON:
@@ -150,16 +110,11 @@ class AIBrain:
           "priority": ["url1", "url2"]
         }}
         """
-
         try:
             res = await asyncio.to_thread(self.model.generate_content, prompt)
             text = res.text.strip()
-
             if "{" in text:
                 text = text[text.find("{"):text.rfind("}") + 1]
-
-            data = json.loads(text)
-            return data.get("priority", endpoints)
-
-        except:
+            return json.loads(text).get("priority", endpoints)
+        except Exception:
             return endpoints

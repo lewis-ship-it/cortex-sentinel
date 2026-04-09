@@ -26,18 +26,26 @@ guard    = SafetyGuard()
 verifier = DomainVerifier()
 limiter  = RateLimiter()
 
+# FIX: detect Docker by checking for the container sentinel env var or hostname
+# Only start an inline worker thread when running locally (not in Docker),
+# since the Docker Compose stack runs the worker as its own dedicated service.
+_IS_DOCKER = os.path.exists("/.dockerenv") or os.getenv("RUNNING_IN_DOCKER") == "1"
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    try:
-        from workers.workers import start_worker_loop
-        worker_thread = threading.Thread(target=start_worker_loop, daemon=True)
-        worker_thread.start()
-        print("✅ Background Worker Thread Started Successfully")
-    except Exception as e:
-        print(f"❌ CRITICAL: Worker failed to start: {e}")
+    if not _IS_DOCKER:
+        try:
+            from workers.workers import start_worker_loop
+            worker_thread = threading.Thread(target=start_worker_loop, daemon=True)
+            worker_thread.start()
+            print("Background Worker Thread Started (local mode)")
+        except Exception as e:
+            print(f"CRITICAL: Worker failed to start: {e}")
+    else:
+        print("Docker mode: worker managed by separate container service")
     yield
-    print("🛠️  Worker Thread: Stopping...")
+    print("Shutting down...")
 
 
 api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
@@ -53,14 +61,11 @@ def verify_api_key(key: str = Security(api_key_header)):
 app = FastAPI(
     title="Sentinel AI API",
     lifespan=lifespan,
-    dependencies=[Depends(verify_api_key)]
+    dependencies=[Depends(verify_api_key)],
 )
 db = DatabaseManager()
 
 
-# ─────────────────────────────────────────────
-# WEB APP SCAN
-# ─────────────────────────────────────────────
 @app.post("/scan")
 async def scan(req: dict, key: str = Depends(verify_api_key)):
     target_url = req.get("url")
@@ -82,19 +87,8 @@ async def scan(req: dict, key: str = Depends(verify_api_key)):
     return {"job_id": job_id, "type": "web_scan"}
 
 
-# ─────────────────────────────────────────────
-# NETWORK SCAN
-# ─────────────────────────────────────────────
 @app.post("/scan/network")
 async def scan_network(req: dict, key: str = Depends(verify_api_key)):
-    """
-    Body:
-    {
-        "host":       "192.168.1.1",
-        "port_range": [22, 80, 443],   # optional
-        "verified":   true
-    }
-    """
     host    = req.get("host") or req.get("url")
     user_id = key
 
@@ -110,29 +104,14 @@ async def scan_network(req: dict, key: str = Depends(verify_api_key)):
     push(NETWORK_QUEUE, {
         "job_id":     job_id,
         "url":        host,
-        "port_range": req.get("port_range", None)
+        "port_range": req.get("port_range"),
     })
 
     return {"job_id": job_id, "type": "network_scan"}
 
 
-# ─────────────────────────────────────────────
-# API DEEP SCAN  ← new
-# ─────────────────────────────────────────────
 @app.post("/scan/api")
 async def scan_api(req: dict, key: str = Depends(verify_api_key)):
-    """
-    Deep API security scan: GraphQL, JWT, BOLA, rate limiting,
-    mass assignment, CORS, HTTP method abuse, and more.
-
-    Body:
-    {
-        "url":        "https://api.example.com",   # required
-        "auth_token": "eyJ...",                    # optional Bearer token
-        "spec_url":   "https://api.example.com/openapi.json",  # optional
-        "verified":   true
-    }
-    """
     target_url = req.get("url")
     user_id    = key
 
@@ -157,14 +136,11 @@ async def scan_api(req: dict, key: str = Depends(verify_api_key)):
     return {"job_id": job_id, "type": "api_scan"}
 
 
-# ─────────────────────────────────────────────
-# STATUS / RESULTS
-# ─────────────────────────────────────────────
 @app.get("/job/{job_id}")
 def job_status(job_id: str):
     job = get_job(job_id)
     if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+        raise HTTPException(404, "Job not found")
     return job
 
 
@@ -178,7 +154,6 @@ def generate_pdf(job_id: str):
     report = db.get_report(job_id)
     if not report:
         raise HTTPException(404, "Report not found")
-
     file_path = f"report_{job_id}.pdf"
     builder.build_pdf(file_path, report["content"])
     return {"file": file_path}

@@ -4,15 +4,14 @@ import fnmatch
 # --- CONFIGURATION ---
 OUTPUT_FILE = "fullsend.txt"
 
-# 1. Add specific root files here
+# 1. Add specific root files here ]
 TARGET_FILES = [
 ]
 
 # 2. Folders you want to deep-crawl
 TARGET_FOLDERS = [
-    "core", "scanner", "api", "workers" , "workers_orchestrator"
+    "workers"
 ]
-
 # 3. Things to ignore (crucial for clean dumps)
 IGNORE_PATTERNS = ["__pycache__", "*.pyc", ".git", ".env", "venv", "node_modules"]
 

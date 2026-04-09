@@ -8,19 +8,14 @@ r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
 def add_findings(job_id, findings):
     key = f"agg:{job_id}"
-
     existing = r.get(key)
-    if existing:
-        data = json.loads(existing)
-    else:
-        data = []
-
+    data = json.loads(existing) if existing else []
     data.extend(findings)
 
-    # Deduplicate
+    # Deduplicate by (type, url, payload)
     unique = {}
     for f in data:
-        k = f"{f.get('type')}_{f.get('url')}_{f.get('payload','')}"
+        k = f"{f.get('type')}_{f.get('url')}_{f.get('payload', '')}"
         unique[k] = f
 
     r.set(key, json.dumps(list(unique.values())))

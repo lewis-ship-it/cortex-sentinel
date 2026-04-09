@@ -4,13 +4,11 @@ import asyncio
 import logging
 import google.generativeai as genai
 from dotenv import load_dotenv
+from scanner.ai_brain import AIBrain
 
 load_dotenv()
 
 
-# -------------------------------
-# SAFE JSON PARSER
-# -------------------------------
 def safe_json_parse(text):
     try:
         if "{" in text:
@@ -20,9 +18,6 @@ def safe_json_parse(text):
         return None
 
 
-# -------------------------------
-# EXPLOIT GENERATOR
-# -------------------------------
 class ExploitGenerator:
     def __init__(self, model):
         self.model = model
@@ -45,7 +40,6 @@ class ExploitGenerator:
           "explanation": "..."
         }}
         """
-
         try:
             response = await asyncio.to_thread(self.model.generate_content, prompt)
             parsed = safe_json_parse(response.text)
@@ -54,41 +48,30 @@ class ExploitGenerator:
             return {"error": str(e)}
 
 
-# -------------------------------
-# AI REPORT GENERATOR
-# -------------------------------
 class AIReportGenerator:
     def __init__(self):
         api_key = os.getenv("GEMINI_API_KEY")
         genai.configure(api_key=api_key)
 
-        self.model = genai.GenerativeModel('gemini-1.5-flash')
-        self.exploit_gen = ExploitGenerator(self.model)
+        self._model = genai.GenerativeModel("gemini-1.5-flash")
+        self.exploit_gen = ExploitGenerator(self._model)
+
+        # FIX: expose brain publicly so workers.py can call
+        # reporter.brain.analyze_attack_chain(...)
+        self.brain = AIBrain()
 
     async def generate_report(self, data, target):
-        """
-        Accepts:
-        {
-            findings: [],
-            attack_graph: {},
-            chains: []
-        }
-        """
-
-        findings = data.get("findings", [])
+        findings     = data.get("findings", [])
         attack_graph = data.get("attack_graph", {})
-        chains = data.get("chains", [])
+        chains       = data.get("chains", [])
 
         if not findings:
             return {
-                "target": target,
-                "summary": "No vulnerabilities found.",
-                "findings": []
+                "target":   target,
+                "summary":  "No vulnerabilities found.",
+                "findings": [],
             }
 
-        # -------------------------------
-        # AI REASONING PROMPT (UPGRADED)
-        # -------------------------------
         prompt = f"""
         You are an elite penetration tester.
 
@@ -120,71 +103,55 @@ class AIReportGenerator:
         """
 
         try:
-            response = await asyncio.to_thread(self.model.generate_content, prompt)
-
-            ai_data = safe_json_parse(response.text)
+            response = await asyncio.to_thread(self._model.generate_content, prompt)
+            ai_data  = safe_json_parse(response.text)
 
             if not ai_data:
                 raise Exception("AI returned invalid JSON")
 
             refined_findings = ai_data.get("findings", [])
 
-            # -------------------------------
-            # GENERATE POCs (SMART FILTER)
-            # -------------------------------
+            # Generate PoCs for high-confidence findings
             enriched = []
             for f in refined_findings:
-                confidence = float(f.get("confidence", 0.5))
-
-                if confidence >= 0.7:
+                if float(f.get("confidence", 0.5)) >= 0.7:
                     logging.info(f"[AI] Generating PoC for {f.get('title')}")
-
                     poc = await self.exploit_gen.generate_poc(
                         f.get("title"),
                         f.get("url", target),
-                        f.get("evidence")
+                        f.get("evidence"),
                     )
-
                     f["poc"] = poc
 
-                enriched.append(f)
-
-            # -------------------------------
-            # NORMALIZE SEVERITY
-            # -------------------------------
-            for f in enriched:
+                # Normalize severity
                 sev = str(f.get("severity", "Low")).capitalize()
-                if sev not in ["Critical", "High", "Medium", "Low"]:
+                if sev not in ("Critical", "High", "Medium", "Low"):
                     sev = "Medium"
                 f["severity"] = sev
+                enriched.append(f)
 
-            # -------------------------------
-            # FINAL REPORT
-            # -------------------------------
             report = {
                 "target": target,
                 "summary": {
-                    "total_findings": len(findings),
+                    "total_findings":     len(findings),
                     "validated_findings": len(enriched),
-                    "critical": len([f for f in enriched if f["severity"] == "Critical"]),
-                    "high": len([f for f in enriched if f["severity"] == "High"]),
-                    "chains_detected": len(chains)
+                    "critical":           len([f for f in enriched if f["severity"] == "Critical"]),
+                    "high":               len([f for f in enriched if f["severity"] == "High"]),
+                    "chains_detected":    len(chains),
                 },
                 "critical_paths": ai_data.get("critical_paths", []),
-                "findings": enriched,
-                "recommendations": ai_data.get("recommendations", [])
+                "findings":       enriched,
+                "recommendations": ai_data.get("recommendations", []),
             }
-
             return report
 
         except Exception as e:
             logging.error(f"[AI ERROR] {e}")
-
             return {
-                "target": target,
-                "status": "fallback",
-                "message": "AI failed, returning raw structured data",
-                "findings": findings,
+                "target":       target,
+                "status":       "fallback",
+                "message":      "AI failed, returning raw structured data",
+                "findings":     findings,
                 "attack_graph": attack_graph,
-                "chains": chains
+                "chains":       chains,
             }

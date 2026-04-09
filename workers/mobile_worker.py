@@ -1,53 +1,36 @@
-# workers/mobile_worker.py
-
 import asyncio
-import logging
-import os
 
-from task_queue.redis_client import pop, push, retry
-from task_queue.queues import MOBILE_QUEUE, AGGREGATION_QUEUE
-from scanner.mobile_engine import MobileEngine
-from core.job_tracker import update_stage
+from task_queue.redis_client import pop, retry
+from task_queue.queues import EXPLOIT_QUEUE
+from scanner.exploit_engine import ExploitEngine
+from core.orchestrator import Orchestrator
 
-engine = MobileEngine()
+engine = ExploitEngine()
+orchestrator = Orchestrator()
 
 
 async def main():
-    logging.info("[MOBILE WORKER] Ready and listening...")
-
     while True:
-        job = pop(MOBILE_QUEUE)
-
+        job = pop(EXPLOIT_QUEUE)
         if not job:
             await asyncio.sleep(1)
             continue
 
-        job_id   = job.get("job_id")
-        apk_path = job.get("apk_path")
-
         try:
-            if not apk_path or not os.path.exists(apk_path):
-                raise FileNotFoundError(f"APK not found at path: {apk_path}")
+            job_id = job["job_id"]
+            findings = job.get("data", {}).get("findings", [])
 
-            logging.info(f"[MOBILE WORKER] Scanning: {apk_path}")
-            update_stage(job_id, "mobile_scan", 10)
+            validated = await engine.verify(findings)
 
-            # Run in executor so the async loop stays unblocked
-            # (apktool subprocess is synchronous)
-            loop = asyncio.get_event_loop()
-            findings = await loop.run_in_executor(None, engine.scan, apk_path)
-
-            logging.info(f"[MOBILE WORKER] {len(findings)} findings for {apk_path}")
-            update_stage(job_id, "mobile_scan_done", 50)
-
-            push(AGGREGATION_QUEUE, {
-                "job_id":   job_id,
-                "findings": findings
-            })
+            await orchestrator.on_stage_complete(
+                job_id,
+                "exploit",
+                {"findings": validated}
+            )
 
         except Exception as e:
-            logging.error(f"[MOBILE WORKER] Failed: {e}")
-            retry(MOBILE_QUEUE, job, str(e))
+            retry(EXPLOIT_QUEUE, job, str(e))
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())

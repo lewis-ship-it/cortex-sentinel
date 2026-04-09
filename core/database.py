@@ -18,19 +18,18 @@ class DatabaseManager:
     # -----------------------
     def insert_job(self, job_id, url, status, progress):
         self.db.table("jobs").insert({
-            "id": job_id,
-            "url": url,
-            "status": status,
+            "id":       job_id,
+            "url":      url,
+            "status":   status,
             "progress": progress
         }).execute()
 
     def update_job(self, job_id, status=None, progress=None):
         update_data = {}
-        if status:
+        if status is not None:
             update_data["status"] = status
         if progress is not None:
             update_data["progress"] = progress
-
         if update_data:
             self.db.table("jobs").update(update_data).eq("id", job_id).execute()
 
@@ -44,18 +43,16 @@ class DatabaseManager:
     def save_vulnerabilities(self, job_id, results):
         if not results:
             return
-
         data = []
         for r in results:
             data.append({
-                "job_id": job_id,
-                "type": r.get("type"),
-                "severity": r.get("severity"),
-                "url": r.get("url"),
+                "job_id":      job_id,
+                "type":        r.get("type"),
+                "severity":    r.get("severity"),
+                "url":         r.get("url"),
                 "description": r.get("description", ""),
-                "payload": r.get("payload")
+                "payload":     r.get("payload"),
             })
-
         self.db.table("vulnerabilities").insert(data).execute()
 
     def get_results(self, job_id):
@@ -67,7 +64,7 @@ class DatabaseManager:
     # -----------------------
     def save_report(self, job_id, content):
         self.db.table("reports").insert({
-            "job_id": job_id,
+            "job_id":  job_id,
             "content": content
         }).execute()
 
@@ -80,14 +77,16 @@ class DatabaseManager:
     # -----------------------
     def add_log(self, job_id, message):
         self.db.table("scan_logs").insert({
-            "job_id": job_id,
+            "job_id":  job_id,
             "message": message
         }).execute()
 
     def get_logs(self, job_id):
-        res = self.db.table("scan_logs") \
-            .select("*") \
-            .eq("job_id", job_id) \
-            .order("created_at", desc=False) \
+        res = (
+            self.db.table("scan_logs")
+            .select("*")
+            .eq("job_id", job_id)
+            .order("created_at", desc=False)
             .execute()
+        )
         return res.data
