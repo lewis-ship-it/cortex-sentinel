@@ -20,12 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
-# Install apktool (APK decompiler for mobile scanning)
-RUN wget -q https://bitbucket.org/iBotPeaches/apktool/downloads/apktool_2.9.3.jar \
-        -O /usr/local/bin/apktool.jar && \
-    wget -q https://raw.githubusercontent.com/iBotPeaches/Apktool/master/scripts/linux/apktool \
-        -O /usr/local/bin/apktool && \
-    chmod +x /usr/local/bin/apktool /usr/local/bin/apktool.jar
+
 
 # Install Python dependencies
 COPY requirements.txt .

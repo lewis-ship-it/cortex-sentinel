@@ -8,10 +8,8 @@ from fastapi import FastAPI, Security, HTTPException, Depends
 from fastapi.security.api_key import APIKeyHeader
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
-
-from task_queue.redis_scanner import enqueue_scan
 from task_queue.redis_client import push
-from task_queue.queues import NETWORK_QUEUE, MOBILE_QUEUE, API_QUEUE, SCAN_QUEUE
+from task_queue.queues import  API_QUEUE, SCAN_QUEUE
 from core.job_tracker import create_job, get_job
 from storage.database import DatabaseManager
 from scanner.report_builder import ReportBuilder
@@ -92,27 +90,6 @@ async def scan(req: dict, key: str = Depends(verify_api_key)):
     return {"job_id": job_id, "type": "web_scan"}
 
 
-@app.post("/scan/network")
-async def scan_network(req: dict, key: str = Depends(verify_api_key)):
-    host = req.get("host") or req.get("url")
-    user_id = key
-
-    if not host:
-        raise HTTPException(400, "Missing host")
-    if not limiter.allow(user_id):
-        raise HTTPException(429, "Too many requests")
-    if not req.get("verified", False):
-        raise HTTPException(403, "You must confirm you have permission to scan this host")
-
-    job_id = str(uuid.uuid4())
-    create_job(job_id, host)
-    push(NETWORK_QUEUE, {
-        "job_id": job_id,
-        "url": host,
-        "port_range": req.get("port_range"),
-    })
-
-    return {"job_id": job_id, "type": "network_scan"}
 
 
 @app.post("/scan/api")

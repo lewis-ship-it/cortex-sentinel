@@ -1,157 +1,114 @@
-import os
-import json
-import asyncio
-import logging
+# intelligence/ai/report_generator.py
+import os, json, asyncio, logging
 import google.generativeai as genai
 from dotenv import load_dotenv
 from scanner.ai_brain import AIBrain
 
 load_dotenv()
+logger = logging.getLogger(__name__)
 
 
-def safe_json_parse(text):
+def safe_json_parse(text: str):
     try:
-        if "{" in text:
-            text = text[text.find("{"):text.rfind("}") + 1]
-        return json.loads(text)
+        s = text.find("{")
+        e = text.rfind("}")
+        if s >= 0 and e >= 0:
+            return json.loads(text[s:e+1])
     except Exception:
-        return None
-
-
-class ExploitGenerator:
-    def __init__(self, model):
-        self.model = model
-
-    async def generate_poc(self, vuln_type, url, evidence=None):
-        prompt = f"""
-        Target: {url}
-        Vulnerability: {vuln_type}
-        Context: {evidence}
-
-        TASK:
-        1. Provide a working payload
-        2. Provide a curl command
-        3. Explain bypass logic briefly
-
-        Return JSON:
-        {{
-          "payload": "...",
-          "curl_command": "...",
-          "explanation": "..."
-        }}
-        """
-        try:
-            response = await asyncio.to_thread(self.model.generate_content, prompt)
-            parsed = safe_json_parse(response.text)
-            return parsed if parsed else {"error": "Invalid PoC format"}
-        except Exception as e:
-            return {"error": str(e)}
+        pass
+    return None
 
 
 class AIReportGenerator:
     def __init__(self):
-        api_key = os.getenv("GEMINI_API_KEY")
-        genai.configure(api_key=api_key)
+        genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+        self._model    = genai.GenerativeModel("gemini-1.5-flash")
+        self.brain     = AIBrain()
 
-        self._model = genai.GenerativeModel("gemini-1.5-flash")
-        self.exploit_gen = ExploitGenerator(self._model)
-
-        # FIX: expose brain publicly so workers.py can call
-        # reporter.brain.analyze_attack_chain(...)
-        self.brain = AIBrain()
-
-    async def generate_report(self, data, target):
+    async def generate_report(self, data: dict, target: str) -> dict:
         findings     = data.get("findings", [])
         attack_graph = data.get("attack_graph", {})
         chains       = data.get("chains", [])
 
         if not findings:
-            return {
-                "target":   target,
-                "summary":  "No vulnerabilities found.",
-                "findings": [],
-            }
+            return {"target": target, "summary": {"total": 0}, "findings": []}
 
-        prompt = f"""
-        You are an elite penetration tester.
+        summary = {
+            "total":    len(findings),
+            "critical": sum(1 for f in findings if f.get("severity") == "Critical"),
+            "high":     sum(1 for f in findings if f.get("severity") == "High"),
+            "medium":   sum(1 for f in findings if f.get("severity") == "Medium"),
+            "low":      sum(1 for f in findings if f.get("severity") == "Low"),
+        }
 
-        TARGET: {target}
+        prompt = f"""You are a senior web application penetration tester writing a professional security report.
 
-        DATA:
-        Findings:
-        {json.dumps(findings, indent=2)}
+TARGET: {target}
 
-        Attack Graph:
-        {json.dumps(attack_graph, indent=2)}
+VERIFIED FINDINGS ({len(findings)} total):
+{json.dumps(findings, indent=2)}
 
-        Exploit Chains:
-        {json.dumps(chains, indent=2)}
+ATTACK CHAINS:
+{json.dumps(chains, indent=2)}
 
-        Task:
-        1. Provide a SAFE example payload (non-destructive).
-        2. Provide a demonstration request (no real exploitation).
-        3. Explain the vulnerability.
+For each finding provide:
+1. Clear technical explanation of the vulnerability
+2. Exact reproduction steps
+3. Real-world business impact
+4. Specific remediation code or configuration
 
-        Do NOT provide weaponized or destructive payloads.
-
-        OUTPUT JSON:
-        {{
-          "critical_paths": [],
-          "findings": [],
-          "recommendations": []
-        }}
-        """
+Return ONLY valid JSON in this exact structure:
+{{
+  "executive_summary": "2-3 sentence business-level summary",
+  "findings": [
+    {{
+      "type": "...",
+      "severity": "Critical|High|Medium|Low",
+      "url": "...",
+      "parameter": "...",
+      "payload": "...",
+      "confidence": 0.0-1.0,
+      "description": "technical explanation",
+      "impact": "business impact",
+      "reproduction": ["step 1", "step 2"],
+      "remediation": "specific fix with code example",
+      "cwe": "CWE-XX",
+      "cvss": 0.0-10.0
+    }}
+  ],
+  "recommendations": ["priority fix 1", "priority fix 2"],
+  "attack_narrative": "how these findings chain together"
+}}"""
 
         try:
-            response = await asyncio.to_thread(self._model.generate_content, prompt)
-            ai_data  = safe_json_parse(response.text)
-
+            res     = await asyncio.to_thread(self._model.generate_content, prompt)
+            ai_data = safe_json_parse(res.text)
             if not ai_data:
-                raise Exception("AI returned invalid JSON")
+                raise ValueError("AI returned unparseable response")
 
-            refined_findings = ai_data.get("findings", [])
-
-            # Generate PoCs for high-confidence findings
-            enriched = []
-            for f in refined_findings:
-                if float(f.get("confidence", 0.5)) >= 0.7:
-                    logging.info(f"[AI] Generating PoC for {f.get('title')}")
-                    poc = await self.exploit_gen.generate_poc(
-                        f.get("title"),
-                        f.get("url", target),
-                        f.get("evidence"),
-                    )
-                    f["poc"] = poc
-
-                # Normalize severity
-                sev = str(f.get("severity", "Low")).capitalize()
-                if sev not in ("Critical", "High", "Medium", "Low"):
+            # Normalize severities
+            for f in ai_data.get("findings", []):
+                sev = str(f.get("severity","Low")).capitalize()
+                if sev not in ("Critical","High","Medium","Low"):
                     sev = "Medium"
                 f["severity"] = sev
-                enriched.append(f)
 
-            report = {
-                "target": target,
-                "summary": {
-                    "total_findings":     len(findings),
-                    "validated_findings": len(enriched),
-                    "critical":           len([f for f in enriched if f["severity"] == "Critical"]),
-                    "high":               len([f for f in enriched if f["severity"] == "High"]),
-                    "chains_detected":    len(chains),
-                },
-                "critical_paths": ai_data.get("critical_paths", []),
-                "findings":       enriched,
-                "recommendations": ai_data.get("recommendations", []),
+            return {
+                "target":            target,
+                "summary":           summary,
+                "executive_summary": ai_data.get("executive_summary",""),
+                "findings":          ai_data.get("findings", findings),
+                "recommendations":   ai_data.get("recommendations", []),
+                "attack_narrative":  ai_data.get("attack_narrative",""),
+                "attack_graph":      attack_graph,
+                "chains":            chains,
             }
-            return report
 
         except Exception as e:
-            logging.error(f"[AI ERROR] {e}")
+            logger.error(f"[AI REPORT] Error: {e}")
             return {
-                "target":       target,
-                "status":       "fallback",
-                "message":      "AI failed, returning raw structured data",
-                "findings":     findings,
-                "attack_graph": attack_graph,
-                "chains":       chains,
+                "target":   target,
+                "summary":  summary,
+                "findings": findings,
+                "status":   "fallback",
             }

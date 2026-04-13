@@ -32,8 +32,6 @@ reportlab
 supabase
 redis
 
-# Mobile Scanning
-androguard
 
 # NOTE: apktool is a Java binary, not a pip package.
 # It is installed via the Dockerfile automatically.

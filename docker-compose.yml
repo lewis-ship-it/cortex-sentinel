@@ -48,6 +48,24 @@ services:
         limits:
           memory: 1G
 
+  scan_specialist:
+    build: .
+    command: python workers/scan_worker.py
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: always
+
+  report_specialist:
+    build: .
+    command: python workers/report_worker.py
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: always
+
   # 4. AGGREGATOR SPECIALIST - The "Brain" (AI & Report Generation)
   aggregator_specialist:
     build: .

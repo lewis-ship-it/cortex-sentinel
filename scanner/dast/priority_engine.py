@@ -1,59 +1,32 @@
-# scanner/priority_engine.py
-
-
+# scanner/dast/priority_engine.py
 class PriorityEngine:
+    HIGH_RISK   = ["admin","login","auth","account","api","checkout","user","password","upload","file"]
+    MEDIUM_RISK = ["search","query","filter","find","id","view","page"]
 
-    # -------------------------
-    # KEYWORD LISTS
-    # -------------------------
-    HIGH_RISK = ["admin", "login", "auth", "account", "api", "checkout"]
-    MEDIUM_RISK = ["search", "query", "filter"]
-
-    # Attack selection keywords (merged from attack_planner.py)
-    AUTH_KEYWORDS = ["login", "auth"]
-    SEARCH_KEYWORDS = ["search", "query"]
-
-    # -------------------------
-    # SCORING
-    # -------------------------
-    def score_endpoint(self, url):
+    def score_endpoint(self, url: str) -> int:
         score = 0
-
-        for word in self.HIGH_RISK:
-            if word in url:
-                score += 5
-
-        for word in self.MEDIUM_RISK:
-            if word in url:
-                score += 3
-
-        # Parameter bonus — URLs with query strings are higher priority
-        if "?" in url:
-            score += 4
-
+        url_l = url.lower()
+        for w in self.HIGH_RISK:
+            if w in url_l: score += 5
+        for w in self.MEDIUM_RISK:
+            if w in url_l: score += 3
+        if "?" in url: score += 4
         return score
 
-    # -------------------------
-    # PRIORITIZE
-    # -------------------------
-    def prioritize(self, endpoints):
-        scored = [(url, self.score_endpoint(url)) for url in endpoints]
+    def prioritize(self, endpoints: list) -> list:
+        scored = [(u, self.score_endpoint(u)) for u in endpoints]
         scored.sort(key=lambda x: x[1], reverse=True)
-        return [url for url, _ in scored]
+        return [u for u, _ in scored]
 
-    # -------------------------
-    # CHOOSE ATTACKS
-    # (moved from scanner/attack_planner.py)
-    # -------------------------
-    def choose_attacks(self, url):
-        """
-        Returns a list of attack types to run against a given URL
-        based on the nature of the endpoint.
-        """
-        if any(k in url for k in self.AUTH_KEYWORDS):
-            return ["sqli", "bruteforce"]
-
-        if any(k in url for k in self.SEARCH_KEYWORDS):
-            return ["xss", "sqli"]
-
-        return ["xss"]
+    def choose_attacks(self, url: str) -> list:
+        url_l = url.lower()
+        attacks = ["xss"]
+        if any(k in url_l for k in ["login","auth","user","password","account"]):
+            attacks = ["sqli","xss","lfi"]
+        elif any(k in url_l for k in ["search","query","find","q=","s="]):
+            attacks = ["xss","sqli","ssti"]
+        elif any(k in url_l for k in ["file","path","dir","doc","download"]):
+            attacks = ["lfi","xss"]
+        elif any(k in url_l for k in ["redirect","next","return","dest","url"]):
+            attacks = ["open_redirect","xss"]
+        return attacks

@@ -1,39 +1,34 @@
-import redis
-import json
+# core/state_manager.py
+import os, json, redis
 
-import os
-REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
 
 class StateManager:
-    def _key(self, job_id):
-        return f"job_state:{job_id}"
+    def _key(self, job_id): return f"job_state:{job_id}"
 
     def init_job(self, job_id, scan_type):
         state = {
             "scan_type": scan_type,
             "stages": {
-                "crawl": "pending",
-                "sast": "pending",
-                "scan": "pending",
-                "exploit": "pending",
-                "aggregation": "pending",
+                "crawl": "pending", "scan": "pending",
+                "exploit": "pending", "aggregation": "pending",
                 "report": "pending",
             }
         }
-        r.set(self._key(job_id), json.dumps(state))
+        r.set(self._key(job_id), json.dumps(state), ex=86400)
 
     def mark_done(self, job_id, stage):
-        state = json.loads(r.get(self._key(job_id)))
-        state["stages"][stage] = "done"
-        r.set(self._key(job_id), json.dumps(state))
+        raw = r.get(self._key(job_id))
+        if not raw: return
+        state = json.loads(raw)
+        if stage in state["stages"]:
+            state["stages"][stage] = "done"
+        r.set(self._key(job_id), json.dumps(state), ex=86400)
 
     def is_complete(self, job_id):
-        state = json.loads(r.get(self._key(job_id)))
-        stages = state["stages"]
-
-        # define completion rules
-        required = ["scan", "exploit", "aggregation"]
-
-        return all(stages[s] == "done" for s in required)
+        raw = r.get(self._key(job_id))
+        if not raw: return False
+        stages = json.loads(raw)["stages"]
+        return all(stages.get(s) == "done" for s in ["scan", "aggregation"])

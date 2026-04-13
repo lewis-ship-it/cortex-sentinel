@@ -1,61 +1,66 @@
-# task_queue/redis_client.py
-
 import redis
 import json
+import logging
 import os
 import time
-import logging
 
-# Load environment variables
+# Configuration
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-
-try:
-    # If the URL starts with rediss:// (Upstash/Cloud), 
-    # we let the URL handle everything. No manual 'ssl' arguments.
-    if REDIS_URL.startswith("rediss://"):
-        r = redis.Redis.from_url(
-            REDIS_URL, 
-            decode_responses=True
-        )
-    else:
-        # Standard local connection
-        r = redis.Redis.from_url(
-            REDIS_URL, 
-            decode_responses=True
-        )
-    
-    # Connection Test
-    r.ping()
-    print("✅ Successfully connected to Redis")
-    
-except Exception as e:
-    logging.error(f"❌ Redis Connection Failed: {e}")
-    # Create a dummy object so the rest of the script doesn't crash on import
-    r = None 
-
 MAX_RETRIES = 3
 
-def push(queue: str, data: dict) -> None:
-    if r:
-        data["retries"] = data.get("retries", 0)
-        r.lpush(queue, json.dumps(data))
+# Initialize Redis Connection
+try:
+    r = redis.Redis.from_url(REDIS_URL, decode_responses=True, ssl_cert_reqs=None)
+except Exception as e:
+    logging.error(f"[REDIS] Failed to initialize: {e}")
+    r = None
 
-def pop(queue: str):
-    if not r:
+def push(queue, data):
+    if not data or r is None:
+        logging.warning(f"[REDIS] Push failed: No data or no connection to {queue}")
+        return
+
+    try:
+        r.rpush(queue, json.dumps(data))
+    except Exception as e:
+        logging.error(f"[REDIS] Push error: {e}")
+
+def pop(queue):
+    if r is None:
         return None
     try:
-        data = r.rpop(queue)
-        if data:
-            return json.loads(data)
+        data = r.lpop(queue)
+        if data is None:
+            return None
+        return json.loads(data)
     except Exception as e:
         logging.error(f"[REDIS] Pop error: {e}")
-    return None
+        return None
 
+# --- THE RESTORED RETRY LOGIC ---
 def retry(queue: str, job: dict, error: str = None) -> None:
-    job["retries"] = job.get("retries", 0) + 1
-    if job["retries"] > MAX_RETRIES:
-        logging.error(f"[DROP] Job failed permanently: {job}")
+    """
+    Re-queues a failed job with exponential backoff.
+    Drops the job if it exceeds MAX_RETRIES.
+    """
+    if r is None:
+        logging.error("[DROP] Redis connection missing during retry attempt.")
         return
-    logging.warning(f"[RETRY] {queue} | Attempt {job['retries']} | Error: {error}")
-    time.sleep(1)
-    push(queue, job)
+
+    # Initialize or increment retry count
+    job["retries"] = job.get("retries", 0) + 1
+
+    if job["retries"] > MAX_RETRIES:
+        logging.error(f"[DROP] Job {job.get('job_id')} failed permanently: {error}")
+        # Optionally: log_event(job['job_id'], "error", "Job dropped after max retries")
+        return
+
+    logging.warning(f"[RETRY] {queue} attempt {job['retries']}: {error}")
+
+    # Exponential Backoff: Wait longer with each failure (2s, 4s, 8s)
+    time.sleep(2 ** job["retries"])
+
+    try:
+        r.rpush(queue, json.dumps(job))
+    except Exception as e:
+        logging.error(f"[DROP] Redis down during retry: {e}")

