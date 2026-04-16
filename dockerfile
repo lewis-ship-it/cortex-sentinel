@@ -1,32 +1,23 @@
-# dockerfile
-
-# Use a slim Python image for a smaller footprint
-FROM python:3.12-slim
-
-# Set environment variables to prevent Python from writing .pyc files
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
+FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install system dependencies
-# - gcc / libpq-dev : needed for some security/db libraries
-# - default-jre     : required by apktool (Java binary)
-# - wget            : to download apktool jar
+# Install system dependencies first (cached unless this layer changes)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
-    libpq-dev \
-    default-jre \
-    wget \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
-
-
-# Install Python dependencies
+# Copy only requirements first for better caching
 COPY requirements.txt .
+
+# Install Python dependencies (cached unless requirements.txt changes)
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the entire project
-COPY . .
+# Playwright browsers installation (cached unless this step changes)
+# This runs BEFORE copying app code so rebuilds don't re-download browsers
+RUN playwright install --with-deps
 
-# Note: The actual command to run is handled in docker-compose.yml
+# Copy app code last (changes frequently, doesn't invalidate previous layers)
+COPY . /app
+
+CMD ["python", "api/main.py"]

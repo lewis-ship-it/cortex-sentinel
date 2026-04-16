@@ -1,72 +1,111 @@
-# workers/scan_worker.py
-#
-# PLACEMENT: Replace workers/scan_worker.py entirely.
-#
-# WHAT CHANGED:
-#   • Calls filter_false_positives() after every scan
-#   • Updates job status in DB during the scan lifecycle
-#   • WAF name forwarded to findings metadata
-
-import asyncio
+import requests
+import time
 import logging
 
-from task_queue.redis_client import pop, retry
+from workers.base_worker import worker_loop, push_log
 from task_queue.queues import SCAN_QUEUE
-from scanner.dast.active_scanner import ActiveScanner, filter_false_positives
-from scanner.ai_brain import AIBrain
-from core.orchestrator import Orchestrator
-from core.job_tracker import update_stage
+from core.pipeline import on_scan_complete
+from core.session_store import get_session
+from scanner.fuzzer import SmartFuzzer
+from scanner.detector import Detector
+from scanner.context_engine import ContextEngine
 
-logger       = logging.getLogger(__name__)
-scanner      = ActiveScanner()
-brain        = AIBrain()
-orchestrator = Orchestrator()
+logging.basicConfig(level=logging.DEBUG)
+
+detector = Detector()
+context_engine = ContextEngine()
+fuzzer = SmartFuzzer()
+
+TIMEOUT = 6
 
 
-async def main():
-    logging.basicConfig(level=logging.INFO)
-    logger.info("[SCAN WORKER] Ready and listening...")
+def scan_url(job_id, target_url):
+    findings = []
+    
+    session = get_session(job_id) or {}
+    cookies = session.get("cookies", {})
+    headers = session.get("headers", {})
+    
+    # Common injectable parameters to test
+    test_params = ["q", "search", "id", "user", "name", "email", "comment", "message", "text"]
+    
+    try:
+        baseline = requests.get(target_url, cookies=cookies, headers=headers, timeout=TIMEOUT)
+        baseline_text = baseline.text[:5000]
+        
+        payloads = fuzzer.generate(["<script>alert(1)</script>", "' OR 1=1 --", "1' AND '1'='1"])
+        
+        for param in test_params:
+            for payload in payloads:
+                injected = f"{target_url}?{param}={payload}"
+                
+                try:
+                    start = time.time()
+                    r = requests.get(injected, cookies=cookies, headers=headers, timeout=TIMEOUT)
+                    delay = time.time() - start
+                    body = r.text[:5000]
+                    
+                    # XSS Detection
+                    if detector.detect_xss(body, payload):
+                        findings.append({
+                            "type": "XSS",
+                            "target_url": injected,
+                            "payload": payload,
+                            "param": param,
+                            "severity": "High",
+                            "confidence": 0.85
+                        })
+                        push_log(job_id, f"[XSS] Found in {param}")
+                    
+                    # SQLi Detection - check for errors and time-based
+                    sql_keywords = ["sql", "mysql", "syntax", "warning", "error", "exception"]
+                    if any(keyword in body.lower() for keyword in sql_keywords):
+                        findings.append({
+                            "type": "SQL Injection",
+                            "target_url": injected,
+                            "payload": payload,
+                            "param": param,
+                            "severity": "Critical",
+                            "confidence": 0.9
+                        })
+                        push_log(job_id, f"[SQLi] Found in {param}")
+                    
+                    # Reflection without encoding
+                    if payload in body and payload not in baseline_text:
+                        findings.append({
+                            "type": "Reflection",
+                            "target_url": injected,
+                            "payload": payload,
+                            "param": param,
+                            "severity": "Medium",
+                            "confidence": 0.6
+                        })
+                        push_log(job_id, f"[Reflection] Found in {param}")
+                
+                except requests.exceptions.Timeout:
+                    push_log(job_id, f"[Timeout] {param}={payload}")
+                except Exception as e:
+                    logging.debug(f"[Error] Testing {param}: {e}")
+    
+    except Exception as e:
+        push_log(job_id, f"[Error] Scan failed: {str(e)}")
+        logging.error(f"Scan error: {e}")
+    
+    return findings
 
-    while True:
-        job = pop(SCAN_QUEUE)
-        if not job:
-            await asyncio.sleep(1)
-            continue
 
-        job_id = job.get("job_id")
-        url    = job.get("url")
-        auth   = job.get("auth")
-
-        try:
-            logger.info(f"[SCAN WORKER] Starting: {url}")
-            update_stage(job_id, "scanning", 10)
-
-            # ── Run the full scan ──────────────────────────────────────────────
-            raw_findings = await scanner.scan(url, auth_config=auth)
-            logger.info(f"[SCAN WORKER] Raw findings: {len(raw_findings)}")
-
-            update_stage(job_id, "validating", 70)
-
-            # ── AI false-positive filter ───────────────────────────────────────
-            # This removes noise before the report is generated.
-            # Findings with AI confidence < 0.6 are dropped.
-            validated = await filter_false_positives(raw_findings, brain)
-            logger.info(
-                f"[SCAN WORKER] After AI filter: {len(validated)} "
-                f"(dropped {len(raw_findings) - len(validated)} false positives)"
-            )
-
-            update_stage(job_id, "scan_done", 90)
-
-            # ── Forward to orchestrator ────────────────────────────────────────
-            await orchestrator.on_stage_complete(
-                job_id, "scan", {"findings": validated}
-            )
-
-        except Exception as e:
-            logger.error(f"[SCAN WORKER] Error for {url}: {e}", exc_info=True)
-            retry(SCAN_QUEUE, job, str(e))
+def handle(job):
+    job_id = job["job_id"]
+    target_url = job["target_url"]
+    
+    push_log(job_id, f"[SCAN] Starting scan for {target_url}")
+    
+    findings = scan_url(job_id, target_url)
+    
+    push_log(job_id, f"[SCAN] Completed - Found {len(findings)} vulnerabilities")
+    
+    on_scan_complete(job_id, findings)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    worker_loop(SCAN_QUEUE, handle)

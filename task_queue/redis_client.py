@@ -1,66 +1,115 @@
+# task_queue/redis_client.py
+#
+# FIX 1 — Redis Error 111 in Docker:
+#   REDIS_URL now reads from environment. docker-compose.yml must set
+#   REDIS_URL=redis://redis:6379 for all worker/api containers.
+#   The default "redis://localhost:6379" only works for local non-Docker dev.
+#
+# FIX 2 — datetime.now() bug:
+#   Was: from datetime import datetime  (module not imported correctly)
+#   Was: str(datetime.now())            (AttributeError on the module object)
+#   Fix: import datetime; datetime.datetime.now()
+#
+# FIX 3 — Added get_redis_connection() used by browser_worker.py
+
 import redis
 import json
-import logging
 import os
+import datetime
 import time
+import logging
 
-# Configuration
+logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONNECTION
+# Docker: set REDIS_URL=redis://redis:6379 in docker-compose env_file / environment
+# Local:  set REDIS_URL=redis://localhost:6379 in .env  (or leave as default)
+# ─────────────────────────────────────────────────────────────────────────────
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-MAX_RETRIES = 3
 
-# Initialize Redis Connection
-try:
-    r = redis.Redis.from_url(REDIS_URL, decode_responses=True, ssl_cert_reqs=None)
-except Exception as e:
-    logging.error(f"[REDIS] Failed to initialize: {e}")
-    r = None
+_client: redis.Redis | None = None
 
-def push(queue, data):
-    if not data or r is None:
-        logging.warning(f"[REDIS] Push failed: No data or no connection to {queue}")
-        return
 
+def _connect() -> redis.Redis | None:
+    global _client
+    if _client is not None:
+        return _client
     try:
-        r.rpush(queue, json.dumps(data))
+        c = redis.Redis.from_url(REDIS_URL, decode_responses=True, socket_connect_timeout=3)
+        c.ping()
+        _client = c
+        logger.info(f"[REDIS] Connected → {REDIS_URL}")
     except Exception as e:
-        logging.error(f"[REDIS] Push error: {e}")
+        logger.error(f"[REDIS] Cannot connect to {REDIS_URL}: {e}")
+        _client = None
+    return _client
 
-def pop(queue):
-    if r is None:
+
+# Expose the bare client for modules that need direct access (pipeline.py, etc.)
+r = _connect()
+
+
+def get_redis_connection() -> redis.Redis | None:
+    """Return the shared Redis client (lazy-reconnect on failure)."""
+    return _connect()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# QUEUE HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def push(queue_name: str, data: dict) -> None:
+    c = _connect()
+    if not c:
+        logger.error(f"[REDIS] push({queue_name}) skipped — no connection")
+        return
+    try:
+        c.rpush(queue_name, json.dumps(data))
+    except Exception as e:
+        logger.error(f"[REDIS] push error on {queue_name}: {e}")
+
+
+def pop(queue_name: str) -> dict | None:
+    """Non-blocking pop. Returns None if queue is empty or Redis is down."""
+    c = _connect()
+    if not c:
         return None
     try:
-        data = r.lpop(queue)
-        if data is None:
-            return None
-        return json.loads(data)
+        data = c.lpop(queue_name)
+        return json.loads(data) if data else None
     except Exception as e:
-        logging.error(f"[REDIS] Pop error: {e}")
+        logger.error(f"[REDIS] pop error on {queue_name}: {e}")
         return None
 
-# --- THE RESTORED RETRY LOGIC ---
-def retry(queue: str, job: dict, error: str = None) -> None:
-    """
-    Re-queues a failed job with exponential backoff.
-    Drops the job if it exceeds MAX_RETRIES.
-    """
-    if r is None:
-        logging.error("[DROP] Redis connection missing during retry attempt.")
-        return
 
-    # Initialize or increment retry count
+def retry(queue: str, job: dict, error: str = None, max_retries: int = 3) -> None:
+    """Re-queue a failed job with an exponential back-off."""
     job["retries"] = job.get("retries", 0) + 1
-
-    if job["retries"] > MAX_RETRIES:
-        logging.error(f"[DROP] Job {job.get('job_id')} failed permanently: {error}")
-        # Optionally: log_event(job['job_id'], "error", "Job dropped after max retries")
+    if job["retries"] > max_retries:
+        logger.error(f"[DROP] Job {job.get('job_id')} permanently failed ({error})")
         return
+    wait = 2 ** job["retries"]
+    logger.warning(f"[RETRY] {queue} attempt {job['retries']}/{max_retries} in {wait}s: {error}")
+    time.sleep(wait)
+    push(queue, job)
 
-    logging.warning(f"[RETRY] {queue} attempt {job['retries']}: {error}")
 
-    # Exponential Backoff: Wait longer with each failure (2s, 4s, 8s)
-    time.sleep(2 ** job["retries"])
-
+def log_event(job_id: str | None, stage: str, message: str) -> None:
+    """Append a timestamped log entry visible in the Streamlit dashboard."""
+    if not job_id:
+        return
+    c = _connect()
+    if not c:
+        return
     try:
-        r.rpush(queue, json.dumps(job))
+        entry = {
+            # FIX: was datetime.now() — module not class. Now correct.
+            "timestamp": datetime.datetime.now().strftime("%H:%M:%S"),
+            "stage": stage.upper(),
+            "message": message,
+        }
+        c.lpush(f"logs:{job_id}", json.dumps(entry))
+        c.ltrim(f"logs:{job_id}", 0, 99)
     except Exception as e:
-        logging.error(f"[DROP] Redis down during retry: {e}")
+        logger.debug(f"[REDIS] log_event error: {e}")

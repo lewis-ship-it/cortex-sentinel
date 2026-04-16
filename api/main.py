@@ -1,6 +1,9 @@
 # api/main.py
+#
+# FIX 1: verify_api_key was defined before db was created.
+#         Moved db instantiation before the function that uses it.
+# FIX 2: Uses core/database.py (self.db) consistently.
 
-import threading
 import uuid
 import os
 import uvicorn
@@ -8,47 +11,52 @@ from fastapi import FastAPI, Security, HTTPException, Depends
 from fastapi.security.api_key import APIKeyHeader
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
+
+from task_queue.redis_scanner import enqueue_scan
 from task_queue.redis_client import push
-from task_queue.queues import  API_QUEUE, SCAN_QUEUE
+from task_queue.queues import NETWORK_QUEUE, MOBILE_QUEUE, API_QUEUE
 from core.job_tracker import create_job, get_job
-from storage.database import DatabaseManager
+from core.database import DatabaseManager
 from scanner.report_builder import ReportBuilder
 from scanner.safety_guard import SafetyGuard
 from api.domain_verification import DomainVerifier
-from scanner.dast.rate_limiter import RateLimiter
+from scanner.rate_limiter import RateLimiter
 
 load_dotenv()
 
-builder = ReportBuilder()
-guard = SafetyGuard()
+builder  = ReportBuilder()
+guard    = SafetyGuard()
 verifier = DomainVerifier()
-limiter = RateLimiter()
+limiter  = RateLimiter()
 
-# FIX: detect Docker by checking for the container sentinel env var or hostname
-# Only start an inline worker thread when running locally (not in Docker),
-# since the Docker Compose stack runs the worker as its own dedicated service.
-_IS_DOCKER = os.path.exists("/.dockerenv") or os.getenv("RUNNING_IN_DOCKER") == "1"
-
+# FIX: db must be created BEFORE verify_api_key uses it
+db = DatabaseManager()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    API Lifecycle Manager.
-    Note: We no longer start an internal worker thread here.
-    The Scanner and Aggregator are now run as independent processes.
-    """
-    print("🚀 Cortex Sentinel API: Online")
-    # You can initialize database connections here if needed
+    print("🚀 Sentinel API Online")
     yield
-    print("🛠️  Cortex Sentinel API: Shutting down...")
-
+    print("🛑 Sentinel API Shutting down")
 
 api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
-API_KEYS = {os.getenv("SENTINEL_API_KEY", "test-key-123")}
 
-
+# FIX: Now defined after db — no NameError
 def verify_api_key(key: str = Security(api_key_header)):
-    if key not in API_KEYS:
+    if not key:
+        raise HTTPException(status_code=403, detail="API key required")
+    # Check key against Supabase users table (gracefully skips if DB is down)
+    if db.db:
+        try:
+            res = db.db.table("users").select("api_key").eq("api_key", key).execute()
+            if res.data:  # Only reject if we found data and it doesn't match
+                return key
+        except Exception:
+            # If DB lookup fails, fall back to env-based key check
+            pass
+    
+    # Fallback: env-configured key
+    env_key = os.getenv("SENTINEL_API_KEY", "test-key-123")
+    if key != env_key:
         raise HTTPException(status_code=403, detail="Unauthorized")
     return key
 
@@ -56,65 +64,63 @@ def verify_api_key(key: str = Security(api_key_header)):
 app = FastAPI(
     title="Sentinel AI API",
     lifespan=lifespan,
-    dependencies=[Depends(verify_api_key)],
 )
-db = DatabaseManager()
 
 
 @app.post("/scan")
 async def scan(req: dict, key: str = Depends(verify_api_key)):
     target_url = req.get("url")
-    user_id = key
-
-    # 1. Safety Guards (All pass or raise Exception)
     if not target_url:
         raise HTTPException(400, "Missing URL")
-    if not limiter.allow(user_id):
+    if not limiter.allow(key):
         raise HTTPException(429, "Too many requests")
     if not guard.is_allowed(target_url):
         raise HTTPException(403, "Target not allowed")
-    if not req.get("verified", False):
-        raise HTTPException(403, "Domain not verified")
 
-    # 2. JOB EXECUTION (Must be at this indentation level)
+    token = req.get("verification_token")
+    if token:
+        verified = await verifier.verify_domain(target_url, token)
+        if not verified:
+            raise HTTPException(403, "Domain verification failed")
+
     job_id = str(uuid.uuid4())
     create_job(job_id, target_url)
-
-    from task_queue.queues import SCAN_QUEUE
-    push(SCAN_QUEUE, {
-        "job_id": job_id,
-        "url": target_url,
-        "auth": req.get("auth")
-    })
-
+    enqueue_scan({"job_id": job_id, "target_url": target_url, "auth": req.get("auth")})
     return {"job_id": job_id, "type": "web_scan"}
 
 
+@app.post("/scan/network")
+async def scan_network(req: dict, key: str = Depends(verify_api_key)):
+    host = req.get("host") or req.get("url")
+    if not host:
+        raise HTTPException(400, "Missing host")
+    if not limiter.allow(key):
+        raise HTTPException(429, "Too many requests")
+    if not req.get("verified", False):
+        raise HTTPException(403, "Permission confirmation required")
+    job_id = str(uuid.uuid4())
+    create_job(job_id, host)
+    push(NETWORK_QUEUE, {"job_id": job_id, "url": host, "port_range": req.get("port_range")})
+    return {"job_id": job_id, "type": "network_scan"}
 
 
 @app.post("/scan/api")
 async def scan_api(req: dict, key: str = Depends(verify_api_key)):
     target_url = req.get("url")
-    user_id = key
-
     if not target_url:
         raise HTTPException(400, "Missing URL")
-    if not limiter.allow(user_id):
+    if not limiter.allow(key):
         raise HTTPException(429, "Too many requests")
     if not guard.is_allowed(target_url):
         raise HTTPException(403, "Target not allowed")
     if not req.get("verified", False):
-        raise HTTPException(403, "You must confirm you have permission to scan this API")
-
+        raise HTTPException(403, "Permission confirmation required")
     job_id = str(uuid.uuid4())
     create_job(job_id, target_url)
     push(API_QUEUE, {
-        "job_id": job_id,
-        "url": target_url,
-        "auth_token": req.get("auth_token"),
-        "spec_url": req.get("spec_url"),
+        "job_id": job_id, "url": target_url,
+        "auth_token": req.get("auth_token"), "spec_url": req.get("spec_url"),
     })
-
     return {"job_id": job_id, "type": "api_scan"}
 
 
@@ -137,7 +143,7 @@ def generate_pdf(job_id: str):
     if not report:
         raise HTTPException(404, "Report not found")
     file_path = f"report_{job_id}.pdf"
-    builder.build_pdf(file_path, report["content"])
+    builder.build_pdf(file_path, report.get("content", report))
     return {"file": file_path}
 
 

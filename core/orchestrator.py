@@ -1,46 +1,50 @@
 # core/orchestrator.py
-from task_queue.redis_client import push
-from task_queue.queues import CRAWL_QUEUE, SCAN_QUEUE, EXPLOIT_QUEUE, AGGREGATION_QUEUE, REPORT_QUEUE
+#
+# FIX: Imports core/database.py (which has self.db) not storage/database.py
+#      (which had self.client). The two had incompatible attributes causing
+#      AttributeError on every db call.
+
+import logging
+from task_queue.redis_client import push, log_event
+from task_queue.queues import SCAN_QUEUE, EXPLOIT_QUEUE, REPORT_QUEUE
+from core.database import DatabaseManager
+
+logger = logging.getLogger(__name__)
+db = DatabaseManager()
+
 
 class Orchestrator:
-    async def on_stage_complete(self, job_id, stage, data=None):
-        print(f"[Orchestrator] {job_id} completed stage: {stage}")
-        
-        # Ensure data structure is consistent
-        data = data or {"findings": [], "urls": []}
+    def __init__(self):
+        self.stages = ["crawl", "scan", "exploit", "report"]
 
-        # 1. NEW: Handle Crawl -> Scan transition
-        if stage == "crawl":
-            urls_to_scan = data.get("urls", [])
-            if not urls_to_scan:
-                print(f"[Orchestrator] {job_id} Crawl finished with 0 URLs. Skipping scan.")
-                # Directly jump to report or end
-                return 
+    async def handle_completion(self, job_id: str, current_stage: str, results: dict):
+        if current_stage == "crawl":
+            urls = results.get("urls", [])
+            if not urls:
+                self._fail_job(job_id, "No URLs discovered during crawl.")
+                return
+            log_event(job_id, "ORCH", f"Crawl done. {len(urls)} targets → Scan queue.")
+            db.update_job_status(job_id, "scanning", 25)
+            for url in set(urls):
+                push(SCAN_QUEUE, {"job_id": job_id, "url": url})
 
-            # Centralized Routing: Push the found URLs into the Scan Queue
-            push(SCAN_QUEUE, {
-                "job_id": job_id,
-                "urls": urls_to_scan, # Pass the list of discovered pages
-                "data": data
-            })
+        elif current_stage == "scan":
+            findings = results.get("findings", [])
+            if not findings:
+                log_event(job_id, "ORCH", "Scan complete. No vulnerabilities found.")
+                db.update_job_status(job_id, "done", 100)
+                return
+            log_event(job_id, "ORCH", f"Scan complete. {len(findings)} vulns → Exploit.")
+            db.update_job_status(job_id, "exploiting", 60)
+            push(EXPLOIT_QUEUE, {"job_id": job_id, "findings": findings})
 
-        # 2. Handle Scan -> Exploit
-        elif stage == "scan":
-            push(EXPLOIT_QUEUE, {
-                "job_id": job_id,
-                "data": data
-            })
+        elif current_stage == "exploit":
+            db.update_job_status(job_id, "reporting", 90)
+            push(REPORT_QUEUE, {"job_id": job_id, "data": results})
 
-        # 3. Handle Exploit -> Aggregation
-        elif stage == "exploit":
-            push(AGGREGATION_QUEUE, {
-                "job_id": job_id,
-                "data": data
-            })
+    def _fail_job(self, job_id: str, reason: str):
+        log_event(job_id, "ERROR", reason)
+        db.update_job_status(job_id, "failed", 100)
 
-        # 4. Handle Aggregation -> Report
-        elif stage == "aggregation":
-            push(REPORT_QUEUE, {
-                "job_id": job_id,
-                "data": data
-            })
+
+orchestrator = Orchestrator()

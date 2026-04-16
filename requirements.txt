@@ -31,8 +31,8 @@ reportlab
 # Database & Queue
 supabase
 redis
+docker
+# Crypto (FIX: added — oast.py no longer uses this, but kept for other crypto needs)
+# pycryptodome  ← removed from oast.py; add back if needed elsewhere
 
-
-# NOTE: apktool is a Java binary, not a pip package.
-# It is installed via the Dockerfile automatically.
-# For local dev: https://apktool.org/docs/install
+# NOTE: apktool is a Java binary installed via Dockerfile, not pip.

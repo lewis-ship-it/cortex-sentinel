@@ -1,97 +1,163 @@
-# docker-compose.yml
-
-version: '3.8'
-
 services:
 
-  # 1. REDIS - The Central Nervous System
+  # ───────────────────────────────────────────────────────────
+  # REDIS — Core message backbone
+  # ───────────────────────────────────────────────────────────
   redis:
-    image: redis:8.0-alpine
+    image: redis:7-alpine
     container_name: sentinel_redis
     ports:
       - "6379:6379"
     restart: always
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    networks:
+      - sentinel_net
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 5
 
-  # 2. API - The Gateway
+  # ───────────────────────────────────────────────────────────
+  # WORKERS — The Engine Room
+  # ───────────────────────────────────────────────────────────
+  
+  scan_worker:
+    build: .
+    container_name: sentinel_scan_worker
+    command: python -m workers.scan_worker
+    volumes:
+      - .:/app
+    networks:
+      - sentinel_net
+    environment:
+      - PYTHONPATH=/app
+      - REDIS_URL=redis://redis:6379
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: always
+
+  report_worker:
+    build: .
+    container_name: sentinel_report_worker
+    command: python -m workers.report_worker
+    volumes:
+      - .:/app
+    networks:
+      - sentinel_net
+    environment:
+      - PYTHONPATH=/app
+      - REDIS_URL=redis://redis:6379
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: always
+
+  memory_worker:
+    build: .
+    container_name: sentinel_memory_worker
+    command: python -m workers.memory_worker
+    volumes:
+      - .:/app
+    networks:
+      - sentinel_net
+    environment:
+      - PYTHONPATH=/app
+      - REDIS_URL=redis://redis:6379
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: always
+
+  scoring_worker:
+    build: .
+    container_name: sentinel_scoring_worker
+    command: python -m workers.scoring_worker
+    volumes:
+      - .:/app
+    networks:
+      - sentinel_net
+    environment:
+      - PYTHONPATH=/app
+      - REDIS_URL=redis://redis:6379
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: always
+
+  # ───────────────────────────────────────────────────────────
+  # API — FastAPI backend for scan requests
+  # ───────────────────────────────────────────────────────────
   api:
     build: .
     container_name: sentinel_api
-    command: uvicorn api.main:app --host 0.0.0.0 --port 8000
+    command: python -m uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
     ports:
       - "8000:8000"
-    env_file:
-      - .env
-    depends_on:
-      redis:
-        condition: service_healthy
-    restart: always
-
-  # 3. SCANNER SPECIALIST - The "Eyes" (Active Scanning)
-  # Replaces the old worker.py to prevent pipeline duplication
-  scanner_specialist:
-    build: .
-    container_name: sentinel_scanner
-    command: python workers/crawl_worker.py
-    env_file:
-      - .env
-    depends_on:
-      redis:
-        condition: service_healthy
-    restart: always
-    deploy:
-      resources:
-        limits:
-          memory: 1G
-
-  scan_specialist:
-    build: .
-    command: python workers/scan_worker.py
+    volumes:
+      - .:/app
+    networks:
+      - sentinel_net
+    environment:
+      - PYTHONPATH=/app
+      - REDIS_URL=redis://redis:6379
+      - PORT=8000
     env_file: .env
     depends_on:
       redis:
         condition: service_healthy
     restart: always
 
-  report_specialist:
+  # ───────────────────────────────────────────────────────────
+  # LOGGING WORKER — Container log aggregation to Redis
+  # ───────────────────────────────────────────────────────────
+  logging_worker:
     build: .
-    command: python workers/report_worker.py
+    container_name: sentinel_logging_worker
+    command: python -m workers.logging_worker
+    volumes:
+      - .:/app
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - sentinel_net
+    environment:
+      - PYTHONPATH=/app
+      - REDIS_URL=redis://redis:6379
     env_file: .env
     depends_on:
       redis:
         condition: service_healthy
     restart: always
 
-  # 4. AGGREGATOR SPECIALIST - The "Brain" (AI & Report Generation)
-  aggregator_specialist:
-    build: .
-    container_name: sentinel_aggregator
-    command: python workers/aggregation_worker.py
-    env_file:
-      - .env
-    depends_on:
-      redis:
-        condition: service_healthy
-    restart: always
-
-  # 5. DASHBOARD - The Control Center
+  # ───────────────────────────────────────────────────────────
+  # DASHBOARD
+  # ───────────────────────────────────────────────────────────
   dashboard:
     build: .
     container_name: sentinel_dashboard
     command: streamlit run app.py --server.port 8501 --server.address 0.0.0.0
     ports:
       - "8501:8501"
-    env_file:
-      - .env
+    volumes:
+      - .:/app
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - sentinel_net
+    environment:
+      - PYTHONPATH=/app
+      - REDIS_URL=redis://redis:6379
+    env_file: .env
     depends_on:
-      api:
-        condition: service_started
+      redis:
+        condition: service_healthy
     restart: always
 
+# Define the shared bridge network
 networks:
-  default:
-    name: sentinel_network
+  sentinel_net:
+    driver: bridge

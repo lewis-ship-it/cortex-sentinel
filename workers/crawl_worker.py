@@ -1,68 +1,70 @@
 # workers/crawl_worker.py
-import asyncio
-import logging
-import httpx
-from task_queue.redis_client import pop, push, retry
-from task_queue.queues import CRAWL_QUEUE, SCAN_QUEUE
-from scanner.dast.crawler import Crawler
-from core.orchestrator import Orchestrator
-from core.logger import log_event, set_stage
 
-logger = logging.getLogger(__name__)
-orchestrator = Orchestrator()
+import requests
+from urllib.parse import urljoin, urlparse
+from bs4 import BeautifulSoup
 
-async def process_job(job):
-    job_id = job.get("job_id")
-    url = job.get("url")
-    auth = job.get("auth")
+from workers.base_worker import worker_loop, push_log
+from task_queue.queues import CRAWL_QUEUE
+from core.pipeline import on_crawl_complete
+from scanner.js_parser import JSParser
 
-    # Set UI state to 'crawl'
-    set_stage(job_id, "crawl")
-    log_event(job_id, "crawl", f"🕸️ Starting crawl on {url}")
+MAX_URLS = 300
+MAX_DEPTH = 3
 
-    try:
-        async with httpx.AsyncClient(
-            verify=False, 
-            follow_redirects=True, 
-            timeout=20
-        ) as client:
-            crawler = Crawler(url)
-            # Perform the actual crawling logic
-            endpoints, forms = await crawler.crawl(client)
 
-        logger.info(f"[CRAWL WORKER] {len(endpoints)} endpoints found for {job_id}")
-        log_event(job_id, "crawl", f"Found {len(endpoints)} unique endpoints and {len(forms)} forms.")
+def same_domain(base, target):
+    return urlparse(base).netloc == urlparse(target).netloc
 
-        # Handoff to orchestrator to handle the routing to SCAN_QUEUE
-        await orchestrator.on_stage_complete(job_id, "crawl", {
-            "urls": list(endpoints), 
-            "forms": forms,
-            "auth": auth
-        })
 
-    except Exception as e:
-        logger.error(f"[CRAWL WORKER] Error: {e}")
-        log_event(job_id, "crawl", f"Error during crawl: {str(e)}")
-        # Re-queue the job if it fails
-        retry(CRAWL_QUEUE, job, str(e))
+def crawl(start_url):
+    visited = set()
+    queue = [(start_url, 0)]
+    results = set()
+    js_parser = JSParser()
 
-async def main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-    logger.info("[CRAWL WORKER] Ready and listening for jobs...")
+    while queue:
+        url, depth = queue.pop(0)
 
-    while True:
-        job = pop(CRAWL_QUEUE)
-        if not job:
-            await asyncio.sleep(1)
+        if url in visited or depth > MAX_DEPTH or len(results) > MAX_URLS:
             continue
-            
-        await process_job(job)
+
+        visited.add(url)
+
+        try:
+            res = requests.get(url, timeout=5)
+            results.add(url)
+
+            soup = BeautifulSoup(res.text, "html.parser")
+
+            # extract links
+            for a in soup.find_all("a", href=True):
+                full = urljoin(url, a["href"])
+                if same_domain(start_url, full):
+                    queue.append((full, depth + 1))
+
+            # extract JS endpoints
+            js_endpoints = js_parser.extract_endpoints(res.text, url)
+            results.update(js_endpoints)
+
+        except Exception:
+            continue
+
+    return list(results)
+
+
+def handle(job):
+    job_id = job["job_id"]
+    url = job["url"]
+
+    push_log(job_id, "[CRAWL] Started")
+
+    urls = crawl(url)
+
+    push_log(job_id, f"[CRAWL] Found {len(urls)} URLs")
+
+    on_crawl_complete(job_id, urls)
+
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Stopping Crawl Worker...")
+    worker_loop(CRAWL_QUEUE, handle)

@@ -1,53 +1,34 @@
+# report_builder.py
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
 
 class ReportBuilder:
-
     def build_pdf(self, path, report):
         doc = SimpleDocTemplate(path)
         styles = getSampleStyleSheet()
-
         elements = []
 
-        # -------------------------
-        # TITLE
-        # -------------------------
-        elements.append(Paragraph("Sentinel AI Security Report", styles["Title"]))
+        # 1. Header
+        elements.append(Paragraph(f"Security Assessment: {report.get('target')}", styles["Title"]))
         elements.append(Spacer(1, 12))
 
-        # -------------------------
-        # SUMMARY
-        # -------------------------
-        summary = report.get("summary", {})
-
+        # 2. Executive Summary (From AI)
         elements.append(Paragraph("Executive Summary", styles["Heading2"]))
-        elements.append(Paragraph(f"Total Findings: {summary.get('validated_findings', 0)}", styles["Normal"]))
-        elements.append(Paragraph(f"Critical: {summary.get('critical', 0)}", styles["Normal"]))
-        elements.append(Paragraph(f"High: {summary.get('high', 0)}", styles["Normal"]))
+        elements.append(Paragraph(report.get("executive_summary", "N/A"), styles["Normal"]))
         elements.append(Spacer(1, 12))
 
-        # -------------------------
-        # TOP RISK
-        # -------------------------
-        top = summary.get("top_risk")
+        # 3. Stats
+        summary = report.get("summary", {})
+        elements.append(Paragraph(f"Findings: {summary.get('validated_findings')} (Crit: {summary.get('critical')}, High: {summary.get('high')})", styles["Normal"]))
+        elements.append(Spacer(1, 12))
 
-        if top:
-            elements.append(Paragraph("Top Risk (Fix First)", styles["Heading2"]))
-            elements.append(Paragraph(str(top), styles["Normal"]))
-            elements.append(Spacer(1, 12))
-
-        # -------------------------
-        # FINDINGS
-        # -------------------------
-        elements.append(Paragraph("Detailed Findings", styles["Heading2"]))
-
+        # 4. Detailed Findings (The Priority List)
+        elements.append(Paragraph("Prioritized Vulnerabilities", styles["Heading2"]))
         for f in report.get("prioritized", []):
-            elements.append(Paragraph(
-                f"{f.get('type')} | {f.get('severity')} | Score: {f.get('priority_score')}",
-                styles["Heading3"]
-            ))
-            elements.append(Paragraph(f"URL: {f.get('url')}", styles["Normal"]))
-            elements.append(Spacer(1, 10))
+            title = f"{f.get('type')} - {f.get('severity')}"
+            elements.append(Paragraph(title, styles["Heading3"]))
+            elements.append(Paragraph(f"Location: {f.get('url', 'N/A')}", styles["Normal"]))
+            elements.append(Paragraph(f"Score: {f.get('priority_score', 'N/A')}", styles["Normal"]))
+            elements.append(Spacer(1, 6))
 
         doc.build(elements)
-        return path

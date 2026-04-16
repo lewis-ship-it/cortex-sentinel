@@ -5,10 +5,8 @@ import logging
 
 from task_queue.redis_client import pop, push, retry
 from task_queue.queues import API_QUEUE, AGGREGATION_QUEUE
-from scanner.api.api_engine import APIEngine
+from scanner.api_engine import APIEngine
 from core.job_tracker import update_stage
-from core.logger import log_event
-
 
 engine = APIEngine()
 
@@ -22,13 +20,14 @@ async def main():
             continue
 
         job_id     = job.get("job_id")
-        target_url = job.get("url")
+        target_url = job.get("target_url")
         auth_token = job.get("auth_token")
         spec_url   = job.get("spec_url")
 
         try:
             logging.info(f"[API WORKER] Scanning: {target_url}")
             update_stage(job_id, "api_scan", 10)
+
             findings = await engine.scan(
                 base_url=target_url,
                 auth_token=auth_token,
@@ -38,10 +37,7 @@ async def main():
             logging.info(f"[API WORKER] {len(findings)} findings for {target_url}")
             update_stage(job_id, "api_scan_done", 50)
 
-            push(AGGREGATION_QUEUE, {
-                "job_id": job_id,
-                "data": {"findings": findings}
-            })
+            push(AGGREGATION_QUEUE, {"job_id": job_id, "findings": findings})
 
         except Exception as e:
             logging.error(f"[API WORKER] Failed for {target_url}: {e}")
