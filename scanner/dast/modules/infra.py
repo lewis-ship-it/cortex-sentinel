@@ -62,12 +62,12 @@ class InfraModule:
         if self.scanner.oast:
             oast_url  = f"http://{self.scanner.oast.domain}/ssrf_{param}"
             probe_url = self.scanner.param_engine.inject_payload(url, param, oast_url)
-            await self.scanner._req(client, "GET", probe_url, timeout=8)
+            await self.scanner._req(client, "GET", probe_url, timeout=15)
 
         # Inline response-based detection
         for provider, target, extra_headers in SSRF_TARGETS:
             test_url = self.scanner.param_engine.inject_payload(url, param, target)
-            res = await self.scanner._req(client, "GET", test_url, headers=extra_headers, timeout=8)
+            res = await self.scanner._req(client, "GET", test_url, headers=extra_headers, timeout=15)
             if res and res.status_code == 200:
                 body = res.text.lower()
                 for ind in SSRF_INDICATORS:

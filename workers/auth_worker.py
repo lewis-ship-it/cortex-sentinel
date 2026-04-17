@@ -8,37 +8,38 @@ from core.pipeline import on_crawl_complete
 
 auth = Authenticator()
 
-
 def handle(job):
     job_id = job["job_id"]
     url = job["url"]
-
+    tier = job.get("tier", "Basic") # From base_worker fetch
     creds = job.get("auth")
 
     if not creds:
-        # no auth → go straight to crawl
+        # No auth provided -> Proceed to crawl immediately
         on_crawl_complete(job_id, [url])
         return
 
-    push_log(job_id, "[AUTH] Logging in")
+    push_log(job_id, f"[AUTH] Attempting login in {tier} mode", tier=tier)
 
+    # PRODUCTION MOVE: We pass the tier to the authenticator. 
+    # For Professional, it can handle sophisticated token refreshes or MFA bypasses.
     session = auth.login(
         creds["login_url"],
         creds["username"],
-        creds["password"]
+        creds["password"],
+        tier=tier
     )
 
     if not session:
-        push_log(job_id, "[AUTH] Failed")
+        push_log(job_id, "[AUTH] Login failed. Proceeding as unauthenticated.", tier=tier)
         on_crawl_complete(job_id, [url])
         return
 
     save_session(job_id, session)
+    push_log(job_id, "[AUTH] Login successful. Session saved.", tier=tier)
 
-    push_log(job_id, "[AUTH] Success")
-
+    # Hand off to the next stage with the authenticated session
     on_crawl_complete(job_id, [url], auth=session)
-
 
 if __name__ == "__main__":
     worker_loop(AUTH_QUEUE, handle)

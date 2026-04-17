@@ -195,7 +195,7 @@ class NetworkEngine:
             loop    = asyncio.get_running_loop()
 
             def _connect():
-                with socket.create_connection((host, port), timeout=5) as sock:
+                with socket.create_connection((host, port), timeout=15) as sock:
                     with context.wrap_socket(sock, server_hostname=host) as ssock:
                         return {
                             "version": ssock.version(),

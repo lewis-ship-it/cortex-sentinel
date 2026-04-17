@@ -150,7 +150,7 @@ class AccessModule:
             found_cred = None
             for username, password in DEFAULT_CREDS:
                 data = {u_field: username, p_field: password}
-                lr   = await self.scanner._req(client, "POST", url, data=data, timeout=10)
+                lr   = await self.scanner._req(client, "POST", url, data=data, timeout=15)
                 if not lr:
                     continue
                 if lr.status_code in (301, 302, 303):
@@ -178,7 +178,7 @@ class AccessModule:
                 locked = False
                 for _ in range(10):
                     r = await self.scanner._req(client, "POST", url,
-                        data={u_field: "admin", p_field: "wrongpassword123"}, timeout=8)
+                        data={u_field: "admin", p_field: "wrongpassword123"}, timeout=15)
                     if r and (r.status_code == 429 or any(
                         kw in r.text.lower() for kw in ("locked", "too many", "captcha", "blocked")
                     )):

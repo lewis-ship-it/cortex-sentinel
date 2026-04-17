@@ -60,8 +60,9 @@ class DatabaseManager:
     # --- Findings & Reports ---
 
     def save_vulnerabilities(self, job_id, results):
-        """Maps 'url' from scanner results to 'target_url' in database."""
-        if not self.db or not results: return
+        """Maps 'url' from scanner results to 'target_url' and preserves metadata."""
+        if not self.db or not results: 
+            return
         
         try:
             data = []
@@ -70,12 +71,23 @@ class DatabaseManager:
                     "job_id": job_id,
                     "type": r.get("type"),
                     "severity": r.get("severity"),
-                    "target_url": r.get("url") or r.get("target_url"), # Mapping fix
+                    "target_url": r.get("url") or r.get("target_url"),
                     "description": r.get("description", ""),
-                    "payload": r.get("payload")
+                    "payload": str(r.get("payload", "")), # Force string to prevent JSON errors
+                    # NEW: Preserve the context from scan_worker.py
+                    "metadata": {
+                        "param": r.get("param"),
+                        "confidence": r.get("confidence")
+                    }
                 })
-            return self.db.table("vulnerabilities").insert(data).execute()
+            
+            # Use execute() and check for errors
+            res = self.db.table("vulnerabilities").insert(data).execute()
+            print(f"[DB] Successfully saved {len(data)} findings for {job_id}")
+            return res
         except Exception as e:
+            # Print specifically for Docker log visibility
+            print(f"!!! [DB ERROR] Failed to save findings: {e}")
             logger.error(f"[DB] save_vulnerabilities error: {e}")
 
     def save_report(self, job_id, content):

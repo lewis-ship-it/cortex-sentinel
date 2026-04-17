@@ -83,7 +83,7 @@ class Crawler:
         logger.debug(f"[CRAWL] depth={depth} {url}")
 
         try:
-            res = await client.get(url, timeout=12)
+            res = await client.get(url, timeout=15)
         except Exception as e:
             logger.debug(f"[CRAWL ERR] {url}: {e}")
             return
@@ -165,11 +165,11 @@ class Crawler:
             if not self._is_same_domain(js_url):
                 continue
             try:
-                res = await client.get(js_url, timeout=8)
+                res = await client.get(js_url, timeout=15)
                 self._mine_js(res.text)
                 # Also mine sourcemaps if referenced
                 sm_url = js_url + ".map"
-                sm_res = await client.get(sm_url, timeout=5)
+                sm_res = await client.get(sm_url, timeout=15)
                 if sm_res.status_code == 200 and "sources" in sm_res.text:
                     import json as _json
                     try:
@@ -218,7 +218,7 @@ class Crawler:
         async def probe(path: str):
             url = self.base_url + path
             try:
-                r = await client.get(url, timeout=6)
+                r = await client.get(url, timeout=15)
                 if r.status_code not in (404, 410, 400):
                     self.endpoints.add(url)
                     logger.debug(f"[PROBE] {url} → {r.status_code}")
@@ -233,7 +233,7 @@ class Crawler:
     async def _parse_robots_and_sitemap(self, client: httpx.AsyncClient):
         for path in ["/robots.txt", "/sitemap.xml", "/sitemap_index.xml"]:
             try:
-                r = await client.get(self.base_url + path, timeout=6)
+                r = await client.get(self.base_url + path, timeout=15)
                 if r.status_code != 200:
                     continue
                 for line in r.text.splitlines():

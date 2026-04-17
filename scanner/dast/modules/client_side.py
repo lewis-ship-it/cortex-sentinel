@@ -71,7 +71,7 @@ class ClientSideModule:
             test_url = self.scanner.param_engine.inject_payload(url, param, payload)
             try:
                 # FIX: don't follow redirects — inspect Location header directly
-                res = await client.get(test_url, follow_redirects=False, timeout=8)
+                res = await client.get(test_url, follow_redirects=False, timeout=15)
             except Exception:
                 continue
 
@@ -105,9 +105,9 @@ class ClientSideModule:
         for payload in XSS_PAYLOADS[:8]:
             data = {k: payload for k in base}
             if method == "POST":
-                res = await self.scanner._req(client, "POST", url, data=data, timeout=12)
+                res = await self.scanner._req(client, "POST", url, data=data, timeout=15)
             else:
-                res = await self.scanner._req(client, "GET", url, params=data, timeout=12)
+                res = await self.scanner._req(client, "GET", url, params=data, timeout=15)
             if res and payload in res.text:
                 self.scanner._add_finding({
                     "type": "Cross-Site Scripting (XSS)", "subtype": f"Reflected via Form ({method})",
