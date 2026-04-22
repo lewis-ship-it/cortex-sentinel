@@ -24,7 +24,7 @@ class DomainVerifier:
                 if res.status_code == 200 and token in res.text:
                     return True
 
-        except:
+        except Exception:
             pass
 
         return False

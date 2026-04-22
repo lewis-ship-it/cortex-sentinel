@@ -1,188 +1,207 @@
 # core/pipeline.py
+# ──────────────────────────────────────────────────────────────────────────────
+# Pipeline orchestration — STRICT SQLite edition.
+# All legacy state_manager calls removed to prevent dual-write conflicts.
+# All ephemeral caching (r.set) moved to db.kv_set for persistence.
+# ──────────────────────────────────────────────────────────────────────────────
 
 import json
-import redis
-import os
+from typing import Optional, Dict, List, Any
 
 from task_queue.redis_client import push
 from task_queue.queues import (
-    SCAN_QUEUE,
-    BROWSER_QUEUE,
-    EXPLOIT_QUEUE,
-    AGGREGATION_QUEUE,
-    REPORT_QUEUE,
-    PLANNER_QUEUE,
-    MEMORY_QUEUE,
-    SCORING_QUEUE
+    SCAN_QUEUE, BROWSER_QUEUE, EXPLOIT_QUEUE, AGGREGATION_QUEUE,
+    REPORT_QUEUE, PLANNER_QUEUE, MEMORY_QUEUE, SCORING_QUEUE,
 )
-
-
 from core.counters import set_counter, decrement
-from core.database import DatabaseManager
+from core.database import get_db
+from core.logger import get_logger
 from intelligence.prioritization.risk_prioritizer import RiskPrioritizer
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
-
-db = DatabaseManager()
-prioritizer = RiskPrioritizer()
+db           = get_db()
+prioritizer  = RiskPrioritizer()
+logger       = get_logger("pipeline")
 
 
-# ─────────────────────────────────────────────
-# LOGGING
-# ─────────────────────────────────────────────
-def log(job_id, msg):
-    r.rpush(f"logs:{job_id}", msg)
-    r.ltrim(f"logs:{job_id}", -100, -1)
+# ─────────────────────────────────────────────────────────────────────────────
+# SCAN COMPLETE → EXPLOIT
+# ─────────────────────────────────────────────────────────────────────────────
 
+def on_scan_complete(
+    job_id:   str,
+    findings: List[Dict],
+    target:   Optional[str] = None,
+    tier:     str = "Basic",
+) -> None:
+    try:
+        if not findings:
+            logger.warning(f"Scan complete but no findings", job_id)
+            db.update_job(job_id, status="exploiting", progress=55)
+            push(EXPLOIT_QUEUE, {"job_id": job_id, "findings": [], "tier": tier})
+            return
 
-# ─────────────────────────────────────────────
-# SCAN COMPLETE - SIMPLIFIED FOR NOW
-# ─────────────────────────────────────────────
-def on_scan_complete(job_id, findings):
-    """Scan finished - persist findings to Supabase and mark job as done"""
-    
-    
-    r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
-    
-    if findings:
-        # 1. Store backup in Redis (for fast retrieval/logs)
-        r.set(f"job:{job_id}:findings_json", json.dumps(findings))
-        
-        # 2. Persist to Supabase (so app.py can display them)
-        try:
-            log(job_id, f"[DB] Persisting {len(findings)} findings to database...")
-            # We call the database manager to populate the vulnerabilities table
-            db.save_vulnerabilities(job_id, findings) 
-            log(job_id, "[DB] Persistence successful.")
-        except Exception as e:
-            # We log to Redis/Console so you can see exactly why the commit failed
-            log(job_id, f"[DB] ERROR: Could not save findings: {str(e)}")
-            print(f"!!! DB Persistence Error for {job_id}: {e}")
+        # Cache findings in SQLite KV store instead of raw Redis
+        db.kv_set(f"job:{job_id}:findings_json", json.dumps(findings))
 
-    # 3. Mark job complete ONLY after attempt to save data
-    db.update_job(job_id, status="done", progress=100)
-    log(job_id, f"[SCAN] Complete → {len(findings)} findings persisted → Job finished")
+        db.update_job(job_id, status="exploiting", progress=55)
 
+        logger.info(
+            f"Scan complete — routing {len(findings)} findings to exploit",
+            job_id,
+            details={"finding_count": len(findings), "tier": tier},
+        )
 
-# ─────────────────────────────────────────────
-# CRAWL COMPLETE → TRIGGER SCAN + BROWSER
-# ─────────────────────────────────────────────
-def on_crawl_complete(job_id, urls, auth=None):
-    if not urls:
+        push(EXPLOIT_QUEUE, {
+            "job_id":   job_id,
+            "findings": findings,
+            "tier":     tier,
+            "target":   target or "unknown",
+        })
+
+    except Exception as e:
+        logger.error(f"on_scan_complete failed: {e}", job_id)
         db.update_job(job_id, status="failed", progress=100)
-        log(job_id, "[CRAWL] No URLs found")
-        return
 
-    total_tasks = len(urls) * 2  # HTTP + Browser scans
 
-    set_counter(job_id, "scan", total_tasks)
-    db.update_job(job_id, status="scanning", progress=25)
+# ─────────────────────────────────────────────────────────────────────────────
+# EXPLOIT COMPLETE → AGGREGATION
+# ─────────────────────────────────────────────────────────────────────────────
 
-    for url in urls:
-        # HTTP scanner
-        push(SCAN_QUEUE, {
-            "job_id": job_id,
-            "url": url,
-            "auth": auth
+def on_exploit_complete(
+    job_id:   str,
+    findings: List[Dict],
+    tier:     str = "Basic",
+) -> None:
+    try:
+        if findings:
+            db.kv_set(f"job:{job_id}:exploit_results", json.dumps(findings))
+
+        db.update_job(job_id, status="aggregating", progress=65)
+
+        if tier == "Professional":
+            push(PLANNER_QUEUE, {"job_id": job_id, "findings": findings})
+
+        push(AGGREGATION_QUEUE, {
+            "job_id":   job_id,
+            "findings": findings,
+            "tier":     tier,
         })
 
-        # Browser scanner
-        push(BROWSER_QUEUE, {
-            "job_id": job_id,
-            "url": url,
-            "auth": auth
-        })
-
-    log(job_id, f"[CRAWL] {len(urls)} URLs → {total_tasks} scan tasks queued")
+    except Exception as e:
+        logger.error(f"on_exploit_complete failed: {e}", job_id)
+        db.update_job(job_id, status="failed", progress=100)
 
 
-# ─────────────────────────────────────────────
-# EXPLOIT COMPLETE
-# ─────────────────────────────────────────────
-def on_exploit_complete(job_id, findings):
-    set_counter(job_id, "aggregation", 1)
-    # send to planner FIRST
-    push(PLANNER_QUEUE, {
-        "job_id": job_id,
-        "findings": findings
-    })
+# ─────────────────────────────────────────────────────────────────────────────
+# AGGREGATION COMPLETE → TIERED ROUTING
+# ─────────────────────────────────────────────────────────────────────────────
 
-    # THEN continue normal flow
-    push(AGGREGATION_QUEUE, {
-        "job_id": job_id,
-        "findings": findings
-    })
+def on_aggregation_complete(
+    job_id: str,
+    data:   Dict[str, Any],
+    target: str = "unknown",
+    tier:   str = "Basic",
+) -> None:
+    try:
+        # Archive raw findings in SQLite KV store (Survives restarts)
+        db.kv_set(f"job:{job_id}:vault:findings", json.dumps(data))
 
+        if tier == "Basic":
+            findings         = data.get("findings", [])
+            prioritized_data = prioritizer.calculate(findings, [])
 
-# ─────────────────────────────────────────────
-# AGGREGATION COMPLETE
-# ─────────────────────────────────────────────
-def on_aggregation_complete(job_id, data, target, tier="Basic"):
-    """
-    The Tiered Checkpoint: Branch logic between Free (Scoring) and Pro (AI Reporting)
-    """
-    # 1. THE VAULT: Always save the raw data to Redis/DB first.
-    # If they upgrade later, we pull this exact JSON to run the AI report.
-    r.set(f"job:{job_id}:vault:findings", json.dumps(data))
-    log(job_id, "[VAULT] Raw scan findings archived.")
-
-    # 2. TIER BRANCHING
-    if tier == "Basic":
-        log(job_id, "[PIPELINE] Basic Tier detected. Redirecting to Risk Prioritizer...")
-        
-        # Calculate the "Anxiety Score" using local lightweight logic
-        # We pass findings and empty chains for basic mode
-        prioritized_data = prioritizer.calculate(data.get("findings", []), [])
-        
-        # Create a "Redacted" report structure
-        basic_report = {
-            "target": target,
-            "summary": {
-                "total_findings": len(prioritized_data),
-                "risk_score": max([f.get("priority_score", 0) for f in prioritized_data]) if prioritized_data else 0,
-                "tier_status": "Basic (Free)"
-            },
-            "executive_content": {
-                "summary": "UPGRADE TO PRO: Detailed AI analysis is locked.",
-                "narrative": "UPGRADE TO PRO: Attack path chaining is locked.",
-                "remediation": "UPGRADE TO PRO: Code-level fixes are locked."
+            basic_report = {
+                "target":  target,
+                "summary": {
+                    "total_findings": len(prioritized_data),
+                    "risk_score":     max(
+                        (f.get("priority_score", 0) for f in prioritized_data), default=0
+                    ),
+                    "tier_status":    "Basic (Free) — Limited Analysis",
+                },
+                "executive_summary": "Upgrade to Professional for full AI analysis.",
+                "findings":          prioritized_data,
             }
-        }
-        
-        # Save the redacted report and end the job early
-        db.save_report(job_id, basic_report)
+
+            db.save_report(job_id, basic_report)
+            db.update_job(job_id, status="done", progress=100)
+            logger.info("Basic tier job complete", job_id, tier="Basic")
+
+        else:
+            # Professional tier: memory enrichment + scoring + AI report
+            db.update_job(job_id, status="memory_enriching", progress=70)
+
+            push(MEMORY_QUEUE, {"job_id": job_id, "findings": data, "target": target, "tier": tier})
+            push(SCORING_QUEUE, {"job_id": job_id, "findings": data, "tier": tier})
+            # FIX: Also push to REPORT_QUEUE for AI-powered narrative generation.
+            # Previously Professional tier never triggered report_worker — only scoring_worker
+            # called on_report_complete, which skips the AI analysis.
+            push(REPORT_QUEUE, {
+                "job_id":    job_id,
+                "findings":  data,
+                "target":    target,
+                "tier":      tier,
+            })
+            logger.info("Professional tier — routed to memory + scoring + AI report", job_id, tier="Professional")
+
+    except Exception as e:
+        logger.error(f"on_aggregation_complete failed: {e}", job_id)
+        db.update_job(job_id, status="failed", progress=100)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REPORT COMPLETE → DONE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def on_report_complete(
+    job_id: str,
+    report: Dict[str, Any],
+    tier:   str = "Professional",
+) -> None:
+    try:
+        db.save_report(job_id, report)
         db.update_job(job_id, status="done", progress=100)
-        log(job_id, "[REPORT] Basic scoring complete. Job finished.")
-        
-    else:
-        # PRO TIER: Continue to the heavy AI Workers
-        log(job_id, "[PIPELINE] Professional Tier detected. Engaging Cortex AI...")
-        
-        push(MEMORY_QUEUE, {
-            "job_id": job_id,
-            "findings": data,
-            "target": target
-        })
 
-        push(SCORING_QUEUE, {
-            "job_id": job_id,
-            "findings": data
-        })
+        # Clean up ephemeral state from SQLite KV
+        db.kv_delete(f"job:{job_id}:counts")
 
-        db.update_job(job_id, status="reporting", progress=90)
-        log(job_id, "[AGG] Enrichment complete → Triggering AI Report Worker")
+        logger.info("Job successfully completed", job_id, tier=tier)
+
+    except Exception as e:
+        logger.error(f"on_report_complete failed: {e}", job_id)
+        db.update_job(job_id, status="failed", progress=100)
 
 
-# ─────────────────────────────────────────────
-# REPORT COMPLETE
-# ─────────────────────────────────────────────
-def on_report_complete(job_id, report):
-    db.save_report(job_id, report)
+# ─────────────────────────────────────────────────────────────────────────────
+# CRAWL COMPLETE → SCAN
+# ─────────────────────────────────────────────────────────────────────────────
 
-    db.update_job(job_id, status="done", progress=100)
-    log(job_id, "[REPORT] Job complete")
+def on_crawl_complete(
+    job_id: str,
+    urls:   List[str],
+    auth:   Optional[Dict] = None,
+    tier:   str = "Basic",
+) -> None:
+    try:
+        if not urls:
+            logger.warning("Crawl complete but no URLs", job_id)
+            db.update_job(job_id, status="failed", progress=100)
+            db.add_log(job_id, "[SYSTEM] No URLs discovered during crawl", level="ERROR")
+            return
 
-    # cleanup Redis state
-    r.delete(f"job:{job_id}:counts")
-    r.delete(f"job:{job_id}:findings")
+        set_counter(job_id, "scan", len(urls))
+        db.update_job(job_id, status="scanning", progress=25)
+
+        for url in urls:
+            push(SCAN_QUEUE,    {"job_id": job_id, "url": url, "auth": auth, "tier": tier})
+            push(BROWSER_QUEUE, {"job_id": job_id, "url": url, "auth": auth, "tier": tier})
+
+        logger.info(
+            f"Crawl complete — {len(urls)} URLs queued",
+            job_id,
+            details={"url_count": len(urls)},
+        )
+
+    except Exception as e:
+        logger.error(f"on_crawl_complete failed: {e}", job_id)
+        db.update_job(job_id, status="failed", progress=100)

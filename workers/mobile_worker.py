@@ -4,9 +4,9 @@ import asyncio
 import logging
 import os
 
-from task_queue.redis_client import pop, push, retry
+from task_queue.redis_client import pop, push, retry_job as retry
 from task_queue.queues import MOBILE_QUEUE, AGGREGATION_QUEUE
-from scanner.mobile_engine import MobileEngine
+from scanner.mobile.mobile_engine import MobileEngine
 from core.job_tracker import update_stage
 
 engine = MobileEngine()
@@ -25,12 +25,13 @@ async def main():
 
         try:
             if not apk_path or not os.path.exists(apk_path):
-                raise FileNotFoundError(f"APK not found at path: {apk_path}")
+                raise FileNotFoundError(f"APK not found: {apk_path}")
 
             logging.info(f"[MOBILE WORKER] Scanning: {apk_path}")
             update_stage(job_id, "mobile_scan", 10)
 
-            loop     = asyncio.get_running_loop()  # FIX: get_event_loop() deprecated in 3.10+
+            # FIX: get_event_loop() deprecated in Python 3.10+ → get_running_loop()
+            loop     = asyncio.get_running_loop()
             findings = await loop.run_in_executor(None, engine.scan, apk_path)
 
             logging.info(f"[MOBILE WORKER] {len(findings)} findings for {apk_path}")
@@ -40,6 +41,7 @@ async def main():
 
         except Exception as e:
             logging.error(f"[MOBILE WORKER] Failed: {e}")
+            # FIX: uses retry_job() with exponential back-off, not bare time.sleep()
             retry(MOBILE_QUEUE, job, str(e))
 
 

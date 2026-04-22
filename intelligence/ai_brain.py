@@ -1,107 +1,81 @@
-import google.generativeai as genai
-import os
+# intelligence/ai_brain.py
+# ──────────────────────────────────────────────────────────────────────────────
+# INTELLIGENCE AI BRAIN — Ollama/qwen2.5-coder only. No external provider.
+# google.generativeai has been permanently removed.
+# Delegates to scanner.ai_brain for the actual Ollama transport layer.
+# ──────────────────────────────────────────────────────────────────────────────
+
 import json
 import logging
-from dotenv import load_dotenv
+from scanner.ai_brain import _call_ollama, _extract_json
 
-load_dotenv()
 logger = logging.getLogger(__name__)
 
+
 class AIBrain:
-    def __init__(self):
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            logger.error("CRITICAL: GEMINI_API_KEY is missing from environment.")
-        
-        genai.configure(api_key=api_key)
-        
-        # Using System Instructions to force the model into a 'Security Auditor' persona
-        self.model = genai.GenerativeModel(
-            model_name='gemini-1.5-flash',
-            generation_config={"response_mime_type": "application/json"}, # Force JSON output
-            system_instruction=(
-                "You are an elite automated penetration testing engine. "
-                "You only respond in structured JSON. You prioritize precision over verbosity. "
-                "You never ignore potential evidence of data leakage or execution."
-            )
-        )
+    """
+    Intelligence-layer AI Brain. Uses local Ollama exclusively.
+    Raises on connectivity failure — no silent external fallback.
+    """
 
-    def _clean_json(self, text: str) -> dict:
-        """Removes markdown fluff and attempts to parse JSON safely."""
-        try:
-            # Handle cases where the model still adds ```json blocks
-            text = text.replace("```json", "").replace("```", "").strip()
-            return json.loads(text)
-        except Exception as e:
-            logger.error(f"AI JSON Parse Error: {e} | Raw Text: {text}")
-            return {"error": "Invalid AI response format", "valid": False, "confidence": 0.0}
-
-    async def analyze_attack_surface(self, crawl_data):
+    async def analyze_attack_surface(self, crawl_data: list) -> list:
         """
-        Takes raw crawl data and tells the scanner WHERE to hit hard.
+        Takes raw crawl data and identifies highest-priority attack surface.
         """
         prompt = f"""
-        Analyze these endpoints: {json.dumps(crawl_data)}
-        
-        Identify the 3 most likely endpoints for:
-        1. SQL Injection (check params like id, search, filter)
-        2. SSRF (check params like url, file, path)
-        3. Broken Access Control (check UUIDs or incremental IDs)
+Analyze these endpoints: {json.dumps(crawl_data[:50])}
 
-        Return a JSON list: [{{"url": "...", "reason": "...", "suggested_attack": "..."}}]
+Identify the 3 most likely endpoints for:
+1. SQL Injection (check params like id, search, filter)
+2. SSRF (check params like url, file, path)
+3. Broken Access Control (check UUIDs or incremental IDs)
+
+Return ONLY a JSON array:
+[{{"url": "...", "reason": "...", "suggested_attack": "..."}}]
+"""
+        text = await _call_ollama(prompt)
+        result = _extract_json(text)
+        return result if isinstance(result, list) else []
+
+    async def validate_finding(self, finding: dict,
+                               original_res: str = "",
+                               attack_res: str = "") -> dict:
         """
-        try:
-            response = await self.model.generate_content_async(prompt)
-            return self._clean_json(response.text)
-        except Exception as e:
-            return [{"error": f"AI Brain offline: {str(e)}"}]
-
-    async def validate_finding(self, finding: dict, original_res: str = "", attack_res: str = ""):
-        """
-        The Final Sieve: Distinguishes between a real bug and a generic error page.
-        """
-        # Truncate bodies to save tokens and stay within context limits
-        orig_body = original_res[:1000]
-        attack_body = attack_res[:2000]
-
-        prompt = f"""
-        Analyze this DAST finding.
-        FINDING: {json.dumps(finding)}
-        
-        Compare the baseline response with the attack response:
-       BASELINE: {orig_body}
-        ATTACK: {attack_body}
-        FINDING: {json.dumps(finding)}
-
-        DETERMINE:
-        1. Is the change in the attack response statistically significant?
-        2. Is the evidence (e.g. SQL error, XSS alert, delay) clearly present?
-        3. Is this likely a custom error page (False Positive)?
-
-        Return JSON: {{"valid": bool, "confidence": float, "reason": "string", "severity_adjustment": "string"}}
-        """
-        try:
-            response = await self.model.generate_content_async(prompt)
-            return self._clean_json(response.text)
-        except Exception as e:
-            logger.error(f"Validation failed: {e}")
-            return {"valid": True, "confidence": 0.5, "reason": "Error during AI validation."}
-
-    async def generate_exploit_poc(self, finding: dict):
-        """
-        Generates a custom Proof of Concept (PoC) for the final report.
+        Validates a DAST finding against baseline and attack responses.
         """
         prompt = f"""
-        Generate a 'curl' command to reproduce this vulnerability:
-        TYPE: {finding.get('type')}
-        URL: {finding.get('url')}
-        PAYLOAD: {finding.get('payload')}
-        
-        Include any necessary headers or data flags. 
-        Return JSON: {{"poc_command": "...", "explanation": "..."}}
+Analyze this DAST finding:
+FINDING: {json.dumps(finding)}
+
+BASELINE RESPONSE (first 1000 chars):
+{original_res[:1000]}
+
+ATTACK RESPONSE (first 2000 chars):
+{attack_res[:2000]}
+
+DETERMINE:
+1. Is the change in the attack response statistically significant?
+2. Is the evidence (SQL error, XSS alert, delay) clearly present?
+3. Is this likely a custom error page (False Positive)?
+
+Return ONLY JSON:
+{{"valid": true, "confidence": 0.0, "reason": "string", "severity_adjustment": "none/upgrade/downgrade"}}
+"""
+        text = await _call_ollama(prompt)
+        return _extract_json(text)
+
+    async def generate_exploit_poc(self, finding: dict) -> dict:
         """
-        try:
-            response = await self.model.generate_content_async(prompt)
-            return self._clean_json(response.text)
-        except Exception as e:
-            return {"poc_command": "Manual verification required", "explanation": str(e)}
+        Generates a safe proof-of-concept curl command for a finding.
+        """
+        prompt = f"""
+Generate a safe curl command to demonstrate this vulnerability (non-destructive only):
+TYPE: {finding.get('type')}
+URL: {finding.get('url') or finding.get('target_url')}
+PAYLOAD: {finding.get('payload')}
+
+Return ONLY JSON:
+{{"poc_command": "curl ...", "explanation": "..."}}
+"""
+        text = await _call_ollama(prompt)
+        return _extract_json(text)

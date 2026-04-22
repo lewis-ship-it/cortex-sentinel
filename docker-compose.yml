@@ -1,8 +1,8 @@
 services:
 
-  # ───────────────────────────────────────────────────────────
+  # ───────────────────────────────────────────────────────────────────
   # REDIS — Core message backbone
-  # ───────────────────────────────────────────────────────────
+  # ───────────────────────────────────────────────────────────────────
   redis:
     image: redis:7-alpine
     container_name: sentinel_redis
@@ -18,21 +18,66 @@ services:
       timeout: 3s
       retries: 5
 
-  # ───────────────────────────────────────────────────────────
-  # WORKERS — The Engine Room
-  # ───────────────────────────────────────────────────────────
-  
+  # ───────────────────────────────────────────────────────────────────
+  # API — FastAPI backend serving UI & endpoints
+  # ───────────────────────────────────────────────────────────────────
+  api:
+    build: .
+    container_name: sentinel_api
+    command: python -m uvicorn api.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+      - sentinel_data:/app/data
+    networks:
+      - sentinel_net
+    environment:
+      - PYTHONPATH=/app
+      - REDIS_URL=redis://redis:6379
+      - DB_PATH=/app/data/sentinel.db
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: always
+
+  # ───────────────────────────────────────────────────────────────────
+  # WORKERS — The Engine Room 
+  # ───────────────────────────────────────────────────────────────────
+
   scan_worker:
     build: .
     container_name: sentinel_scan_worker
     command: python -m workers.scan_worker
     volumes:
       - .:/app
+      - sentinel_data:/app/data
     networks:
       - sentinel_net
     environment:
       - PYTHONPATH=/app
       - REDIS_URL=redis://redis:6379
+      - DB_PATH=/app/data/sentinel.db
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: always
+
+  exploit_worker:
+    build: .
+    container_name: sentinel_exploit_worker
+    command: python -m workers.exploit_worker
+    volumes:
+      - .:/app
+      - sentinel_data:/app/data
+    networks:
+      - sentinel_net
+    environment:
+      - PYTHONPATH=/app
+      - REDIS_URL=redis://redis:6379
+      - DB_PATH=/app/data/sentinel.db
     env_file: .env
     depends_on:
       redis:
@@ -45,11 +90,15 @@ services:
     command: python -m workers.report_worker
     volumes:
       - .:/app
+      - sentinel_data:/app/data
     networks:
       - sentinel_net
     environment:
       - PYTHONPATH=/app
       - REDIS_URL=redis://redis:6379
+      - DB_PATH=/app/data/sentinel.db
+      # CRITICAL: Routes out of Docker to your laptop's native Ollama
+      - OLLAMA_HOST=http://host.docker.internal:11434
     env_file: .env
     depends_on:
       redis:
@@ -62,11 +111,15 @@ services:
     command: python -m workers.memory_worker
     volumes:
       - .:/app
+      - sentinel_data:/app/data
     networks:
       - sentinel_net
     environment:
       - PYTHONPATH=/app
       - REDIS_URL=redis://redis:6379
+      - DB_PATH=/app/data/sentinel.db
+      # CRITICAL: Routes out of Docker to your laptop's native Ollama
+      - OLLAMA_HOST=http://host.docker.internal:11434
     env_file: .env
     depends_on:
       redis:
@@ -79,85 +132,162 @@ services:
     command: python -m workers.scoring_worker
     volumes:
       - .:/app
+      - sentinel_data:/app/data
     networks:
       - sentinel_net
     environment:
       - PYTHONPATH=/app
       - REDIS_URL=redis://redis:6379
+      - DB_PATH=/app/data/sentinel.db
     env_file: .env
     depends_on:
       redis:
         condition: service_healthy
     restart: always
 
-  # ───────────────────────────────────────────────────────────
-  # API — FastAPI backend for scan requests
-  # ───────────────────────────────────────────────────────────
-  api:
+
+  # ───────────────────────────────────────────────────────────────────
+  # CRAWL WORKER — URL discovery and sitemap crawling
+  # ───────────────────────────────────────────────────────────────────
+  crawl_worker:
     build: .
-    container_name: sentinel_api
-    command: python -m uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
-    ports:
-      - "8000:8000"
+    container_name: sentinel_crawl_worker
+    command: python -m workers.crawl_worker
     volumes:
       - .:/app
+      - sentinel_data:/app/data
     networks:
       - sentinel_net
     environment:
       - PYTHONPATH=/app
       - REDIS_URL=redis://redis:6379
-      - PORT=8000
+      - DB_PATH=/app/data/sentinel.db
     env_file: .env
     depends_on:
       redis:
         condition: service_healthy
     restart: always
 
-  # ───────────────────────────────────────────────────────────
-  # LOGGING WORKER — Container log aggregation to Redis
-  # ───────────────────────────────────────────────────────────
-  logging_worker:
+  # ───────────────────────────────────────────────────────────────────
+  # AGGREGATION WORKER — Combines findings into enriched payload
+  # ───────────────────────────────────────────────────────────────────
+  aggregation_worker:
     build: .
-    container_name: sentinel_logging_worker
-    command: python -m workers.logging_worker
+    container_name: sentinel_aggregation_worker
+    command: python -m workers.aggregation_worker
     volumes:
       - .:/app
-      - /var/run/docker.sock:/var/run/docker.sock
+      - sentinel_data:/app/data
     networks:
       - sentinel_net
     environment:
       - PYTHONPATH=/app
       - REDIS_URL=redis://redis:6379
+      - DB_PATH=/app/data/sentinel.db
     env_file: .env
     depends_on:
       redis:
         condition: service_healthy
     restart: always
 
-  # ───────────────────────────────────────────────────────────
-  # DASHBOARD
-  # ───────────────────────────────────────────────────────────
-  dashboard:
+  # ───────────────────────────────────────────────────────────────────
+  # AUTH WORKER — Login and session establishment
+  # ───────────────────────────────────────────────────────────────────
+  auth_worker:
     build: .
-    container_name: sentinel_dashboard
-    command: streamlit run app.py --server.port 8501 --server.address 0.0.0.0
-    ports:
-      - "8501:8501"
+    container_name: sentinel_auth_worker
+    command: python -m workers.auth_worker
     volumes:
       - .:/app
-      - /var/run/docker.sock:/var/run/docker.sock
+      - sentinel_data:/app/data
     networks:
       - sentinel_net
     environment:
       - PYTHONPATH=/app
       - REDIS_URL=redis://redis:6379
+      - DB_PATH=/app/data/sentinel.db
     env_file: .env
     depends_on:
       redis:
         condition: service_healthy
     restart: always
 
-# Define the shared bridge network
+  # ───────────────────────────────────────────────────────────────────
+  # BROWSER WORKER — Playwright-based JS rendering and DOM XSS
+  # ───────────────────────────────────────────────────────────────────
+  browser_worker:
+    build: .
+    container_name: sentinel_browser_worker
+    command: python -m workers.browser_worker
+    volumes:
+      - .:/app
+      - sentinel_data:/app/data
+    networks:
+      - sentinel_net
+    environment:
+      - PYTHONPATH=/app
+      - REDIS_URL=redis://redis:6379
+      - DB_PATH=/app/data/sentinel.db
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: always
+
+  # ───────────────────────────────────────────────────────────────────
+  # API WORKER — REST/GraphQL API endpoint scanning
+  # ───────────────────────────────────────────────────────────────────
+  api_worker:
+    build: .
+    container_name: sentinel_api_worker
+    command: python -m workers.api_worker
+    volumes:
+      - .:/app
+      - sentinel_data:/app/data
+    networks:
+      - sentinel_net
+    environment:
+      - PYTHONPATH=/app
+      - REDIS_URL=redis://redis:6379
+      - DB_PATH=/app/data/sentinel.db
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: always
+
+  # ───────────────────────────────────────────────────────────────────
+  # PLANNER WORKER — AI-driven attack planning (Professional tier only)
+  # ───────────────────────────────────────────────────────────────────
+  planner_worker:
+    build: .
+    container_name: sentinel_planner_worker
+    command: python -m workers.planner_worker
+    volumes:
+      - .:/app
+      - sentinel_data:/app/data
+    networks:
+      - sentinel_net
+    environment:
+      - PYTHONPATH=/app
+      - REDIS_URL=redis://redis:6379
+      - DB_PATH=/app/data/sentinel.db
+      - OLLAMA_HOST=http://host.docker.internal:11434
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: always
+# ───────────────────────────────────────────────────────────────────
+# Shared bridge network
+# ───────────────────────────────────────────────────────────────────
 networks:
   sentinel_net:
     driver: bridge
+
+# ───────────────────────────────────────────────────────────────────
+# Named volumes
+# ───────────────────────────────────────────────────────────────────
+volumes:
+  sentinel_data:
+  ollama_data:

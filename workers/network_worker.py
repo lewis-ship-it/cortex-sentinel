@@ -3,7 +3,7 @@
 import asyncio
 import logging
 
-from task_queue.redis_client import pop, push, retry
+from task_queue.redis_client import pop, push, retry_job as retry
 from task_queue.queues import NETWORK_QUEUE, AGGREGATION_QUEUE
 from scanner.network_engine import NetworkEngine
 from core.job_tracker import update_stage
@@ -35,6 +35,7 @@ async def main():
 
         except Exception as e:
             logging.error(f"[NET WORKER] Failed for {target}: {e}")
+            # FIX: exponential back-off retry
             retry(NETWORK_QUEUE, job, str(e))
 
 
