@@ -27,33 +27,54 @@ logger       = get_logger("pipeline")
 # SCAN COMPLETE → EXPLOIT
 # ─────────────────────────────────────────────────────────────────────────────
 
+# core/pipeline.py  on_scan_complete()
 def on_scan_complete(
     job_id:   str,
     findings: List[Dict],
     target:   Optional[str] = None,
     tier:     str = "Basic",
 ) -> None:
+    """
+    Called once per URL by scan_worker. Accumulates findings in the KV store
+    and only forwards to exploit when ALL URLs have reported back.
+    Uses a Redis/SQLite counter set by on_crawl_complete() to track pending scans.
+    """
     try:
-        if not findings:
-            logger.warning(f"Scan complete but no findings", job_id)
-            db.update_job(job_id, status="exploiting", progress=55)
-            push(EXPLOIT_QUEUE, {"job_id": job_id, "findings": [], "tier": tier})
-            return
+        # 1. Accumulate findings for this URL into the shared KV store
+        if findings:
+            raw = db.kv_get(f"job:{job_id}:findings_json")
+            accumulated = json.loads(raw) if raw else []
+            accumulated.extend(findings)
+            db.kv_set(f"job:{job_id}:findings_json", json.dumps(accumulated))
+            logger.info(
+                f"Scan result received — +{len(findings)} findings "
+                f"(total accumulated: {len(accumulated)})",
+                job_id,
+            )
 
-        # Cache findings in SQLite KV store instead of raw Redis
-        db.kv_set(f"job:{job_id}:findings_json", json.dumps(findings))
+        # 2. Decrement the pending-URL counter
+        remaining = decrement(job_id, "scan")
+        logger.info(f"Pending scan slots remaining: {remaining}", job_id)
+
+        # 3. Only proceed when ALL URLs have reported back
+        if remaining > 0:
+            return  # other URLs still in progress — wait
+
+        # 4. All URLs done — collect everything and forward to exploit
+        raw = db.kv_get(f"job:{job_id}:findings_json")
+        all_findings = json.loads(raw) if raw else []
 
         db.update_job(job_id, status="exploiting", progress=55)
 
         logger.info(
-            f"Scan complete — routing {len(findings)} findings to exploit",
+            f"All URLs scanned — routing {len(all_findings)} total findings to exploit",
             job_id,
-            details={"finding_count": len(findings), "tier": tier},
+            details={"finding_count": len(all_findings), "tier": tier},
         )
 
         push(EXPLOIT_QUEUE, {
             "job_id":   job_id,
-            "findings": findings,
+            "findings": all_findings,
             "tier":     tier,
             "target":   target or "unknown",
         })

@@ -73,7 +73,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     target_url      TEXT NOT NULL,
     status          TEXT NOT NULL DEFAULT 'pending',
     progress        INTEGER NOT NULL DEFAULT 0,
-    tier            TEXT NOT NULL DEFAULT 'Basic',
+    tier            TEXT NOT NULL DEFAULT 'professional',
     idempotency_key TEXT UNIQUE,
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
@@ -85,7 +85,7 @@ CREATE TABLE IF NOT EXISTS logs (
     message    TEXT NOT NULL,
     level      TEXT NOT NULL DEFAULT 'INFO',
     component  TEXT NOT NULL DEFAULT 'system',
-    tier       TEXT NOT NULL DEFAULT 'Basic',
+    tier       TEXT NOT NULL DEFAULT 'professional',
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 CREATE INDEX IF NOT EXISTS idx_logs_job ON logs(job_id, id);
@@ -165,8 +165,8 @@ class _MinimalDB:
 
     # ── Jobs ──────────────────────────────────────────────────────────────────
 
-    def insert_job(self, job_id, url, status="pending", tier="Basic",
-                   idempotency_key=None, **_) -> bool:
+    def insert_job(self, job_id, url, status="pending", tier="Basic",  # ✅ capital B
+               idempotency_key=None, **_) -> bool:
         try:
             if idempotency_key and self.get_job_by_idempotency_key(idempotency_key):
                 return False
@@ -239,7 +239,7 @@ class _MinimalDB:
 
     # ── Logs ──────────────────────────────────────────────────────────────────
 
-    def add_log(self, job_id, message, level="INFO", component="system", tier="Basic"):
+    def add_log(self, job_id, message, level="INFO", component="system", tier="professional"):
         try:
             with self._conn() as c:
                 c.execute(
@@ -611,7 +611,7 @@ def verify_key(key: str = Security(api_key_header)) -> str:
 
 class ScanIn(BaseModel):
     url: str
-    tier: str = "Basic"
+    tier: str = "professional"
     auth: Optional[Dict[str, Any]] = None
     idempotency_key: Optional[str] = None
 

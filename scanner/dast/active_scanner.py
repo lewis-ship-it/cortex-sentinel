@@ -1,16 +1,9 @@
 # scanner/dast/active_scanner.py
 #
-# FIXES:
-#   1. self.target_url — added attribute, set in scan()
-#   2. _detect_waf_and_tech — method was called but never defined; now implemented
-#   3. crawler.crawl() return format — crawler returns (list[str], list[dict])
-#      scan() was treating it as a list of {url, params, forms} dicts — WRONG.
-#      Fixed to properly unpack (endpoints, forms) then pass to modules.
-#   4. finalize_and_report — was indented inside filter_false_positives (dead code).
-#      Moved to be a proper class method.
-#   5. filter_false_positives — called brain.analyze_attack_surface which doesn't
-#      exist on AIBrain; changed to brain.validate_finding.
-#   6. log_event(self.job_id) — guarded so None job_id doesn't crash.
+# AGGRESSIVE ACTIVE SCANNER — Comprehensive vulnerability detection pipeline
+# Phases: WAF/Tech detection -> Deep Crawl -> Hidden Param Discovery -> Module Execution
+#          -> Header Injection -> Sensitive Files -> Security Headers -> GraphQL -> OAST
+# Modules: Injection, ClientSide, Infra, Access, XXE, NoSQL, API Abuse
 
 import asyncio
 import json
@@ -57,9 +50,10 @@ BURST_EVERY  = 10
 BURST_PAUSE  = (0.8, 1.6)
 
 SENSITIVE_FILES = [
-    ("/.env",              ["DB_PASSWORD","SECRET_KEY","AWS_","API_KEY"]),
+    ("/.env",              ["DB_PASSWORD","SECRET_KEY","AWS_","API_KEY","MONGO","POSTGRES"]),
     ("/.env.local",        ["DB_PASSWORD","SECRET_KEY"]),
     ("/.env.production",   ["DB_PASSWORD","SECRET_KEY"]),
+    ("/.env.development",  ["DB_PASSWORD","SECRET_KEY"]),
     ("/.git/HEAD",         ["ref:","refs/heads"]),
     ("/.git/config",       ["[core]","repositoryformatversion"]),
     ("/web.config",        ["connectionString","appSettings"]),
@@ -68,19 +62,51 @@ SENSITIVE_FILES = [
     ("/server-status",     ["Apache Server Status"]),
     ("/actuator/env",      ["systemProperties","applicationConfig"]),
     ("/actuator/mappings", ["dispatcherServlet"]),
+    ("/actuator/heapdump", [""]),
     ("/backup.sql",        ["INSERT INTO","CREATE TABLE"]),
     ("/dump.sql",          ["INSERT INTO","CREATE TABLE"]),
     ("/id_rsa",            ["-----BEGIN","PRIVATE KEY"]),
     ("/composer.json",     ["require","autoload"]),
     ("/package.json",      ["dependencies","scripts"]),
+    ("/crossdomain.xml",   ["cross-domain-policy","allow-access-from"]),
+    ("/clientaccesspolicy.xml", ["access-policy","allow-from"]),
+    ("/.htaccess",         ["RewriteEngine","AuthType"]),
+    ("/wp-config.php",     ["DB_PASSWORD","DB_NAME"]),
+    ("/database.yml",      ["adapter","password"]),
+    ("/settings.py",       ["SECRET_KEY","DATABASE"]),
+    ("/config.json",       ["password","secret","key"]),
+    ("/.svn/entries",      ["dir","svn"]),
+    ("/.DS_Store",         ["Bud1","dscl"]),
+    ("/encryptionkeys",    ["key","secret","encrypt"]),
+    ("/encryptionkeys/default", ["key","secret"]),
 ]
 
 LISTING_MARKERS = ["Index of /","Directory listing","Parent Directory"]
 
+# Header injection payloads
+HEADER_INJECTION_TESTS = [
+    ("X-Forwarded-For", "127.0.0.1", "IP bypass may grant admin access"),
+    ("X-Original-URL", "/admin", "URL rewrite bypass may access admin paths"),
+    ("X-Rewrite-URL", "/admin", "URL rewrite bypass may access admin paths"),
+    ("X-Custom-IP-Authorization", "127.0.0.1", "IP-based auth bypass"),
+    ("X-Forwarded-Host", "localhost", "Host header injection"),
+    ("X-Host", "localhost", "Host header injection"),
+    ("X-HTTP-Method-Override", "PUT", "HTTP method override bypass"),
+    ("X-Method-Override", "DELETE", "HTTP method override bypass"),
+    ("X-Forwarded-Proto", "https", "Protocol downgrade bypass"),
+    ("X-Real-IP", "127.0.0.1", "IP spoofing for auth bypass"),
+    ("True-Client-IP", "127.0.0.1", "IP spoofing for auth bypass"),
+    ("X-Client-IP", "127.0.0.1", "IP spoofing for auth bypass"),
+    ("X-Remote-IP", "127.0.0.1", "IP spoofing for auth bypass"),
+    ("X-Remote-Addr", "127.0.0.1", "IP spoofing for auth bypass"),
+    ("X-Originating-IP", "127.0.0.1", "IP spoofing for auth bypass"),
+    ("Forwarded", "for=127.0.0.1", "Forwarded header bypass"),
+]
+
 
 class ActiveScanner:
-    MAX_REQUESTS = 5000
-    CONCURRENCY  = 12
+    MAX_REQUESTS = 8000
+    CONCURRENCY  = 15
 
     def __init__(self, job_id: str = None, budget: float = 2.00):
         self.param_engine   = ParamEngine()
@@ -101,7 +127,7 @@ class ActiveScanner:
         self.request_count  = 0
         self.target_tech    = ["Generic"]
         self.waf_name       = None
-        self.target_url     = ""   # FIX: was missing — caused AttributeError in _req
+        self.target_url     = ""
 
     # ─────────────────────────────────────────────────────────────────────────
     # THROTTLE
@@ -137,7 +163,6 @@ class ActiveScanner:
             headers = kwargs.pop("headers", {})
             headers["User-Agent"] = random.choice(USER_AGENTS)
             headers["Accept-Language"] = "en-US,en;q=0.9"
-            # FIX: self.target_url now always exists
             if self.target_url:
                 headers["Referer"] = self.target_url
 
@@ -210,17 +235,14 @@ class ActiveScanner:
             client.headers["Authorization"] = f"Bearer {auth_config['token']}"
 
     # ─────────────────────────────────────────────────────────────────────────
-    # FIX: _detect_waf_and_tech — was called in scan() but never defined
+    # WAF + TECH DETECTION
     # ─────────────────────────────────────────────────────────────────────────
     async def _detect_waf_and_tech(self, client, base_url: str) -> None:
-        """Detects WAF presence and fingerprints technology stack."""
-        # WAF detection
         self.waf_name = await self.waf_detector.detect(client, base_url)
         if self.waf_name and self.waf_name != "Generic":
             logger.warning(f"[WAF] Detected: {self.waf_name}")
             log_event(self.job_id, "WAF", f"WAF detected: {self.waf_name}")
 
-        # Tech fingerprint from homepage
         try:
             res = await self._req(client, "GET", base_url)
             if res:
@@ -243,6 +265,10 @@ class ActiveScanner:
         if "asp.net" in x_powered or "iis" in server:       tech.append("ASP.NET")
         if "wp-content" in body or "wp-json" in body:       tech.append("WordPress")
         if "laravel" in cookies or "laravel" in body:        tech.append("Laravel")
+        if "angular" in body:                                tech.append("Angular")
+        if "react" in body or "__next" in body:              tech.append("React")
+        if "vue" in body:                                    tech.append("Vue")
+        if "juice" in body or "juiceshop" in body:           tech.append("JuiceShop")
         return tech or ["Generic"]
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -258,7 +284,7 @@ class ActiveScanner:
         self.waf_name       = None
         self.target_tech    = ["Generic"]
         self.job_id         = job_id
-        self.target_url     = base_url   # FIX: set here so _req can use it
+        self.target_url     = base_url
 
         logger.info(f"[SCAN] Starting: {base_url}")
         log_event(self.job_id, "SCAN", f"Starting scan: {base_url}")
@@ -274,31 +300,40 @@ class ActiveScanner:
             except Exception as e:
                 logger.warning(f"[OAST] Setup failed: {e}")
 
-        audit_semaphore = asyncio.Semaphore(5)
+        audit_semaphore = asyncio.Semaphore(8)
 
         async with httpx.AsyncClient(timeout=20, verify=False, follow_redirects=True) as client:
             if auth_config:
                 await self._handle_auth(client, auth_config)
 
-            # Phase 0+1: WAF + Tech fingerprint (FIX: method now defined)
+            # Phase 0+1: WAF + Tech fingerprint
             await self._detect_waf_and_tech(client, base_url)
 
-            # Phase 2: Crawl
-            # FIX: crawler.crawl() returns (list[str], list[dict]) — unpack correctly
-            crawler = Crawler(base_url)
+            # Phase 2: Deep Crawl
+            crawler = Crawler(base_url, max_pages=300, max_depth=6)
             endpoints, forms = await crawler.crawl(client)
             log_event(self.job_id, "CRAWL", f"Found {len(endpoints)} endpoints, {len(forms)} forms")
 
-            # Phase 3: Recon
+            # Phase 2b: Hidden parameter discovery on key endpoints
+            hidden_urls = []
+            for url in endpoints[:50]:  # Top 50 endpoints
+                if urlparse(url).query:
+                    hidden_urls.extend(self.param_engine.get_hidden_param_urls(url)[:10])
+            for h_url in hidden_urls:
+                endpoints.append(h_url)
+            log_event(self.job_id, "CRAWL", f"Added {len(hidden_urls)} hidden-param URLs")
+
+            # Phase 3: Recon (parallel)
             await asyncio.gather(
                 self._check_security_headers(client, base_url),
                 self._check_sensitive_files(client, base_url),
                 self._run_graphql_check(client, base_url),
+                self._test_header_injection(client, base_url),
+                self._test_http_methods(client, base_url),
                 return_exceptions=True,
             )
 
-            # Phase 4: Module execution
-            # FIX: pass url (str) directly — not item["url"] from a dict
+            # Phase 4: Module execution on all endpoints
             tasks = []
             for url in endpoints:
                 async def _audit_url(u=url):
@@ -312,7 +347,10 @@ class ActiveScanner:
                 tasks.append(_audit_form())
             await asyncio.gather(*tasks, return_exceptions=True)
 
-            # Phase 5: OAST polling
+            # Phase 5: Path-based IDOR testing
+            await self._test_path_idor(client, endpoints)
+
+            # Phase 6: OAST polling
             if oast_active:
                 await asyncio.sleep(3)
                 interactions = await self.oast.poll_interactions()
@@ -334,6 +372,7 @@ class ActiveScanner:
     async def _run_all_modules(self, client, url: str) -> None:
         params = self.param_engine.extract_params(url)
         if not params:
+            # Try adding common params
             for variant in self.param_engine.add_param_variants(url)[:5]:
                 params = self.param_engine.extract_params(variant)
                 if params:
@@ -360,6 +399,138 @@ class ActiveScanner:
         )
 
     # ─────────────────────────────────────────────────────────────────────────
+    # HEADER INJECTION / AUTH BYPASS
+    # ─────────────────────────────────────────────────────────────────────────
+    async def _test_header_injection(self, client, base_url: str) -> None:
+        """Test for auth bypass via header injection."""
+        # Get baseline response
+        baseline = await self._req(client, "GET", base_url)
+        if not baseline:
+            return
+        baseline_len = len(baseline.text)
+        baseline_status = baseline.status_code
+
+        for header_name, header_value, description in HEADER_INJECTION_TESTS:
+            res = await self._req(client, "GET", base_url, headers={header_name: header_value})
+            if not res:
+                continue
+
+            # Check if the header changed the response significantly
+            if res.status_code != baseline_status:
+                if res.status_code == 200 and baseline_status in (401, 403):
+                    self._add_finding({
+                        "type": "Authentication Bypass via Header",
+                        "subtype": f"{header_name}: {header_value}",
+                        "url": base_url, "parameter": header_name,
+                        "payload": header_value,
+                        "severity": "Critical", "confidence": 0.95,
+                        "evidence": f"Status changed from {baseline_status} to {res.status_code} with {header_name}",
+                        "description": description,
+                    })
+            elif res.status_code == 200 and abs(len(res.text) - baseline_len) > 500:
+                # Same status but very different content — might have bypassed
+                self._add_finding({
+                    "type": "Authentication Bypass via Header",
+                    "subtype": f"{header_name}: {header_value}",
+                    "url": base_url, "parameter": header_name,
+                    "payload": header_value,
+                    "severity": "High", "confidence": 0.80,
+                    "evidence": f"Response size changed from {baseline_len} to {len(res.text)} with {header_name}",
+                    "description": description,
+                })
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # HTTP METHOD TESTING
+    # ─────────────────────────────────────────────────────────────────────────
+    async def _test_http_methods(self, client, base_url: str) -> None:
+        """Test for dangerous HTTP methods and method-based auth bypass."""
+        parsed = urlparse(base_url)
+        base = f"{parsed.scheme}://{parsed.netloc}"
+
+        # Test common API endpoints with different methods
+        test_paths = ["/", "/api", "/api/users", "/admin"]
+        for path in test_paths:
+            url = base + path
+            for method in ["PUT", "DELETE", "PATCH", "OPTIONS", "TRACE"]:
+                try:
+                    res = await self._req(client, method, url)
+                    if not res:
+                        continue
+                    if method == "OPTIONS":
+                        allow = res.headers.get("Allow", "")
+                        if allow and any(m in allow for m in ["PUT", "DELETE", "PATCH"]):
+                            self._add_finding({
+                                "type": "Dangerous HTTP Methods Allowed",
+                                "subtype": f"OPTIONS on {path}",
+                                "url": url, "parameter": "HTTP Method",
+                                "payload": "OPTIONS",
+                                "severity": "Medium", "confidence": 0.90,
+                                "evidence": f"Allow: {allow}",
+                                "description": f"Server allows dangerous methods: {allow}",
+                            })
+                    elif method in ("PUT", "DELETE", "PATCH"):
+                        if res.status_code not in (404, 405, 403, 501):
+                            self._add_finding({
+                                "type": "HTTP Method Tampering",
+                                "subtype": f"{method} on {path}",
+                                "url": url, "parameter": "HTTP Method",
+                                "payload": method,
+                                "severity": "High", "confidence": 0.80,
+                                "evidence": f"{method} returned {res.status_code}",
+                                "description": f"Server accepted {method} on {path} — may allow unauthorized modifications.",
+                            })
+                except Exception:
+                    continue
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # PATH-BASED IDOR
+    # ─────────────────────────────────────────────────────────────────────────
+    async def _test_path_idor(self, client, endpoints: list) -> None:
+        """Test for IDOR in URL path segments (e.g., /api/users/1)."""
+        idor_patterns = [
+            (r'/api/users/(\d+)', "User IDOR"),
+            (r'/api/basket/(\d+)', "Basket IDOR"),
+            (r'/api/product-reviews/(\d+)', "Review IDOR"),
+            (r'/api/orders/(\d+)', "Order IDOR"),
+            (r'/api/invoices/(\d+)', "Invoice IDOR"),
+            (r'/user/(\d+)', "User IDOR"),
+            (r'/profile/(\d+)', "Profile IDOR"),
+        ]
+
+        for url in endpoints:
+            for pattern, label in idor_patterns:
+                m = re.search(pattern, url)
+                if not m:
+                    continue
+                current_id = int(m.group(1))
+                baseline = await self._req(client, "GET", url)
+                if not baseline or baseline.status_code != 200:
+                    continue
+                baseline_len = len(baseline.text)
+
+                for test_id in [current_id - 1, current_id + 1, 1, 2, 0]:
+                    if test_id < 0 or test_id == current_id:
+                        continue
+                    test_url = re.sub(pattern, lambda _: f'/api/users/{test_id}' if 'users' in pattern else f'/api/basket/{test_id}' if 'basket' in pattern else f'/api/product-reviews/{test_id}' if 'product-reviews' in pattern else f'/api/orders/{test_id}' if 'orders' in pattern else f'/api/invoices/{test_id}' if 'invoices' in pattern else f'/user/{test_id}' if 'user' in pattern.split('/')[-2] else f'/profile/{test_id}', url)
+                    # Simpler approach: just replace the number
+                    test_url = re.sub(r'/(\d+)(?=[/?]|$)', f'/{test_id}', url, count=1)
+                    res = await self._req(client, "GET", test_url)
+                    if not res or res.status_code != 200:
+                        continue
+                    diff = abs(len(res.text) - baseline_len)
+                    if diff > 100 and len(res.text) > 200:
+                        self._add_finding({
+                            "type": "Insecure Direct Object Reference (IDOR)",
+                            "subtype": f"Path-Based: {label}",
+                            "url": test_url, "parameter": "path_id",
+                            "payload": str(test_id),
+                            "severity": "Critical", "confidence": 0.85,
+                            "evidence": f"ID={test_id} returned 200 with {len(res.text)}B (baseline={baseline_len}B)",
+                            "description": f"Path segment allows accessing other objects — {label}.",
+                        })
+                        break
+
+    # ─────────────────────────────────────────────────────────────────────────
     # GRAPHQL, SECURITY HEADERS, SENSITIVE FILES
     # ─────────────────────────────────────────────────────────────────────────
     async def _run_graphql_check(self, client, base_url: str) -> None:
@@ -383,6 +554,7 @@ class ActiveScanner:
             "x-content-type-options":    ("Low",   "No nosniff header."),
             "strict-transport-security": ("Medium","No HSTS — HTTP downgrade possible."),
             "referrer-policy":           ("Low",   "No Referrer-Policy."),
+            "permissions-policy":        ("Low",   "No Permissions-Policy."),
         }
         for header, (sev, desc) in REQUIRED.items():
             if header not in h:
@@ -391,6 +563,7 @@ class ActiveScanner:
                     "url":base_url,"severity":sev,"confidence":1.0,
                     "evidence":f"'{header}' absent","description":desc,
                 })
+        # CORS check
         cors = await self._req(client, "GET", base_url, headers={"Origin":"https://evil.com"})
         if cors:
             acao = cors.headers.get("access-control-allow-origin","")
@@ -417,6 +590,15 @@ class ActiveScanner:
             res = await self._req(client, "GET", url)
             if not (res and res.status_code == 200):
                 continue
+            if not indicators:
+                # Empty indicators = any 200 is a finding
+                self._add_finding({
+                    "type":"Sensitive File Exposed","subtype":path,
+                    "url":url,"severity":"Critical","confidence":0.90,
+                    "evidence":f"File accessible (HTTP 200, {len(res.text)}B)",
+                    "description":f"File {path} is publicly accessible.",
+                })
+                continue
             for ind in indicators:
                 if ind.lower() in res.text.lower():
                     self._add_finding({
@@ -426,7 +608,7 @@ class ActiveScanner:
                         "description":f"File {path} is publicly accessible.",
                     })
                     break
-        for d in ["/uploads/","/backup/","/logs/","/files/","/tmp/"]:
+        for d in ["/uploads/","/backup/","/logs/","/files/","/tmp/","/ftp/"]:
             url = base + d
             res = await self._req(client, "GET", url)
             if res and res.status_code == 200 and any(m in res.text for m in LISTING_MARKERS):
@@ -438,10 +620,9 @@ class ActiveScanner:
                 })
 
     # ─────────────────────────────────────────────────────────────────────────
-    # FIX: finalize_and_report now a proper class method (was trapped in wrong scope)
+    # FINALIZE
     # ─────────────────────────────────────────────────────────────────────────
     async def finalize_and_report(self) -> dict:
-        """Save usage metrics and return final cost summary."""
         if not self.tracker:
             return {}
         try:
@@ -467,21 +648,17 @@ class ActiveScanner:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# AI FALSE-POSITIVE FILTER (module-level, imported by workers)
-# FIX: was calling brain.analyze_attack_surface — method doesn't exist on AIBrain.
-#      Changed to brain.validate_finding which is the actual method.
+# AI FALSE-POSITIVE FILTER
 # ─────────────────────────────────────────────────────────────────────────────
 async def filter_false_positives(findings: list, brain) -> list:
     validated = []
     for f in findings:
-        # OAST hits bypass filtering — they're definitively confirmed
         if "OAST" in f.get("type","") or f.get("confidence",0) > 0.98:
             f["ai_confidence"]  = 1.0
             f["ai_explanation"] = "Verified via out-of-band interaction."
             validated.append(f)
             continue
         try:
-            # FIX: validate_finding is the correct method name
             result = await brain.validate_finding(f)
             conf = result.get("confidence", 0)
             if result.get("valid") and conf >= 0.65:

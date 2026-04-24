@@ -1,3 +1,4 @@
+
 # scanner/context_engine.py
 # ──────────────────────────────────────────────────────────────────────────────
 # CONTEXT ENGINE — Detects where user input lands in a response so the fuzzer
@@ -9,6 +10,11 @@ import re
 from scanner.fuzzer import (
     XSS_PAYLOADS, SQLI_PAYLOADS, SSTI_PAYLOADS,
     TRAVERSAL_PAYLOADS, CMDI_PAYLOADS, SSRF_PAYLOADS,
+)
+from scanner.dast.payloads import (
+    XSS_PAYLOADS as DAST_XSS, SQLI_PAYLOADS as DAST_SQLI,
+    LFI_PAYLOADS, OPEN_REDIRECT_PAYLOADS, XXE_PAYLOADS,
+    NOSQL_PAYLOADS,
 )
 
 
@@ -182,3 +188,4 @@ class ContextEngine:
             ]
         else:
             return SQLI_PAYLOADS
+

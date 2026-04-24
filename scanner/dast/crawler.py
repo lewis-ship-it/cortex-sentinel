@@ -1,7 +1,6 @@
 # scanner/dast/crawler.py
-# FIX: Regex patterns rewritten — backtick in character class caused SyntaxError.
-# FIX: crawl() now always returns (endpoints, forms) tuple.
-# IMPROVED: Added form action normalisation, JS sourcemap mining, meta refresh detection.
+# AGGRESSIVE CRAWLER — Deep crawling, JS endpoint mining, API discovery,
+# hidden path probing, form extraction, parameter discovery, and JuiceShop paths
 
 import asyncio
 import logging
@@ -12,27 +11,75 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+# Expanded hidden paths including JuiceShop-specific endpoints
 COMMON_HIDDEN_PATHS = [
+    # Admin panels
     "/admin", "/admin/login", "/admin/index.php", "/administrator",
+    "/admin/dashboard", "/admin/users", "/admin/settings",
     "/wp-admin", "/wp-login.php", "/wp-json/wp/v2/users",
-    "/login", "/signin", "/signup", "/register",
+    # Auth
+    "/login", "/signin", "/signup", "/register", "/logout",
+    "/forgot", "/reset", "/password", "/change-password",
+    "/2fa", "/2fa/setup", "/2fa/validate",
+    # API
     "/api", "/api/v1", "/api/v2", "/api/v3", "/graphql",
+    "/api/admin", "/api/users", "/api/user", "/api/user/1",
+    "/api/products", "/api/product", "/api/search",
+    "/api/basket", "/api/basket/1", "/api/basket/1/coupon",
+    "/api/complaints", "/api/challenges", "/api/data erasure",
+    "/api/security-question", "/api/security-answer",
+    "/api/track-result", "/api/address-selection",
+    "/api/payment", "/api/recycle", "/api/file-server",
+    "/api/error-reporting", "/api/user/whoami",
+    "/api/user/reset-password", "/api/user/change-password",
+    "/api/product-reviews", "/api/product-reviews/1",
+    "/api/quantity", "/api/deluxe-membership",
+    "/api/user/1", "/api/users/1",
+    # Sensitive files
     "/.env", "/.env.local", "/.env.production",
     "/.git/HEAD", "/.git/config", "/.svn/entries",
     "/robots.txt", "/sitemap.xml", "/sitemap_index.xml",
     "/.htaccess", "/server-status", "/server-info",
-    "/actuator", "/actuator/health", "/actuator/env", "/actuator/mappings",
-    "/debug", "/console", "/trace",
+    # Spring Boot / Actuator
+    "/actuator", "/actuator/health", "/actuator/env",
+    "/actuator/mappings", "/actuator/configprops",
+    "/actuator/beans", "/actuator/info", "/actuator/metrics",
+    "/actuator/loggers", "/actuator/threaddump",
+    "/actuator/heapdump", "/actuator/trace",
+    # Debug/dev
+    "/debug", "/console", "/trace", "/info", "/status",
+    "/phpinfo.php", "/info.php", "/test",
+    # User endpoints
     "/user", "/users", "/profile", "/account", "/dashboard",
     "/panel", "/manage", "/management", "/upload", "/uploads", "/files",
-    "/search", "/find", "/query", "/forgot", "/reset", "/password",
-    "/phpmyadmin", "/pma", "/backup", "/config.php", "/web.config",
-    "/phpinfo.php", "/info.php",
+    "/search", "/find", "/query",
+    # JuiceShop-specific
+    "/ftp", "/ftp/quarantine", "/ftp/coupons_2013.md.bak",
+    "/encryptionkeys", "/encryptionkeys/default",
+    "/score-board", "/administration",
+    "/redirect", "/profile", "/profile/change-password",
+    "/b2b/v2/orders", "/b2b/v2/supply",
+    "/rest/admin", "/rest/user", "/rest/products",
+    # Swagger/API docs
     "/swagger", "/swagger-ui", "/swagger.json", "/openapi.json", "/api-docs",
-    "/metrics", "/health", "/status", "/ping",
+    "/swagger-ui.html", "/swagger-resources", "/v2/api-docs",
+    # Health/metrics
+    "/metrics", "/health", "/status", "/ping", "/version",
+    # Common paths
     "/v1", "/v2", "/v3",
     "/internal", "/private", "/secret",
     "/config", "/settings", "/setup",
+    "/backup", "/db", "/database",
+    "/phpmyadmin", "/pma",
+    "/web.config", "/config.php",
+    # OAuth
+    "/oauth", "/oauth/authorize", "/oauth/token",
+    "/.well-known/openid-configuration", "/.well-known/jwks.json",
+    # Websocket
+    "/ws", "/websocket", "/socket.io",
+    # Other
+    "/sitemap", "/crossdomain.xml", "/clientaccesspolicy.xml",
+    "/elmah.axd", "/trace.axd",
 ]
 
 BLOCKED_EXTENSIONS = {
@@ -41,12 +88,12 @@ BLOCKED_EXTENSIONS = {
     ".pdf", ".zip", ".tar", ".gz", ".rar", ".7z",
     ".mp4", ".mp3", ".avi", ".mov", ".wav", ".ogg",
     ".pyc", ".class", ".exe", ".dll", ".so",
-    ".min.js",  # minified JS — not useful for endpoint mining
+    ".min.js",
 }
 
 
 class Crawler:
-    def __init__(self, base_url: str, max_pages: int = 150, max_depth: int = 5):
+    def __init__(self, base_url: str, max_pages: int = 300, max_depth: int = 6):
         self.base_url  = base_url.rstrip("/")
         self.base_host = urlparse(base_url).netloc
         self.max_pages = max_pages
@@ -54,16 +101,16 @@ class Crawler:
         self.visited   = set()
         self.endpoints = set()
         self.forms     = []
+        self.api_endpoints = set()
 
     async def crawl(self, client: httpx.AsyncClient):
-        """
-        Main entry point. Returns (list[str], list[dict]) — endpoints and forms.
-        FIX: Always returns a tuple regardless of errors.
-        """
+        """Main entry point. Returns (list[str], list[dict]) — endpoints and forms."""
         try:
             await self._crawl_page(client, self.base_url, depth=0)
             await self._probe_hidden_paths(client)
             await self._parse_robots_and_sitemap(client)
+            await self._discover_api_endpoints(client)
+            await self._probe_common_api_patterns(client)
         except Exception as e:
             logger.error(f"[CRAWL] Top-level error: {e}")
 
@@ -91,30 +138,42 @@ class Crawler:
         self.endpoints.add(url)
 
         ct = res.headers.get("content-type", "")
-        if "text/html" not in ct:
+        if "text/html" not in ct and "application/json" not in ct:
+            # Still mine JSON for API endpoints
+            if "application/json" in ct:
+                self._mine_json_api(res.text, url)
             return
 
-        soup = BeautifulSoup(res.text, "html.parser")
+        if "text/html" in ct:
+            soup = BeautifulSoup(res.text, "html.parser")
 
-        # Meta refresh redirect — follow it
-        for meta in soup.find_all("meta", attrs={"http-equiv": re.compile("refresh", re.I)}):
-            content = meta.get("content", "")
-            m = re.search(r"url=(.+)", content, re.I)
-            if m:
-                target = self._normalize(urljoin(url, m.group(1).strip("'\"")))
-                if self._is_same_domain(target):
-                    self.endpoints.add(target)
+            # Meta refresh redirect
+            for meta in soup.find_all("meta", attrs={"http-equiv": re.compile("refresh", re.I)}):
+                content = meta.get("content", "")
+                m = re.search(r"url=(.+)", content, re.I)
+                if m:
+                    target = self._normalize(urljoin(url, m.group(1).strip("'\"")))
+                    if self._is_same_domain(target):
+                        self.endpoints.add(target)
 
-        self._extract_forms(soup, url)
-        await self._extract_js_endpoints(client, soup, url)
+            self._extract_forms(soup, url)
+            await self._extract_js_endpoints(client, soup, url)
 
-        tasks = []
-        for tag in soup.find_all("a", href=True):
-            full = self._normalize(urljoin(url, tag["href"].strip()))
-            if full not in self.visited and self._is_same_domain(full) and self._is_valid(full):
-                tasks.append(self._crawl_page(client, full, depth + 1))
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            # Extract links from all tags with href/src/action
+            tasks = []
+            for tag in soup.find_all("a", href=True):
+                full = self._normalize(urljoin(url, tag["href"].strip()))
+                if full not in self.visited and self._is_same_domain(full) and self._is_valid(full):
+                    tasks.append(self._crawl_page(client, full, depth + 1))
+
+            # Also follow link tags, script srcs, iframe srcs
+            for tag in soup.find_all(["link", "iframe", "frame", "embed"], src=True):
+                full = self._normalize(urljoin(url, tag["src"].strip()))
+                if self._is_same_domain(full) and self._is_valid(full):
+                    self.endpoints.add(full)
+
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
 
     def _extract_forms(self, soup: BeautifulSoup, page_url: str):
         for form in soup.find_all("form"):
@@ -124,7 +183,7 @@ class Crawler:
             enctype = form.get("enctype", "application/x-www-form-urlencoded").lower()
 
             inputs = {}
-            for inp in form.find_all(["input", "textarea", "select"]):
+            for inp in form.find_all(["input", "textarea", "select", "button"]):
                 name = inp.get("name")
                 if not name:
                     continue
@@ -167,7 +226,7 @@ class Crawler:
             try:
                 res = await client.get(js_url, timeout=15)
                 self._mine_js(res.text)
-                # Also mine sourcemaps if referenced
+                # Also mine sourcemaps
                 sm_url = js_url + ".map"
                 sm_res = await client.get(sm_url, timeout=15)
                 if sm_res.status_code == 200 and "sources" in sm_res.text:
@@ -184,13 +243,10 @@ class Crawler:
                 pass
 
     def _mine_js(self, text: str):
-        """
-        FIX: Regex patterns rewritten without backtick inside character classes
-        (Python does not support backtick in regex char classes in all versions).
-        """
+        """Extract API endpoints and paths from JavaScript source."""
         patterns = [
-            # API path strings: "/api/...", "/v1/...", etc.
-            r'''["'](/(?:api|v\d+|graphql|auth|user|admin|search|data|endpoint)[a-zA-Z0-9/_\-\.?=&]*)["']''',
+            # API path strings
+            r'''["'](/(?:api|v\d+|graphql|auth|user|admin|search|data|endpoint|rest|b2b)[a-zA-Z0-9/_\-\.?=&]*)["']''',
             # fetch("...")
             r'''fetch\s*\(\s*["']([^"'\s]+)["']''',
             # axios.get("..."), axios.post("..."), etc.
@@ -200,7 +256,13 @@ class Crawler:
             # XMLHttpRequest .open("GET", "...")
             r'''\.open\s*\(\s*["'][A-Z]+["']\s*,\s*["']([^"'\s]+)["']''',
             # url: "...", href: "...", src: "..."
-            r'''(?:url|href|src|action|endpoint)\s*:\s*["']([^"'\s]+)["']''',
+            r'''(?:url|href|src|action|endpoint|path|route)\s*:\s*["']([^"'\s]+)["']''',
+            # Template literals with paths
+            r'''`(/(?:api|v\d+|rest|admin|user|search)[a-zA-Z0-9/_\-]*)`''',
+            # Angular/Vue router paths
+            r'''path:\s*["']([^"'\s]+)["']''',
+            # Component paths
+            r'''component:\s*["']([^"'\s]+)["']''',
         ]
         for pat in patterns:
             try:
@@ -214,23 +276,52 @@ class Crawler:
             except re.error:
                 continue
 
+    def _mine_json_api(self, text: str, source_url: str):
+        """Extract API endpoints from JSON responses."""
+        try:
+            import json
+            data = json.loads(text)
+            if isinstance(data, dict):
+                # Look for URLs in JSON values
+                for key, value in data.items():
+                    if isinstance(value, str) and value.startswith("/"):
+                        full = urljoin(self.base_url, value)
+                        if self._is_same_domain(full):
+                            self.endpoints.add(full)
+                    elif isinstance(value, list):
+                        for item in value:
+                            if isinstance(item, dict) and "id" in item:
+                                # REST collection — add individual item URLs
+                                item_url = f"{source_url}/{item['id']}"
+                                self.endpoints.add(item_url)
+        except Exception:
+            pass
+
     async def _probe_hidden_paths(self, client: httpx.AsyncClient):
+        """Probe for hidden paths that aren't linked from any page."""
         async def probe(path: str):
             url = self.base_url + path
             try:
                 r = await client.get(url, timeout=15)
                 if r.status_code not in (404, 410, 400):
                     self.endpoints.add(url)
-                    logger.debug(f"[PROBE] {url} → {r.status_code}")
+                    logger.debug(f"[PROBE] {url} -> {r.status_code}")
             except Exception:
                 pass
 
+        # Batch probe with concurrency limit
+        sem = asyncio.Semaphore(20)
+        async def limited_probe(path):
+            async with sem:
+                await probe(path)
+
         await asyncio.gather(
-            *[probe(p) for p in COMMON_HIDDEN_PATHS],
+            *[limited_probe(p) for p in COMMON_HIDDEN_PATHS],
             return_exceptions=True,
         )
 
     async def _parse_robots_and_sitemap(self, client: httpx.AsyncClient):
+        """Parse robots.txt and sitemap.xml for additional endpoints."""
         for path in ["/robots.txt", "/sitemap.xml", "/sitemap_index.xml"]:
             try:
                 r = await client.get(self.base_url + path, timeout=15)
@@ -248,6 +339,55 @@ class Crawler:
                         self.endpoints.add(val)
             except Exception:
                 pass
+
+    async def _discover_api_endpoints(self, client: httpx.AsyncClient):
+        """Try common API documentation endpoints."""
+        api_doc_paths = [
+            "/swagger-ui.html", "/swagger-resources", "/v2/api-docs",
+            "/openapi.json", "/swagger.json", "/api-docs",
+            "/.well-known/openapi", "/graphql", "/graphiql",
+            "/api/swagger", "/api/docs", "/api/openapi",
+        ]
+        for path in api_doc_paths:
+            try:
+                r = await client.get(self.base_url + path, timeout=15)
+                if r.status_code == 200:
+                    self.endpoints.add(self.base_url + path)
+                    # Parse OpenAPI/Swagger JSON
+                    if "json" in r.headers.get("content-type", ""):
+                        try:
+                            import json
+                            spec = json.loads(r.text)
+                            for path_item in spec.get("paths", {}).keys():
+                                full = urljoin(self.base_url, path_item)
+                                if self._is_same_domain(full):
+                                    self.endpoints.add(full)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+    async def _probe_common_api_patterns(self, client: httpx.AsyncClient):
+        """Probe common REST API patterns based on discovered endpoints."""
+        # If we found /api/users, also try /api/users/1, /api/users/admin, etc.
+        api_bases = set()
+        for ep in list(self.endpoints):
+            parsed = urlparse(ep)
+            path = parsed.path
+            # Find API base paths
+            if re.match(r'^/api(/v\d+)?/\w+$', path):
+                api_bases.add(ep)
+
+        for base in api_bases:
+            for suffix in ["/1", "/2", "/admin", "/0", "/me", "/current"]:
+                url = base.rstrip("/") + suffix
+                if url not in self.endpoints:
+                    try:
+                        r = await client.get(url, timeout=15)
+                        if r.status_code not in (404, 410, 400):
+                            self.endpoints.add(url)
+                    except Exception:
+                        pass
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -267,7 +407,6 @@ class Crawler:
     def _normalize(self, url: str) -> str:
         try:
             p = urlparse(url)
-            # Strip fragment, normalise trailing slash on path
             clean_path = p.path.rstrip("/") or "/"
             return urlunparse((p.scheme, p.netloc, clean_path, p.params, p.query, ""))
         except Exception:

@@ -16,11 +16,14 @@ import requests
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 import re
+import asyncio
+import httpx
 
 from workers.base_worker import worker_loop, push_log
 from task_queue.queues import CRAWL_QUEUE
 from core.pipeline import on_crawl_complete
 from scanner.js_parser import JSParser
+from scanner.dast.crawler import Crawler
 
 # High-value paths to always probe (bug bounty goldmines)
 HIGH_VALUE_PATHS = [
@@ -146,22 +149,43 @@ def crawl(start_url, tier="Basic", auth=None):
             continue
 
     return list(results)
-
+BLOCKED_PATHS = ["/register", "/signup", "/auth/sign-up", "/password-reset"]
 
 def handle(job):
     job_id = job["job_id"]
     url    = job["url"]
     tier   = job.get("tier", "Basic")
-    auth   = job.get("auth")  # FIX: forward auth from job payload
+    auth   = job.get("auth")
 
     push_log(job_id, f"[CRAWL] Starting {tier} crawl for {url}", tier=tier)
 
-    found_urls = crawl(url, tier=tier, auth=auth)
+    # 1. Use the advanced Crawler class instead of the simple function
+    # Note: Professional tier uses higher limits for better discovery
+    max_p = 300 if tier == "Professional" else 50
+    crawler = Crawler(base_url=url, max_pages=max_p)
 
-    push_log(job_id, f"[CRAWL] Found {len(found_urls)} URLs", tier=tier)
+    async def run_discovery():
+        async with httpx.AsyncClient(
+            cookies=auth.get("cookies", {}) if auth else None,
+            headers=auth.get("headers", {}) if auth else None,
+            follow_redirects=True
+        ) as client:
+            endpoints, forms = await crawler.crawl(client)
+            return endpoints
 
-    # FIX: pass tier and auth so pipeline.on_crawl_complete pushes correct payloads
-    on_crawl_complete(job_id, found_urls, auth=auth, tier=tier)
+    # Execute the async crawler
+    found_urls = asyncio.run(run_discovery())
+
+    # 2. Filter results
+    filtered_urls = [
+        u for u in found_urls 
+        if not any(blocked in u for blocked in BLOCKED_PATHS)
+    ]
+
+    push_log(job_id, f"[CRAWL] Discovery complete. Found {len(filtered_urls)} endpoints.", tier=tier)
+
+    # 3. Proceed to pipeline
+    on_crawl_complete(job_id, filtered_urls, auth=auth, tier=tier)
 
 
 if __name__ == "__main__":

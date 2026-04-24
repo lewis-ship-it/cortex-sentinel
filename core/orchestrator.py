@@ -20,60 +20,73 @@ class Orchestrator:
         self.stages = ["crawl", "scan", "exploit", "report"]
         self.cleanup_interval = 900  # 15 minutes
 
-    async def handle_completion(self, job_id: str, current_stage: str, results: dict):
-        if current_stage == "crawl":
-            urls = results.get("urls", [])
-            if not urls:
-                self._fail_job(job_id, "No URLs discovered during crawl.")
-                return
-            log_event(job_id, "ORCH", f"Crawl done. {len(urls)} targets → Scan queue.")
-            db.update_job_status(job_id, "scanning", 25)
-            for url in set(urls):
-                push(SCAN_QUEUE, {"job_id": job_id, "url": url})
+async def handle_completion(self, job_id: str, current_stage: str, results: dict):
+    if current_stage == "crawl":
+        urls = results.get("urls", [])
+        if not urls:
+            self._fail_job(job_id, "No URLs discovered during crawl.")
+            return
 
-        elif current_stage == "scan":
+        # Initialize the pending counter in Redis based on the number of URLs
+        # Ensure your db.init_job_counter(job_id, len(urls)) exists
+        db.init_job_counter(job_id, len(urls))
+
+        log_event(job_id, "ORCH", f"Crawl done. {len(urls)} targets → Scan queue.")
+        db.update_job_status(job_id, "scanning", 25)
+        for url in set(urls):
+            push(SCAN_QUEUE, {"job_id": job_id, "url": url})
+
+    elif current_stage == "scan":
+        # 1. Decrement the counter
+        pending_scans = db.decrement_pending_scans(job_id)
+        log_event(job_id, "ORCH", f"Scan part done. {pending_scans} remaining.")
+
+        # 2. Only proceed if ALL scans are finished
+        if pending_scans == 0:
             findings = results.get("findings", [])
+
             if not findings:
                 log_event(job_id, "ORCH", "Scan complete. No vulnerabilities found.")
                 db.update_job_status(job_id, "done", 100)
                 return
+
             log_event(job_id, "ORCH", f"Scan complete. {len(findings)} vulns → Exploit.")
             db.update_job_status(job_id, "exploiting", 60)
             push(EXPLOIT_QUEUE, {"job_id": job_id, "findings": findings})
 
-        elif current_stage == "exploit":
-            db.update_job_status(job_id, "reporting", 90)
-            push(REPORT_QUEUE, {"job_id": job_id, "data": results})
+    elif current_stage == "exploit":
+        db.update_job_status(job_id, "reporting", 90)
+        push(REPORT_QUEUE, {"job_id": job_id, "data": results})
 
-    def _fail_job(self, job_id: str, reason: str):
-        log_event(job_id, "ERROR", reason)
-        db.update_job_status(job_id, "failed", 100)
+def _fail_job(self, job_id: str, reason: str):
+    log_event(job_id, "ERROR", reason)
+    db.update_job_status(job_id, "failed", 100)
 
-    async def cleanup_stale_jobs(self, timeout_minutes: int = 30):
-        """
-        Periodically check for and recover stale jobs.
-        Call this in a background task or separate cleanup worker.
-        
-        Args:
-            timeout_minutes: Jobs not updated in this many minutes are considered stale
-        """
-        recovered = db.recover_stale_jobs(timeout_minutes)
-        if recovered > 0:
-            logger.warning(f"[ORCH] Recovered {recovered} stale jobs")
-        return recovered
+async def cleanup_stale_jobs(self, timeout_minutes: int = 30):
+    """
+    Periodically check for and recover stale jobs.
+    Call this in a background task or separate cleanup worker.
 
-    async def start_cleanup_loop(self):
-        """
-        Start a background task that periodically cleans up stale jobs.
-        Call this once at application startup.
-        """
-        logger.info(f"[ORCH] Starting stale job cleanup loop (every {self.cleanup_interval}s)")
-        while True:
-            try:
-                await asyncio.sleep(self.cleanup_interval)
-                await self.cleanup_stale_jobs()
-            except Exception as e:
-                logger.error(f"[ORCH] Cleanup loop error: {e}")
+    Args:
+        timeout_minutes: Jobs not updated in this many minutes are considered stale
+    """
+    recovered = db.recover_stale_jobs(timeout_minutes)
+    if recovered > 0:
+        logger.warning(f"[ORCH] Recovered {recovered} stale jobs")
+    return recovered
+
+async def start_cleanup_loop(self):
+    """
+    Start a background task that periodically cleans up stale jobs.
+    Call this once at application startup.
+    """
+    logger.info(f"[ORCH] Starting stale job cleanup loop (every {self.cleanup_interval}s)")
+    while True:
+        try:
+            await asyncio.sleep(self.cleanup_interval)
+            await self.cleanup_stale_jobs()
+        except Exception as e:
+            logger.error(f"[ORCH] Cleanup loop error: {e}")
 
 
 orchestrator = Orchestrator()

@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import json
 from playwright.async_api import async_playwright
 
@@ -6,6 +7,9 @@ from workers.base_worker import worker_loop, push_log
 from task_queue.queues import BROWSER_QUEUE
 from core.pipeline import on_scan_complete
 from core.session_store import get_session
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 async def browser_scan(job_id, target_url, tier="Basic"):
     findings = []
@@ -62,10 +66,10 @@ async def browser_scan(job_id, target_url, tier="Basic"):
             # Limit Basic users to 10 links to prevent massive downstream task queues
             link_limit = 10 if tier == "Basic" else 500
             
-            for l in links[:link_limit]:
+            for link in links[:link_limit]:
                 findings.append({
                     "type": "Discovered Endpoint",
-                    "target_url": l,
+                    "target_url": link,
                     "severity": "Info",
                     "confidence": 1.0
                 })
@@ -80,8 +84,13 @@ async def browser_scan(job_id, target_url, tier="Basic"):
 def handle(job):
     # Retrieve job_id and target_url from your uploaded version
     job_id = job["job_id"]
-    target_url = job["target_url"]
-    
+    # Use .get() to provide a fallback or log a clear error
+    target_url = job.get("target_url") or job.get("url")
+
+    if not target_url:
+        logging.error(f"[WORKER] Job missing target_url: {job.get('job_id')}")
+        return # Gracefully exit instead of crashing
+        
     # Retrieve tier from my base_worker refactor (defaults to Basic)
     tier = job.get("tier", "Basic")
 

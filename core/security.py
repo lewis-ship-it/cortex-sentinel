@@ -90,7 +90,7 @@ class APIKeyManager:
                     r.delete(redis_key)
                     continue
             if PasswordManager.verify_password(api_key, meta.get("hash", "")):
-                r.hset(redis_key, field="last_used", value=datetime.utcnow().isoformat())
+                r.hset(redis_key, "last_used", datetime.utcnow().isoformat())
                 return True
         return False
 
@@ -124,8 +124,7 @@ class TokenManager:
             "created_at": datetime.utcnow().isoformat(),
         })
         # Store expiry in metadata (no native TTL in SQLite)
-        r.hset(redis_key, field="expires_at",
-               value=(datetime.utcnow() + timedelta(seconds=expires_in_seconds)).isoformat())
+        r.hset(redis_key, "expires_at", (datetime.utcnow() + timedelta(seconds=expires_in_seconds)).isoformat())
         return token
 
     def validate_token(self, token: str) -> Optional[dict]:

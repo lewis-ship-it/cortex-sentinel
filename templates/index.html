@@ -305,21 +305,22 @@ function renderFindings(findings){
     var tb=document.getElementById('ftbody');
     if(!findings.length) return;
     tb.innerHTML='';
-    findings.forEach(function(f){
-        var sev=(f.severity||'info').toLowerCase();
-        var conf=Math.round(((f.confidence_score!=null?f.confidence_score:f.confidence)||0)*100);
-        var ev=f.evidence_snippet||f.evidence||'';
-        var url=f.target_url||f.url||'-';
-        var tr=document.createElement('tr');
-        tr.innerHTML=
-            '<td class="s'+sev.charAt(0)+'">'+esc(f.severity||'?')+'</td>'+
-            '<td>'+esc(f.type||'Unknown')+'</td>'+
-            '<td>'+esc(f.param||f.parameter||'-')+'</td>'+
-            '<td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+esc(url)+'">'+esc(url.length>50?url.slice(0,50)+'...':url)+'</td>'+
-            '<td>'+conf+'%</td>'+
-            '<td class="ev" title="'+esc(ev)+'">'+esc(ev)||'-'+'</td>';
-        tb.appendChild(tr);
-    });
+findings.forEach(function(f){
+    var sev=(f.severity||'info').toLowerCase();
+    var conf=Math.round(((f.confidence_score!=null?f.confidence_score:f.confidence)||0)*100);
+    var ev=f.evidence_snippet||f.evidence||'';
+    var url=f.target_url||f.url||'-';
+    var evDisplay = esc(ev) || '-';  // ✅ evaluate fallback BEFORE building HTML
+    var tr=document.createElement('tr');
+    tr.innerHTML=
+        '<td class="s'+sev.charAt(0)+'">'+esc(f.severity||'?')+'</td>'+
+        '<td>'+esc(f.type||'Unknown')+'</td>'+
+        '<td>'+esc(f.param||f.parameter||'-')+'</td>'+
+        '<td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+esc(url)+'">'+esc(url.length>50?url.slice(0,50)+'...':url)+'</td>'+
+        '<td>'+conf+'%</td>'+
+        ' <td class="ev" title="' + esc(ev) + '">' + evDisplay + '</td>';
+    tb.appendChild(tr);
+});
 }
 
 function renderReport(content){
@@ -360,7 +361,8 @@ async function loadJobs(){
                 '<div class="ji-url">'+esc(j.target_url||j.id)+'</div>'+
                 '<div class="ji-meta">'+
                   '<span class="ji-st '+st+'">'+st.toUpperCase()+'</span>'+
-                  '<span>'+esc(j.tier||'Basic')+'</span>'+
+                  // templates/index.html  line 363 — normalize tier display
+                  '<span>' + esc((j.tier||'Basic').charAt(0).toUpperCase() + (j.tier||'Basic').slice(1).toLowerCase()) + '</span>' +
                   '<span>'+ago+'</span>'+
                 '</div>';
             div.onclick=function(){resumeJob(j.id);};

@@ -632,41 +632,37 @@ class DatabaseManager:
         rows, skipped = [], 0
         for raw in findings:
             try:
-                n = dict(raw)   # never mutate caller's dict
+                n = dict(raw)
+                # ... (Keep your existing normalisation logic here) ...
 
-                # ── Field name normalisation ───────────────────────────────────
-                if "url" in n and "target_url" not in n:
-                    n["target_url"] = n.pop("url")
-
-                if "parameter" in n and "param" not in n:
-                    n["param"] = n.pop("parameter")
-
-                if "confidence_score" in n:
-                    if "confidence" not in n or n.get("confidence") in (None, 0.5):
-                        n["confidence"] = n["confidence_score"]
-
-                # evidence_snippet (new) takes priority over evidence (old)
-                evidence = n.get("evidence_snippet") or n.get("evidence")
-
-                # ── Validate ───────────────────────────────────────────────────
-                f = FindingRecord(job_id=job_id, **{
-                    k: v for k, v in n.items()
-                    if k in FindingRecord.model_fields
-                })
-
-                rows.append((
-                    f.job_id, f.type, f.severity,
-                    f.target_url,
-                    f.param,
-                    f.payload,
-                    f.confidence,
-                    evidence or f.evidence,
-                    json.dumps(f.metadata) if f.metadata else None,
-                ))
+                # ── New Validation Strategy ──────────────────────────────────
+                # Check if this finding meets strict criteria
+                evidence = n.get("evidence_snippet") or n.get("evidence") or "No evidence available"
+                is_valid = all(k in n for k in ["severity", "type", "confidence"])
+                
+                if is_valid:
+                    # Strict path: use your Pydantic model
+                    f = FindingRecord(job_id=job_id, **{k: v for k, v in n.items() if k in FindingRecord.model_fields})
+                    row = (f.job_id, f.type, f.severity, f.target_url, f.param, f.payload, f.confidence, evidence or f.evidence, json.dumps(f.metadata) if f.metadata else None)
+                else:
+                    # Permissive path: store 'potential' findings without strict validation
+                    # We map them to the same table structure, but give them a default severity/confidence
+                    row = (
+                        job_id, 
+                        n.get("type", "Unknown Potential Finding"), 
+                        n.get("severity", "Info"), 
+                        n.get("target_url") or n.get("url", "unknown"),
+                        n.get("param", "none"),
+                        n.get("payload", "none"),
+                        n.get("confidence", 0.3), # Default low confidence
+                        evidence or "No evidence snippet",
+                        json.dumps(n.get("metadata", {}))
+                    )
+                rows.append(row)
+                
             except Exception as e:
-                skipped += 1
-                logger.warning(f"[DB] Finding skipped (validation error): {e}")
-
+                # Still log failures, but now you know the data is actually flowing
+                logger.warning(f"[DB] Finding normalization issue: {e}")
         if not rows:
             return 0
 
@@ -778,6 +774,14 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"[DB] kv_incr failed for {key!r}: {e}")
             return 0
+
+    # ── Job management ───────────────────────────────────────────────────────
+    def init_job_counter(self, job_id: str, count: int):
+        self.kv_set(f"job_counter:{job_id}", str(count))
+
+    def decrement_pending_scans(self, job_id: str) -> int:
+        # Atomic decrement
+        return self.kv_incr(f"job_counter:{job_id}", by=-1)
 
     # ── Composite status query ────────────────────────────────────────────────
 

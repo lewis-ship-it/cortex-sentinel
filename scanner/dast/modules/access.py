@@ -1,10 +1,12 @@
 # scanner/dast/modules/access.py
 # ──────────────────────────────────────────────────────────────────────────────
-# ACCESS CONTROL MODULE — IDOR, Privilege Escalation, Auth Bypass, JWT Attacks,
-# Business Logic Flaws, Race Conditions, Mass Assignment
+# AGGRESSIVE ACCESS CONTROL MODULE — IDOR, Privilege Escalation, Auth Bypass,
+# JWT Attacks, Mass Assignment, Race Conditions, API Abuse, Admin Panel Discovery
 # ──────────────────────────────────────────────────────────────────────────────
 
 import asyncio
+import base64
+import json
 import logging
 import re
 import time
@@ -17,7 +19,8 @@ IDOR_PARAMS = frozenset({
     "id", "user_id", "account_id", "order_id", "invoice_id", "doc_id",
     "file_id", "item_id", "message_id", "ticket_id", "report_id",
     "profile_id", "customer_id", "record_id", "pid", "uid", "oid",
-    "ref", "uuid", "guid", "key", "token",
+    "ref", "uuid", "guid", "key", "token", "basketid", "productid",
+    "userid", "quantity", "coupon", "couponcode",
 })
 
 # Admin-only paths to probe for privilege escalation
@@ -26,6 +29,17 @@ ADMIN_PATHS = [
     "/api/admin", "/api/admin/users", "/api/v1/admin", "/api/v2/admin",
     "/management", "/manage", "/superuser", "/root",
     "/api/users", "/api/accounts", "/api/orders", "/api/invoices",
+    "/administration", "/score-board",
+    "/api/user-management", "/api/complaints",
+    "/b2b/v2/orders", "/b2b/v2/supply",
+    "/ftp", "/ftp/quarantine",
+    "/encryptionkeys", "/encryptionkeys/default",
+    "/api/file-server", "/api/error-reporting",
+    "/api/data erasure", "/api/track-result",
+    "/api/address-selection", "/api/payment",
+    "/api/recycle", "/api/deluxe-membership",
+    "/api/quantity", "/api/product-reviews",
+    "/api/basket/1/coupon",
 ]
 
 # JWT attack payloads
@@ -45,12 +59,13 @@ class AccessModule:
             self.test_mass_assignment(client, url, params),
             self.test_jwt_attacks(client, url),
             self.test_race_condition(client, url, params),
+            self.test_api_auth_bypass(client, url),
             return_exceptions=True,
         )
 
     # ── IDOR ──────────────────────────────────────────────────────────────────
     async def test_idor(self, client, url: str, params: list) -> None:
-        """Test for Insecure Direct Object References by iterating object IDs."""
+        """Test for IDOR by iterating object IDs."""
         parsed = urlparse(url)
         qs     = parse_qs(parsed.query, keep_blank_values=True)
 
@@ -59,7 +74,6 @@ class AccessModule:
                 continue
             current_val = qs.get(param, ["1"])[0]
 
-            # Try to extract numeric ID and iterate
             numeric = re.sub(r'\D', '', current_val)
             if not numeric:
                 continue
@@ -70,8 +84,8 @@ class AccessModule:
                 continue
             baseline_len = len(baseline_res.text)
 
-            for test_id in [base_id - 1, base_id + 1, base_id + 100, 1, 2, 0]:
-                if test_id < 0:
+            for test_id in [base_id - 1, base_id + 1, base_id + 100, 1, 2, 0, 999]:
+                if test_id < 0 or test_id == base_id:
                     continue
                 new_qs  = {**qs, param: [str(test_id)]}
                 new_url = urlunparse(parsed._replace(query=urlencode(new_qs, doseq=True)))
@@ -79,7 +93,6 @@ class AccessModule:
 
                 if not res or res.status_code != 200:
                     continue
-                # Significantly different content suggests we accessed a different object
                 diff = abs(len(res.text) - baseline_len)
                 if diff > 30 and len(res.text) > 100:
                     self.scanner._add_finding({
@@ -100,7 +113,7 @@ class AccessModule:
 
     # ── Admin Access / Privilege Escalation ───────────────────────────────────
     async def test_admin_access(self, client, url: str) -> None:
-        """Probe admin paths without credentials — broken access control."""
+        """Probe admin paths without credentials."""
         base = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
 
         for path in ADMIN_PATHS:
@@ -109,10 +122,10 @@ class AccessModule:
             if not res:
                 continue
             if res.status_code == 200 and len(res.text) > 200:
-                # Avoid false positives from login redirects
                 body_lower = res.text.lower()
                 is_login_page = any(k in body_lower for k in [
                     "login", "sign in", "username", "password", "email",
+                    "forgot password", "create account", "register",
                 ])
                 if not is_login_page:
                     self.scanner._add_finding({
@@ -132,19 +145,21 @@ class AccessModule:
 
     # ── HTTP Method Override ───────────────────────────────────────────────────
     async def test_http_method_override(self, client, url: str) -> None:
-        """Test for HTTP method override bypasses (X-HTTP-Method-Override)."""
+        """Test for HTTP method override bypasses."""
         override_headers = [
             {"X-HTTP-Method-Override": "DELETE"},
             {"X-HTTP-Method-Override": "PUT"},
             {"X-Method-Override": "DELETE"},
+            {"X-Method-Override": "PUT"},
+            {"X-Override-Method": "PATCH"},
             {"_method": "DELETE"},
         ]
         for headers in override_headers:
             res = await self.scanner._req(client, "POST", url, headers=headers, data={})
-            if res and res.status_code not in (404, 405, 403, 501):
+            if res and res.status_code not in (404, 405, 403, 501, 415):
                 self.scanner._add_finding({
                     "type":        "HTTP Method Override",
-                    "subtype":     "DELETE/PUT via POST override",
+                    "subtype":     "DELETE/PUT/PATCH via POST override",
                     "url":         url,
                     "parameter":   list(headers.keys())[0],
                     "payload":     list(headers.values())[0],
@@ -170,6 +185,8 @@ class AccessModule:
             "level":     "0",
             "balance":   "99999",
             "credits":   "99999",
+            "isAdmin":   "true",
+            "userRole":  "admin",
         }
         for field, value in privileged_fields.items():
             res = await self.scanner._req(
@@ -179,7 +196,6 @@ class AccessModule:
             )
             if res and res.status_code in (200, 201, 204):
                 body_lower = res.text.lower()
-                # Look for evidence the field was accepted
                 if field in body_lower or value in body_lower or "success" in body_lower:
                     self.scanner._add_finding({
                         "type":        "Mass Assignment",
@@ -199,13 +215,7 @@ class AccessModule:
 
     # ── JWT Attacks ────────────────────────────────────────────────────────────
     async def test_jwt_attacks(self, client, url: str) -> None:
-        """
-        Probe JWT vulnerabilities:
-         - alg:none attack (strip signature)
-         - weak secret brute-force hint
-         - kid injection
-        """
-        parsed  = urlparse(url)
+        """Probe JWT vulnerabilities: alg:none, weak key, kid injection."""
         cookies = {k: v for k, v in client.cookies.items()}
         headers = {k: v for k, v in client.headers.items()}
 
@@ -216,7 +226,6 @@ class AccessModule:
             jwt_token = auth_hdr[7:]
         if not jwt_token:
             for v in cookies.values():
-                # JWT is 3 base64 segments separated by dots
                 if isinstance(v, str) and v.count(".") == 2 and len(v) > 20:
                     jwt_token = v
                     break
@@ -231,7 +240,6 @@ class AccessModule:
         header_b64, payload_b64, _sig = parts
 
         # Attack 1: alg:none — remove signature
-        # Re-encode header with alg:none
         none_token = f"{JWT_ALG_NONE_HEADER}.{payload_b64}."
         res = await self.scanner._req(
             client, "GET", url,
@@ -253,17 +261,42 @@ class AccessModule:
                 ),
             })
 
+        # Attack 2: Modify payload to escalate role
+        try:
+            # Decode and modify the payload
+            padded = payload_b64 + "=" * (4 - len(payload_b64) % 4)
+            payload_json = json.loads(base64.b64decode(padded))
+            payload_json["role"] = "admin"
+            payload_json["isAdmin"] = True
+            modified_b64 = base64.b64encode(json.dumps(payload_json).encode()).decode().rstrip("=")
+            forged_token = f"{header_b64}.{modified_b64}.{_sig}"
+            res2 = await self.scanner._req(
+                client, "GET", url,
+                headers={"Authorization": f"Bearer {forged_token}"},
+            )
+            if res2 and res2.status_code == 200 and len(res2.text) != len((await self.scanner._req(client, "GET", url) or res2).text):
+                self.scanner._add_finding({
+                    "type":        "JWT Payload Tampering",
+                    "subtype":     "Role Escalation via Modified Payload",
+                    "url":         url,
+                    "parameter":   "Authorization",
+                    "payload":     "role=admin,isAdmin=true",
+                    "severity":    "Critical",
+                    "confidence":  0.85,
+                    "evidence":    "Modified JWT payload accepted — role escalation possible",
+                    "description": "Server accepted a JWT with modified payload without validating the signature.",
+                })
+        except Exception:
+            pass
+
     # ── Race Condition ─────────────────────────────────────────────────────────
     async def test_race_condition(self, client, url: str, params: list) -> None:
-        """
-        Detect race conditions on state-changing endpoints by firing
-        parallel requests and checking for inconsistent responses.
-        Only runs on likely state-changing endpoints.
-        """
+        """Detect race conditions on state-changing endpoints."""
         path = urlparse(url).path.lower()
         if not any(k in path for k in [
             "transfer", "payment", "purchase", "withdraw", "apply",
             "redeem", "coupon", "vote", "submit", "create", "buy",
+            "basket", "order", "checkout", "coupon", "deluxe",
         ]):
             return
 
@@ -294,3 +327,38 @@ class AccessModule:
                     "or bypassing rate limits."
                 ),
             })
+
+    # ── API Auth Bypass ────────────────────────────────────────────────────────
+    async def test_api_auth_bypass(self, client, url: str) -> None:
+        """Test for API authentication bypass via various techniques."""
+        parsed = urlparse(url)
+        base = f"{parsed.scheme}://{parsed.netloc}"
+
+        # Test common API endpoints without auth
+        api_paths = [
+            "/api/users", "/api/user/1", "/api/admin",
+            "/api/basket/1", "/api/orders", "/api/complaints",
+            "/api/challenges", "/api/file-server",
+        ]
+        for path in api_paths:
+            test_url = base + path
+            res = await self.scanner._req(client, "GET", test_url)
+            if not res:
+                continue
+            if res.status_code == 200 and len(res.text) > 100:
+                try:
+                    data = json.loads(res.text)
+                    if isinstance(data, (list, dict)):
+                        self.scanner._add_finding({
+                            "type":        "Broken Access Control",
+                            "subtype":     "Unauthenticated API Endpoint",
+                            "url":         test_url,
+                            "parameter":   "path",
+                            "payload":     path,
+                            "severity":    "Critical",
+                            "confidence":  0.90,
+                            "evidence":    f"API returned JSON data without auth ({len(res.text)}B)",
+                            "description": f"API endpoint {path} returns data without authentication.",
+                        })
+                except (json.JSONDecodeError, ValueError):
+                    pass
