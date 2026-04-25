@@ -94,7 +94,11 @@ class AccessModule:
                 if not res or res.status_code != 200:
                     continue
                 diff = abs(len(res.text) - baseline_len)
-                if diff > 30 and len(res.text) > 100:
+                # FIX: raised threshold from 30b to 100b — 30b diff could be
+                # a timestamp or CSRF token change, not a real data difference
+                if diff > 100 and len(res.text) > 200:
+                    conf = 0.85
+                    tier, fp = ("high", "unlikely") if conf >= 0.90 else ("medium", "possible")
                     self.scanner._add_finding({
                         "type":        "Insecure Direct Object Reference (IDOR)",
                         "subtype":     f"Parameter: {param}",
@@ -102,7 +106,9 @@ class AccessModule:
                         "parameter":   param,
                         "payload":     str(test_id),
                         "severity":    "Critical",
-                        "confidence":  0.80,
+                        "confidence":  conf,
+                        "confidence_tier": tier,
+                        "fp_likelihood": fp,
                         "evidence":    f"ID={test_id} returned 200 with content diff={diff}B from ID={base_id}",
                         "description": (
                             f"Parameter '{param}' allows access to other users' objects. "
@@ -136,6 +142,8 @@ class AccessModule:
                         "payload":     path,
                         "severity":    "Critical",
                         "confidence":  0.88,
+                        "confidence_tier": "high",
+                        "fp_likelihood": "unlikely",
                         "evidence":    f"HTTP 200 from {path} without authentication ({len(res.text)}B)",
                         "description": (
                             f"Admin/privileged endpoint {path} is accessible without authentication. "

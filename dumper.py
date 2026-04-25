@@ -15,10 +15,10 @@ INCLUDE_LIST = {
     'requirements.txt',  # Includes config files
     'docker-compose.yml',# Includes config files
     'dockerfile',       # Includes config files
-    'templates',         # Includes the entire templates folder
     'Procfile',         # Includes config files
-        # Includes test files
-        # Includes utility scripts
+    'test_redis.py',    # Includes test files
+    'templates',        # Includes the entire templates folder
+    'run_all.py'        # Includes utility scripts
 
 }
 

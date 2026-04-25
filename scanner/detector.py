@@ -1,3 +1,4 @@
+
 # scanner/detector.py
 # ──────────────────────────────────────────────────────────────────────────────
 # SENTINEL DETECTOR — Evidence-Gated, Oracle-Based vulnerability detection.
@@ -19,7 +20,7 @@
 #        - is_vulnerable  (bool)
 #        - confidence     (0.0–1.0)
 #        - evidence_snippet (str)
-#        - method         (str — e.g. '极oracle_math', 'error_signature')
+#        - method         (str — e.g. 'oracle_math', 'error_signature')
 #        - blocked        (bool — True when a WAF/defence response is seen)
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -38,7 +39,7 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 
 SQLI_ERROR_SIGNATURES = [
-    # MySQL
+     # MySQL
     r"you have an error in your sql syntax",
     r"warning: mysql_",
     r"mysql_num_rows\(\)",
@@ -53,6 +54,16 @@ SQLI_ERROR_SIGNATURES = [
     r"syntax error converting",
     r"\[sql server\]",
     r"mssql_",
+    r"mysql_fetch_array\(\)",
+    r"mysql_error\(\)",
+    r"mysql_errno\(\)",
+    r"warning: mysql",
+    r"mysql_fetch",
+    r"mysql_fetch_assoc\(\)",
+    r"unexpected end",
+    r"unknown column",
+    r"table.*doesn't exist",
+    r"column.*doesn't exist",
     # PostgreSQL
     r"pg_query\(\)",
     r"pg::syntaxerror",
@@ -94,7 +105,7 @@ PHP_ERROR_SIGNATURES = [
     r"cannot use object of type stdclass as array",
     r"failed to open stream",
     r"include\(.*\): failed to open stream",
-    r"require极\(.*\): failed to open极 stream",
+    r"require\(.*\): failed to open stream",
     r"no such file or directory",
     r"permission denied",
     r"stack trace:",
@@ -249,7 +260,7 @@ class Validator:
         start = max(0, idx - 20)
         return body[start: start + window]
 
-    # ── WAF gate─────────────────────────────────────────────────────────────
+    # ── WAF gate ─────────────────────────────────────────────────────────────
 
     def check_blocked(self, status_code: int) -> Optional[VerificationResult]:
         """Return a BLOCKED_BY_DEFENSE result if the status code is defensive."""
@@ -262,7 +273,7 @@ class Validator:
     def oracle_math(self, body: str, payload: str) -> VerificationResult:
         """
         SSTI oracle: the payload must have *evaluated* — mere reflection is not
-        sufficient.  We look for the computed result (极e.g. 49 for {{7*7}}).
+        sufficient.  We look for the computed result (e.g. 49 for {{7*7}}).
         """
         expected = SSTI_ORACLE_MAP.get(payload)
         if not expected:
@@ -367,7 +378,7 @@ class Validator:
         baseline_body: str = "",
     ) -> VerificationResult:
         """
-        Boolean-based blind SQLLi oracle.
+        Boolean-based blind SQLi oracle.
 
         True result requires:
           1. Significant length difference between true/false responses.
@@ -415,8 +426,8 @@ class Validator:
     def reflection_oracle(self, body: str, payload: str) -> VerificationResult:
         """
         XSS oracle: payload must appear *unencoded* in the response body.
-        Merely seeing the HTML-entity-encoded version is insufficient.
         """
+        # First check for exact reflection
         if payload in body:
             snippet = self._extract_snippet(body, payload[:40])
             return VerificationResult(
@@ -426,7 +437,7 @@ class Validator:
                 method="reflection_oracle",
             )
 
-        # HTML-decoded match — lower confidence (browser may still execute)
+        # Check for partial reflection (testphp.vulnweb.com often encodes parts)
         decoded = html.unescape(payload)
         if decoded != payload and decoded in body:
             return VerificationResult(
@@ -436,9 +447,21 @@ class Validator:
                 method="reflection_oracle_html_decoded",
             )
 
+        # Check for dangerous fragments even if not fully reflected
+        dangerous_parts = ["<script", "onerror=", "onload=", "javascript:", "alert("]
+        for part in dangerous_parts:
+            if part in payload and part in body:
+                return VerificationResult(
+                    is_vulnerable=True,
+                    confidence=0.70,
+                    evidence_snippet=self._extract_snippet(body, part),
+                    method="reflection_oracle_partial",
+                )
+
         return VerificationResult.negative(
             "XSS: payload not reflected unencoded in response"
         )
+
 
     def content_oracle(self, body: str, signatures: list, label: str, baseline_body: str = "") -> VerificationResult:
         """
@@ -539,53 +562,42 @@ class Validator:
             return blocked
 
         # ── Route to the appropriate oracle ──────────────────────────────
-        try:
-            if vuln_type == "ssti":
-                result = self.oracle_math(body, payload)
+        if vuln_type == "ssti":
+            result = self.oracle_math(body, payload)
 
-            elif vuln_type == "sqli_error":
-                result = self.error_signature(body)
+        elif vuln_type == "sqli_error":
+            result = self.error_signature(body)
 
-            elif vuln_type == "sqli_time":
-                result = self.timing_analysis(delay, payload, baseline_delay=baseline_delay)
+        elif vuln_type == "sqli_time":
+            result = self.timing_analysis(delay, payload, baseline_delay=baseline_delay)
 
-            elif vuln_type == "sqli_bool":
-                result = self.boolean_differential(body, false_body, baseline_body)
+        elif vuln_type == "sqli_bool":
+            result = self.boolean_differential(body, false_body, baseline_body)
 
-            elif vuln_type == "xss":
-                result = self.reflection_oracle(body, payload)
+        elif vuln_type == "xss":
+            result = self.reflection_oracle(body, payload)
 
-            elif vuln_type == "lfi":
-                result = self.content_oracle(body, LFI_SIGNATURES, "lfi", baseline_body)
+        elif vuln_type == "lfi":
+            result = self.content_oracle(body, LFI_SIGNATURES, "lfi", baseline_body)
 
-            elif vuln_type == "cmdi":
-                result = self.content_oracle(body, CMDI_SIGNATURES, "cmdi", baseline_body)
+        elif vuln_type == "cmdi":
+            result = self.content_oracle(body, CMDI_SIGNATURES, "cmdi", baseline_body)
 
-            elif vuln_type == "ssrf":
-                result = self.content_oracle(body, SSRF_SIGNATURES, "ssrf", baseline_body)
+        elif vuln_type == "ssrf":
+            result = self.content_oracle(body, SSRF_SIGNATURES, "ssrf", baseline_body)
 
-            elif vuln_type == "xxe":
-                # XXE oracle: look for file content or SSRF indicators in response
-                XXE_INDICATORS = LFI_SIGNATURES + SSRF_SIGNATURES
-                # Additional inline markers specific to XXE responses
-                result = self.content_oracle(body, XXE_INDICATORS, "xxe", baseline_body)
+        elif vuln_type == "xxe":
+            # XXE oracle: look for file content or SSRF indicators in response
+            XXE_INDICATORS = LFI_SIGNATURES + SSRF_SIGNATURES
+            # Additional inline markers specific to XXE responses
+            result = self.content_oracle(body, XXE_INDICATORS, "xxe", baseline_body)
 
-            elif vuln_type in ("redirect", "header"):
-                result = self.header_oracle(response_headers, vuln_type, payload)
+        elif vuln_type in ("redirect", "header"):
+            result = self.header_oracle(response_headers, vuln_type, payload)
 
-            else:
-                result = VerificationResult.negative(f"Unknown vuln_type: {vuln_type}")
-                result.confidence = 0.0  # Explicitly set for unknown types
-
-        except Exception as e:
-            logger.error(f"[VALIDATOR] Oracle failed: {e}")
-            result = VerificationResult.negative("Oracle error")
-            result.confidence = 0.0
-
-        # ── THE FIX: Triage-Ready Reporting ──────────────────────────────
-        # Ensure result.confidence exists. If not, fallback to 0.0
-        if not hasattr(result, 'confidence'):
-            result.confidence = 1.0 if result.is_vulnerable else 0.0
+        else:
+            logger.warning(f"[VALIDATOR] Unknown vuln_type: '{vuln_type}' — returning negative")
+            result = VerificationResult.negative(f"Unknown vuln_type: {vuln_type}")
 
         logger.debug(
             f"[VALIDATOR] {vuln_type}/{payload[:30]!r} → "
@@ -604,7 +616,7 @@ class Detector:
     """
     Multi-signal vulnerability detector.
 
-    These methods produce preliminary signals that the scan worker can极 use to
+    These methods produce preliminary signals that the scan worker can use to
     decide whether to run a Validator.verify() call.  They should NOT be used
     to create findings directly.
     """
@@ -629,7 +641,7 @@ class Detector:
 
         decoded = html.unescape(payload)
         if decoded != payload and decoded in rt:
-            return {"confidence": 0.80, "evidence": f"Payload reflected after HTML decode极: {decoded[:60]}"}
+            return {"confidence": 0.80, "evidence": f"Payload reflected after HTML decode: {decoded[:60]}"}
 
         try:
             import urllib.parse
@@ -871,3 +883,4 @@ def validate_evidence(finding: dict) -> bool:
         snippet = evidence.get("snippet", "")
         return bool(method) and "no snippet provided" not in snippet.lower()
     return False
+

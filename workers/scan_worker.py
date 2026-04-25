@@ -1,13 +1,14 @@
+
 # workers/scan_worker.py
 # ──────────────────────────────────────────────────────────────────────────────
 # SENTINEL SCAN WORKER — Evidence-Gated Pipeline
 #
 # Architecture changes vs. previous version:
 #
-#   极1. EVIDENCE-GATED PIPELINE
+#   1. EVIDENCE-GATED PIPELINE
 #      Every payload injection now calls validator.verify(...).  A finding is
 #      appended to `findings` ONLY when result.is_vulnerable is True.
-#      WAF/defence responses (403/429/500极/503) are logged but never turned
+#      WAF/defence responses (403/429/500/503) are logged but never turned
 #      into findings.
 #
 #   2. CONFIDENCE SCORING — every finding object carries:
@@ -30,8 +31,8 @@
 #      silent failure.
 #
 #   6. GLOBAL EXCEPTION WRAPPER
-#      A top-level try/except Exception in handle极() logs the full stack trace
-#      to极 the DB and pushes a JobFailed signal — no worker ever silently stops.
+#      A top-level try/except Exception in handle() logs the full stack trace
+#      to the DB and pushes a JobFailed signal — no worker ever silently stops.
 # ──────────────────────────────────────────────────────────────────────────────
 
 import asyncio
@@ -42,6 +43,8 @@ import time
 import traceback
 from typing import Dict, List, Optional
 from urllib.parse import urlparse, parse_qs
+
+import httpx
 
 from workers.base_worker import worker_loop, push_log
 from task_queue.queues import SCAN_QUEUE
@@ -56,21 +59,21 @@ from scanner.detector import Detector, Validator
 from scanner.dast.context_engine import ContextEngine
 
 logging.basicConfig(level=logging.DEBUG)
-logger = get_logger("scan_worker")
+logger        = get_logger("scan_worker")
 state_manager = get_state_manager()
 
-detector = Detector()
-validator = Validator()
+detector       = Detector()
+validator      = Validator()
 context_engine = ContextEngine()
-fuzzer = SmartFuzzer()
+fuzzer         = SmartFuzzer()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TIMEOUT CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 
-DEFAULT_TIMEOUT = 12
-PHP_TIMEOUT = 30
+DEFAULT_TIMEOUT    = 12
+PHP_TIMEOUT        = 30
 TIME_BASED_TIMEOUT = 15
 
 
@@ -86,6 +89,24 @@ COMMON_PARAMS = [
     "sort", "filter", "from", "to", "amount", "code", "key", "session",
     "debug", "action", "op", "mode", "format", "output", "dir", "include",
 ]
+async def is_url_reachable(url: str, timeout: int = 5) -> bool:
+    """
+    Validate that a URL is reachable before attempting full scan.
+    Returns True if URL responds with a non-5xx status code.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            # Use HEAD first for efficiency, fall back to GET if needed
+            try:
+                response = await client.head(url)
+            except (httpx.ConnectError, httpx.ReadTimeout):
+                # Try GET if HEAD fails (some servers block HEAD)
+                response = await client.get(url)
+            
+            return response.status_code < 500
+    except Exception:
+        return False
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -106,30 +127,30 @@ def detect_php(response, url: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# WAF DETECTION
+# WAF DETECTION — delegates to scanner.dast.waf_detector
 # ─────────────────────────────────────────────────────────────────────────────
 
 def detect_waf(response) -> List[str]:
-    waf_signatures = {
-        "Cloudflare": ["cloudflare", "cf-ray"],
-        "AWS WAF": ["aws-elb", "x-amzn-requestid"],
-        "Akamai": ["akamai"],
-        "ModSecurity": ["mod_security", "modsecurity"],
-        "Imperva": ["imperva", "incapsula"],
-        "F5 BIG-IP": ["big-ip", "f5"],
-        "Sucuri": ["sucuri"],
-    }
+    """Detect WAF from a single response. Delegates to WAFDetector signatures."""
+    from scanner.dast.waf_detector import WAF_SIGNATURES
     detected = []
-    headers = str(response.headers).lower()
-    body_low = response.text[:1000].lower()
-    for waf, sigs in waf_signatures.items():
-        if any(s in headers or s in body_low for s in sigs):
-            detected.append(waf)
+    headers  = str(response.headers).lower()
+    body_low = response.text[:2000].lower()
+    for waf_name, sigs in WAF_SIGNATURES.items():
+        score = 0
+        for h in sigs.get("headers", []):
+            if h.lower() in headers:
+                score += 2
+        for b in sigs.get("body", []):
+            if b.lower() in body_low:
+                score += 1
+        if score >= 2:
+            detected.append(waf_name)
     return detected
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PARAMETER DISCOVER极Y
+# PARAMETER DISCOVERY
 # ─────────────────────────────────────────────────────────────────────────────
 
 def extract_params(url: str, html: str) -> List[str]:
@@ -184,19 +205,59 @@ def audit_headers(headers: Dict) -> List[str]:
 
 def get_payloads() -> Dict[str, List[str]]:
     return {
-        "xss": ["<script>alert(1)</script>", "<img src=x onerror=alert(1)>",
-                "<svg/onload=alert(1)>", "\" onmouseover=alert(1) x=\""],
-        "sqli_error": ["' OR 1=1 --", "' OR '1'='1", "\" OR \"1\"=\"1",
-                       "' AND extractvalue(1,concat(0x7e,version()))--"],
-        "sqli_time": ["' OR SLEEP(6)--", "'; WAITFOR DELAY '0:极0:6'--",
-                      "'; SELECT pg_sleep(6)--"],
-        "sqli_bool": ["' AND 1=1--", "' AND 1=2--"],
-        "ssti": ["{{7*7}}", "${7*7}", "#{7*7}"],
-        "lfi": ["../../../../etc/passwd", "../../../../etc/passwd%00",
-                "php://filter/convert.base64-encode/resource=index.php"],
-        "cmdi": ["; id", "| id", "& id", "$(id)", "`id`"],
-        "redirect": ["https://evil.com", "//evil.com", "/\\evil.com"],
-        "header": ["test\r\nX-Injected: evil", "test%0d%0aX-Injected: evil"],
+        "xss": [
+            "<script>alert(1)</script>",
+            "<img src=x onerror=alert(1)>",
+            "<svg/onload=alert(1)>",
+            "\" onmouseover=alert(1) x=\"",
+            "' onmouseover=alert(1) x='",
+            "javascript:alert(1)"
+        ],
+        "sqli_error": [
+            "' OR 1=1 --",
+            "' OR '1'='1",
+            "\" OR \"1\"=\"1",
+            "' AND extractvalue(1,concat(0x7e,version()))--",
+            "1' OR '1'='1'-- -",
+            "1' UNION SELECT NULL,NULL-- -",
+            "1' AND (SELECT * FROM (SELECT SLEEP(5))a)-- -",
+            "1' AND extractvalue(1,concat(0x7e,version()))-- -"
+        ],
+        "sqli_time": [
+            "' OR SLEEP(6)--",
+            "'; WAITFOR DELAY '0:0:6'--",
+            "'; SELECT pg_sleep(6)--"
+        ],
+        "sqli_bool": [
+            "' AND 1=1--",
+            "' AND 1=2--"
+        ],
+        "ssti": [
+            "{{7*7}}",
+            "${7*7}",
+            "#{7*7}"
+        ],
+        "lfi": [
+            "../../../../etc/passwd",
+            "../../../../etc/passwd%00",
+            "php://filter/convert.base64-encode/resource=index.php"
+        ],
+        "cmdi": [
+            "; id",
+            "| id",
+            "& id",
+            "$(id)",
+            "`id`"
+        ],
+        "redirect": [
+            "https://evil.com",
+            "//evil.com",
+            "/\\evil.com"
+        ],
+        "header": [
+            "test\r\nX-Injected: evil",
+            "test%0d%0aX-Injected: evil"
+        ]
     }
 
 
@@ -218,7 +279,7 @@ class ResponseDiff:
     def similarity_ratio(s1: str, s2: str) -> float:
         if not s1 or not s2:
             return 1.0 if s1 == s2 else 0.0
-        longer = s1 if len(s1) >= len(s2) else s2
+        longer  = s1 if len(s1) >= len(s2) else s2
         shorter = s2 if len(s1) >= len(s2) else s1
         if not longer:
             return 1.0
@@ -265,11 +326,11 @@ def _sanitize_findings(findings: List[Dict]) -> List[Dict]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def scan_url_async(
-    job_id: str,
+    job_id:     str,
     target_url: str,
-    tier: str = "Basic",
-    cookies: Optional[Dict] = None,
-    headers: Optional[Dict] = None,
+    tier:       str            = "Basic",
+    cookies:    Optional[Dict] = None,
+    headers:    Optional[Dict] = None,
 ) -> List[Dict]:
     """
     Evidence-gated async vulnerability scan.
@@ -281,8 +342,18 @@ async def scan_url_async(
       - method             (oracle method that confirmed the finding)
     """
     findings: List[Dict] = []
+    # ── Circuit Breaker Check ─────────────────────────────────────────────
+    db = get_db()
+    parsed = urlparse(target_url)
+    host = parsed.netloc
+    
+    if not db.circuit.is_allowed(host):
+        logger.warning(f"[SCAN] Circuit breaker blocked {host} — skipping", job_id)
+        push_log(job_id, f"[SCAN] Skipping {host} — circuit breaker open", tier=tier)
+        return findings
+    # ─────────────────────────────────────────────────────────────────────
 
-    rate_cfg = RateLimitConfig(max_requests_per_second=5, min_delay_ms=200)
+    rate_cfg    = RateLimitConfig(max_requests_per_second=5, min_delay_ms=200)
     http_client = HTTPClient(
         timeout=DEFAULT_TIMEOUT,
         max_retries=3,
@@ -290,15 +361,33 @@ async def scan_url_async(
     )
 
     try:
+        # ── URL Validation Check ─────────────────────────────────────────
+        if not await is_url_reachable(target_url):
+            logger.warning(f"URL {target_url} is not reachable — skipping", job_id)
+            push_log(job_id, f"[SCAN] Skipping unreachable URL: {target_url}", tier=tier)
+            return findings
+        # ─────────────────────────────────────────────────────────────────
         # ── Baseline request ──────────────────────────────────────────────
         logger.info(f"Getting baseline response from {target_url}", job_id)
         baseline_start = time.time()
-        baseline = await http_client.get(target_url, headers=headers, cookies=cookies)
+        try:
+            baseline = await http_client.get(target_url, headers=headers, cookies=cookies)
+        except (httpx.ConnectTimeout, httpx.ConnectError, httpx.ReadTimeout) as exc:
+            # Record circuit breaker failure
+            db.circuit.record_failure(host)
+            logger.warning(f"[SCAN] Connection failed to {target_url}: {exc}", job_id)
+            push_log(job_id, f"[SCAN] Connection failed: {target_url}", tier=tier)
+            return findings
+        except Exception as exc:
+            logger.error(f"Scan failed: {exc}", job_id)
+            raise
+            
         baseline_delay = time.time() - baseline_start
-        baseline_text = baseline.text[:5000]
+        baseline_text  = baseline.text[:5000]
+        db.circuit.record_success(host)
 
         # ── Target fingerprinting ─────────────────────────────────────────
-        is_php = detect_php(baseline, target_url)
+        is_php  = detect_php(baseline, target_url)
         timeout = PHP_TIMEOUT if is_php else DEFAULT_TIMEOUT
 
         if is_php:
@@ -313,27 +402,27 @@ async def scan_url_async(
         missing = audit_headers(dict(baseline.headers))
         if missing:
             findings.append({
-                "type": "Missing Security Headers",
-                "severity": "Medium",
-                "param": "HTTP Headers",
-                "missing_headers": missing,
-                "confidence_score": 0.95,
-                "evidence_snippet": f"Missing: {', '.join(missing)}",
-                "method": "header_audit",
-                "target_url": target_url,
+                "type":              "Missing Security Headers",
+                "severity":          "Medium",
+                "param":             "HTTP Headers",
+                "missing_headers":   missing,
+                "confidence_score":  0.95,
+                "evidence_snippet":  f"Missing: {', '.join(missing)}",
+                "method":            "header_audit",
+                "target_url":        target_url,
             })
             logger.info(f"Missing headers: {missing}", job_id)
 
         # ── Parameter discovery ───────────────────────────────────────────
-        params = extract_params(target_url, baseline.text)
+        params       = extract_params(target_url, baseline.text)
         js_endpoints = extract_js_endpoints(baseline.text)
 
         logger.info(
             f"Discovered {len(params)} params, {len(js_endpoints)} JS endpoints", job_id
         )
 
-        payloads = get_payloads()
-        tests_run = 0
+        payloads    = get_payloads()
+        tests_run   = 0
         total_tests = len(params) * sum(len(p) for p in payloads.values())
 
         logger.info(
@@ -371,7 +460,7 @@ async def scan_url_async(
                         )
 
                         delay = time.time() - req_start
-                        body = r.text[:5000]
+                        body  = r.text[:5000]
                         status = r.status_code
 
                         # ── Boolean false-body caching ────────────────────
@@ -408,29 +497,36 @@ async def scan_url_async(
                             continue
 
                         # Gate: only proceed if oracle confirmed the vulnerability
-                        # Instead of continue:
                         if not result.is_vulnerable:
-                            # IF confidence is > 0.3 (some signal), keep it as a 'Potential' finding
-                            if result.confidence > 0.3:
-                                # Tag it so you know it's not confirmed
-                                is_potential = True
-                                potential_reason = f"Low confidence signal: {result.confidence:.2f}"
-                            else:
-                                continue  # Truly discard findings with no signal at all
+                            continue
 
                         # ── Build the canonical finding dict ──────────────
                         vuln_meta = _VULN_META.get(vuln_type, _VULN_META["_default"])
+                        conf = round(result.confidence, 4)
+
+                        # Confidence classification
+                        if conf >= 0.90:
+                            confidence_tier = "high"
+                            fp_likelihood = "unlikely"
+                        elif conf >= 0.70:
+                            confidence_tier = "medium"
+                            fp_likelihood = "possible"
+                        else:
+                            confidence_tier = "low"
+                            fp_likelihood = "likely"
 
                         finding = {
-                            "type": vuln_meta["type"],
-                            "severity": vuln_meta["severity"],
-                            "param": param,
-                            "payload": payload,
-                            "target_url": injected_url,
+                            "type":             vuln_meta["type"],
+                            "severity":         vuln_meta["severity"],
+                            "param":            param,
+                            "payload":          payload,
+                            "target_url":       injected_url,
                             # Required evidence fields
-                            "confidence_score": round(result.confidence, 4) if not is_potential else 0.1,
-                            "evidence_snippet": result.evidence_snippet if not is_potential else f"Potential: {potential_reason}",
-                            "method": result.method,
+                            "confidence_score": conf,
+                            "confidence_tier":  confidence_tier,
+                            "fp_likelihood":    fp_likelihood,
+                            "evidence_snippet": result.evidence_snippet,
+                            "method":           result.method,
                         }
 
                         # Attach timing evidence for time-based SQLi
@@ -463,36 +559,25 @@ async def scan_url_async(
                                 delay=synthetic_delay,
                                 baseline_delay=baseline_delay,
                             )
-                            # ── MODIFIED EVIDENCE-GATED BLOCK ────────────────────────────────────
-                            # workers/scan_worker.py  asyncio.TimeoutError handler
-# Initialise BEFORE the branch so every path has a value
-                            is_potential     = False
-                            potential_reason = None
-
                             if result.is_vulnerable:
-                                is_potential = False
-                            elif result.blocked:
-                                is_potential     = True
-                                potential_reason = "Blocked by WAF/Defense"
-                            elif result.confidence > 0.3:
-                                is_potential     = True
-                                potential_reason = f"Low confidence signal: {result.confidence:.2f}"
-                            else:
-                                continue  # no signal — discard
-
-                            meta_key  = vuln_type if not is_potential else "potential"
-                            vuln_meta = _VULN_META.get(meta_key, _VULN_META["_default"])
-                            finding = {
-                                "type":             vuln_meta["type"],
-                                "severity":         vuln_meta["severity"],
-                                "param":            param,
-                                "payload":          payload,
-                                "target_url":       injected_url,
-                                "confidence_score": round(result.confidence, 4),
-                                "evidence_snippet": result.evidence_snippet if not is_potential else f"Potential: {potential_reason}",
-                                "method":           result.method,
+                                finding = {
+                                    "type":             "SQL Injection (Time-based — Timeout)",
+                                    "severity":         "Critical",
+                                    "param":            param,
+                                    "payload":          payload,
+                                    "target_url":       injected_url,
+                                    "confidence_score": round(result.confidence, 4),
+                                    "evidence_snippet": (
+                                        f"Request timed out after {req_timeout}s — "
+                                        + result.evidence_snippet
+                                    ),
+                                    "method":           result.method,
+                                    "delay_seconds":    round(synthetic_delay, 2),
                                 }
-                            findings.append(finding)
+                                findings.append(finding)
+                                logger.info(
+                                    f"[CONFIRMED] SQLi timeout on param '{param}'", job_id
+                                )
 
                     except Exception as exc:
                         logger.debug(f"Test failed for {param}/{vuln_type}: {exc}", job_id)
@@ -519,19 +604,18 @@ async def scan_url_async(
 # ─────────────────────────────────────────────────────────────────────────────
 
 _VULN_META = {
-    "xss": {"type": "Cross-Site Scripting (XSS)", "severity": "High"},
-    "sqli_error": {"type": "SQL Injection (Error-based)", "severity": "Critical"},
-    "sqli_time": {"type": "SQL Injection (Time-based Blind)", "severity": "Critical"},
-    "sqli_bool": {"type": "SQL Injection (Boolean-based Blind)", "severity": "Critical"},
-    "ssti": {"type": "Server-Side Template Injection", "severity": "Critical"},
-    "lfi": {"type": "Local File Inclusion", "severity": "Critical"},
-    "cmdi": {"type": "Command Injection", "severity": "Critical"},
-    "redirect": {"type": "Open Redirect", "severity": "Medium"},
-    "header": {"type": "Header Injection", "severity": "High"},
-    "ssrf": {"type": "Server-Side Request Forgery (SSRF)", "severity": "Critical"},
-    "xxe": {"type": "XML External Entity (XXE)", "severity": "Critical"},
-    "_default": {"type": "Unknown Vulnerability", "severity": "Medium"},
-    "potential": {"type": "Potential Finding (Triage)", "severity": "Info"},
+    "xss":        {"type": "Cross-Site Scripting (XSS)",         "severity": "High"},
+    "sqli_error": {"type": "SQL Injection (Error-based)",        "severity": "Critical"},
+    "sqli_time":  {"type": "SQL Injection (Time-based Blind)",   "severity": "Critical"},
+    "sqli_bool":  {"type": "SQL Injection (Boolean-based Blind)","severity": "Critical"},
+    "ssti":       {"type": "Server-Side Template Injection",     "severity": "Critical"},
+    "lfi":        {"type": "Local File Inclusion",               "severity": "Critical"},
+    "cmdi":       {"type": "Command Injection",                  "severity": "Critical"},
+    "redirect":   {"type": "Open Redirect",                      "severity": "Medium"},
+    "header":     {"type": "Header Injection",                   "severity": "High"},
+    "ssrf":       {"type": "Server-Side Request Forgery (SSRF)", "severity": "Critical"},
+    "xxe":        {"type": "XML External Entity (XXE)",          "severity": "Critical"},
+    "_default":   {"type": "Unknown Vulnerability",              "severity": "Medium"},
 }
 
 
@@ -549,9 +633,9 @@ def handle(job: dict) -> None:
       • If anything fails, a JobFailed signal is pushed and the full
         stack trace is saved to the DB — no zombie jobs.
     """
-    job_id = job.get("job_id", "unknown")
+    job_id     = job.get("job_id", "unknown")
     target_url = job.get("url") or job.get("target_url")
-    tier = job.get("tier", "Basic")
+    tier       = job.get("tier", "Basic")
     findings: List[Dict] = []
 
     if not target_url:
@@ -560,11 +644,11 @@ def handle(job: dict) -> None:
 
     try:
         # ── IDEMPOTENCY: mark job as scanning immediately ─────────────────
-        # This makes the job visible in the dashboard before the first HTTP
-        # request is fired.
+        # FIX: Use update_job() not update_job_status() — the latter doesn't
+        # exist on _MinimalDB (the fallback DB class in api/main.py).
         try:
             db = get_db()
-            db.update_job_status(job_id, "scanning")
+            db.update_job(job_id, status="scanning")
         except Exception as db_init_exc:
             logger.warning(f"Could not set job status to scanning: {db_init_exc}", job_id)
 
@@ -640,3 +724,4 @@ def handle(job: dict) -> None:
 
 if __name__ == "__main__":
     worker_loop(SCAN_QUEUE, handle)
+

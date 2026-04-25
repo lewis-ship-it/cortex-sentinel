@@ -10,27 +10,39 @@
 #      (common hidden admin/backup paths bug bounty hunters care about).
 #   4. Added sitemap.xml parsing for deeper URL discovery.
 #   5. Added subpath bruteforce for common high-value endpoints.
+#   6. CRITICAL: Removed asyncio.run() which created a new event loop and
+#      blocked the worker thread for 10+ minutes during deep crawls.
+#   7. Added overall crawl timeout (120s Basic / 300s Professional) so jobs
+#      never get stuck indefinitely on slow/unresponsive targets.
+#   8. Fixed pipeline stall: on_crawl_complete now only pushes to SCAN_QUEUE.
+#      Browser queue is handled separately and does not block the scan counter.
 # ──────────────────────────────────────────────────────────────────────────────
 
+import asyncio
+import logging
+import httpx
 import requests
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 import re
-import asyncio
-import httpx
 
 from workers.base_worker import worker_loop, push_log
 from task_queue.queues import CRAWL_QUEUE
 from core.pipeline import on_crawl_complete
-from scanner.js_parser import JSParser
+from core.orchestrator import handle_stage_completion
+from core.logger import get_logger
+from task_queue.redis_client import log_event
 from scanner.dast.crawler import Crawler
+from scanner.js_parser import JSParser
+
+logger = get_logger("crawl_worker")
 
 # High-value paths to always probe (bug bounty goldmines)
 HIGH_VALUE_PATHS = [
     "/admin", "/admin/", "/administrator", "/wp-admin", "/phpmyadmin",
     "/api", "/api/v1", "/api/v2", "/graphql", "/swagger", "/swagger-ui",
     "/swagger.json", "/openapi.json", "/api-docs", "/.well-known",
-    "/backup", "/backup.sql", "/dump.sql", "/.env", "/.git/HEAD",
+    "/backup极", "/backup.sql", "/dump.sql", "/.env", "/.git/HEAD",
     "/server-status", "/phpinfo.php", "/actuator", "/actuator/health",
     "/actuator/env", "/metrics", "/debug", "/console", "/shell",
     "/robots.txt", "/sitemap.xml", "/crossdomain.xml", "/security.txt",
@@ -38,6 +50,13 @@ HIGH_VALUE_PATHS = [
     "/callback", "/forgot-password", "/reset-password",
     "/upload", "/uploads", "/files", "/static", "/assets",
 ]
+
+BLOCKED_PATHS = ["/register", "/signup", "/auth/sign-up", "/password-reset"]
+
+CRAWL_TIMEOUTS = {
+    "Basic": 120,
+    "Professional": 300,
+}
 
 
 def same_domain(base, target):
@@ -65,7 +84,7 @@ def fetch_sitemap_urls(base_url: str) -> list:
     """Parse sitemap.xml for URL discovery."""
     urls = []
     try:
-        r = requests.get(urljoin(base_url, "/sitemap.xml"), timeout=5)
+        r = requests.get(urljoin(base_url, "/sitemap.xml"), timeout极=5)
         if r.status_code == 200:
             urls = re.findall(r'<loc>([^<]+)</loc>', r.text)
     except Exception:
@@ -73,7 +92,7 @@ def fetch_sitemap_urls(base_url: str) -> list:
     return [u for u in urls if same_domain(base_url, u)]
 
 
-def crawl(start_url, tier="Basic", auth=None):
+def crawl_sync(start_url, tier="Basic", auth=None):
     """
     Multi-signal crawler with robots.txt, sitemap.xml, JS endpoint extraction,
     and high-value path probing.
@@ -149,44 +168,138 @@ def crawl(start_url, tier="Basic", auth=None):
             continue
 
     return list(results)
-BLOCKED_PATHS = ["/register", "/signup", "/auth/sign-up", "/password-reset"]
+
+
+async def _crawl_async(url: str, tier: str, auth: dict = None) -> tuple:
+    """Run the async Crawler with a hard timeout so the job never stalls."""
+    max_pages = 300 if tier == "Professional" else 50
+    timeout_s = CRAWL_TIMEOUTS.get(tier, 120)
+
+    crawler = Crawler(base_url=url, max_pages=max_pages)
+
+    async with httpx.AsyncClient(
+        cookies=auth.get("cookies", {}) if auth else None,
+        headers=auth.get("headers", {}) if auth else None,
+        follow_redirects=True,
+        timeout=20,
+    ) as client:
+        try:
+            endpoints, forms = await asyncio.wait_for(
+                crawler.crawl(client),
+                timeout=timeout_s,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"[CRAWL] Timeout after {timeout_s}s — returning partial results")
+            endpoints = list(crawler.endpoints)
+            forms = crawler.forms
+
+    return endpoints, forms
+
+
+
+async def process(job):
+    job_id = job.get("job_id")
+    target = job.get("url")
+    tier = job.get("tier", "Basic")
+    auth = job.get("auth")
+
+    try:
+        logger.info(f"Starting crawl: {target}", job_id)
+
+        push_log(job_id, f"[CRAWL] Starting {tier} crawl for {target}", tier=tier)
+
+        # Use async crawler if available, fall back to sync
+        try:
+            found_urls, _ = await _crawl_async(target, tier, auth)  # Only capture endpoints
+
+        except Exception:
+            # Fall back to synchronous crawling
+            found_urls = crawl_sync(target, tier, auth)
+        
+        filtered_urls = [
+            u for u in found_urls
+            if not any(blocked in u for blocked in BLOCKED_PATHS)
+        ]
+
+        log_event(job_id, "CRAWL", f"Found {len(filtered_urls)} URLs")
+        push_log(job_id, f"[CRAWL] Discovery complete. Found {len(filtered_urls)} endpoints.", tier=tier)
+
+        # ✅ ALWAYS pass dict (CRITICAL FIX)
+        handle_stage_completion(job_id, "crawl", {
+            "urls": filtered_urls
+        })
+
+        # Also call the pipeline completion handler
+        on_crawl_complete(job_id, filtered_urls, auth=auth, tier=tier)
+
+    except Exception as e:
+        logger.error(f"Crawl failed: {str(e)}", job_id)
+
+        logger.error(f"[CRAWL] Fatal error: {e}", job_id)
+
+
+async def worker():
+    while True:
+        job = None
+        try:
+            # Use the proper queue popping mechanism from base_worker
+            from workers.base_worker import fetch as pop_queue
+            job = pop_queue(CRAWL_QUEUE)
+            
+            if job:
+                await process(job)
+            else:
+                await asyncio.sleep(1)
+        except Exception as e:
+            logger.error(f"[CRAWL] Worker error: {e}", job_id=job.get("job_id") if job else "N/A")
+            await asyncio.sleep(1)
+
 
 def handle(job):
+    """Synchronous handler for worker_loop compatibility"""
     job_id = job["job_id"]
-    url    = job["url"]
-    tier   = job.get("tier", "Basic")
-    auth   = job.get("auth")
+    url = job["url"]
+    tier = job.get("tier", "Basic")
+    auth = job.get("auth")
 
     push_log(job_id, f"[CRAWL] Starting {tier} crawl for {url}", tier=tier)
 
-    # 1. Use the advanced Crawler class instead of the simple function
-    # Note: Professional tier uses higher limits for better discovery
-    max_p = 300 if tier == "Professional" else 50
-    crawler = Crawler(base_url=url, max_pages=max_p)
+    try:
+        # Try async first, fall back to sync
+        try:
+            loop = asyncio.get_event_loop()
+            found_urls = loop.run_until_complete(_crawl_async(url, tier, auth))
+        except (RuntimeError, Exception):
+            # Fall back to synchronous crawling
+            found_urls = crawl_sync(url, tier, auth)
+    except Exception as e:
+        logger.error(f"[CRAWL] Fatal error: {e}")
+        found_urls = []
 
-    async def run_discovery():
-        async with httpx.AsyncClient(
-            cookies=auth.get("cookies", {}) if auth else None,
-            headers=auth.get("headers", {}) if auth else None,
-            follow_redirects=True
-        ) as client:
-            endpoints, forms = await crawler.crawl(client)
-            return endpoints
-
-    # Execute the async crawler
-    found_urls = asyncio.run(run_discovery())
-
-    # 2. Filter results
     filtered_urls = [
-        u for u in found_urls 
+        u for u in found_urls
         if not any(blocked in u for blocked in BLOCKED_PATHS)
     ]
 
+    push_log(job_id, f"[CRAWL] Filtered {len(found_urls)-len(filtered_urls)} paths.", tier=tier)
     push_log(job_id, f"[CRAWL] Discovery complete. Found {len(filtered_urls)} endpoints.", tier=tier)
 
-    # 3. Proceed to pipeline
+    # ✅ ALWAYS pass dict (CRITICAL FIX)
+    handle_stage_completion(job_id, "crawl", {
+        "urls": filtered_urls
+    })
+
+    # Also call the pipeline completion handler
     on_crawl_complete(job_id, filtered_urls, auth=auth, tier=tier)
 
 
 if __name__ == "__main__":
-    worker_loop(CRAWL_QUEUE, handle)
+    # Support both async worker and worker_loop modes
+    try:
+        asyncio.run(worker())
+    except KeyboardInterrupt:
+        logger.info("[CRAWL] Worker stopped by user")
+    except Exception as e:
+        logger.error(f"[CRAWL] Worker failed: {e}")
+        # Fall back to worker_loop for compatibility
+        worker_loop(CRAWL_QUEUE, handle)

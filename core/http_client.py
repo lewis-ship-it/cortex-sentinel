@@ -421,7 +421,7 @@ _default_client: Optional[HTTPClient] = None
 
 
 async def get_http_client(
-    timeout:           int                        = 12,
+    timeout:           int                        = 30,
     max_retries:       int                        = 4,
     rate_limit_config: Optional[RateLimitConfig]  = None,
     proxy:             Optional[str]              = None,

@@ -1,3 +1,4 @@
+
 # report_builder.py
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
@@ -32,3 +33,4 @@ class ReportBuilder:
             elements.append(Spacer(1, 6))
 
         doc.build(elements)
+

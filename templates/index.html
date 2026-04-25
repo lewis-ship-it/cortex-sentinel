@@ -9,6 +9,7 @@
             --bg-dark:#050810;--bg-panel:#0d1117;--primary:#00f5c4;
             --secondary:#58a6ff;--danger:#f85149;--warning:#d29922;
             --text-main:#c9d1d9;--text-muted:#8b949e;--border:#21262d;
+            --conf-high:#00f5c4;--conf-med:#d29922;--conf-low:#f85149;
         }
         *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
         html,body{height:100%}
@@ -113,6 +114,24 @@
             white-space:nowrap;font-family:monospace;font-size:11px;
             color:var(--text-muted);cursor:help}
 
+        /* confidence meter */
+        .conf-cell{display:flex;align-items:center;gap:6px;min-width:120px}
+        .conf-bar{width:60px;height:6px;background:var(--border);
+            border-radius:3px;overflow:hidden;flex-shrink:0}
+        .conf-fill{height:100%;border-radius:3px;transition:width .3s ease}
+        .conf-fill.high{background:var(--conf-high)}
+        .conf-fill.medium{background:var(--conf-med)}
+        .conf-fill.low{background:var(--conf-low)}
+        .conf-pct{font-size:11px;font-weight:600;min-width:32px}
+        .conf-pct.high{color:var(--conf-high)}
+        .conf-pct.medium{color:var(--conf-med)}
+        .conf-pct.low{color:var(--conf-low)}
+        .fp-tag{font-size:9px;font-weight:700;padding:1px 5px;
+            border-radius:8px;letter-spacing:.5px;white-space:nowrap}
+        .fp-tag.unlikely{background:rgba(0,245,196,.12);color:var(--conf-high)}
+        .fp-tag.possible{background:rgba(210,153,34,.15);color:var(--conf-med)}
+        .fp-tag.likely{background:rgba(248,81,73,.15);color:var(--conf-low)}
+
         /* report */
         #rbox{background:var(--bg-panel);border-radius:4px;padding:20px;
             white-space:pre-wrap;font-family:'Courier New',monospace;
@@ -123,6 +142,18 @@
         .pill{display:inline-block;font-size:10px;font-weight:700;
             padding:2px 7px;border-radius:10px;
             background:rgba(0,245,196,.12);color:var(--primary)}
+
+        /* filter bar */
+        .filter-bar{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;
+            align-items:center}
+        .filter-bar label{font-size:10px;color:var(--text-muted);
+            text-transform:uppercase;letter-spacing:.5px;margin-right:2px}
+        .filter-btn{background:var(--bg-dark);border:1px solid var(--border);
+            color:var(--text-muted);padding:3px 10px;border-radius:3px;
+            font-size:11px;cursor:pointer;transition:all .15s}
+        .filter-btn:hover{border-color:var(--primary);color:var(--primary)}
+        .filter-btn.active{background:rgba(0,245,196,.1);
+            border-color:var(--primary);color:var(--primary)}
     </style>
 </head>
 <body>
@@ -180,14 +211,26 @@
             <div id="console"><div class="empty">Awaiting scan...</div></div>
         </div>
         <div class="panel" id="panel-findings">
+            <div class="filter-bar" id="filterBar">
+                <label>Confidence:</label>
+                <button class="filter-btn active" data-filter="all" onclick="setFilter(this,'all')">All</button>
+                <button class="filter-btn" data-filter="high" onclick="setFilter(this,'high')">High</button>
+                <button class="filter-btn" data-filter="medium" onclick="setFilter(this,'medium')">Medium</button>
+                <button class="filter-btn" data-filter="low" onclick="setFilter(this,'low')">Low</button>
+                <span style="margin-left:8px"></span>
+                <label>FP Risk:</label>
+                <button class="filter-btn" data-filter="unlikely" onclick="setFilter(this,'unlikely')">Unlikely</button>
+                <button class="filter-btn" data-filter="possible" onclick="setFilter(this,'possible')">Possible</button>
+                <button class="filter-btn" data-filter="likely" onclick="setFilter(this,'likely')">Likely</button>
+            </div>
             <div class="tw">
                 <table>
                     <thead><tr>
                         <th>Severity</th><th>Type</th><th>Param</th>
-                        <th>URL</th><th>Conf</th><th>Evidence</th>
+                        <th>URL</th><th>Confidence</th><th>FP Risk</th><th>Evidence</th>
                     </tr></thead>
                     <tbody id="ftbody">
-                        <tr><td colspan="6" class="empty">No findings yet.</td></tr>
+                        <tr><td colspan="7" class="empty">No findings yet.</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -200,7 +243,7 @@
 
 <script>
 "use strict";
-var _poll=null, _logCount=0, _activeJob=null;
+var _poll=null, _logCount=0, _activeJob=null, _allFindings=[], _activeFilter="all";
 
 function showTab(el,name){
     document.querySelectorAll('.tab').forEach(function(t){t.classList.remove('active')});
@@ -209,10 +252,28 @@ function showTab(el,name){
     document.getElementById('panel-'+name).classList.add('active');
 }
 
+function setFilter(el,filter){
+    document.querySelectorAll('.filter-btn').forEach(function(b){b.classList.remove('active')});
+    el.classList.add('active');
+    _activeFilter=filter;
+    renderFindings(_allFindings);
+}
+
 function setBadge(text,cls){
     var b=document.getElementById('badge');
     b.textContent=text.toUpperCase();
     b.className='badge '+(cls||'');
+}
+
+function getConfTier(f){
+    var conf=f.confidence_score!=null?f.confidence_score:f.confidence||0;
+    if(conf>=0.90) return 'high';
+    if(conf>=0.70) return 'medium';
+    return 'low';
+}
+
+function getFpLabel(f){
+    return f.fp_likelihood||'possible';
 }
 
 async function startScan(){
@@ -224,9 +285,9 @@ async function startScan(){
 
     btn.disabled=true; btn.textContent='Dispatching...';
     setBadge('CONNECTING','scanning');
-    _logCount=0;
+    _logCount=0; _allFindings=[];
     document.getElementById('console').innerHTML='';
-    document.getElementById('ftbody').innerHTML='<tr><td colspan="6" class="empty">Scanning...</td></tr>';
+    document.getElementById('ftbody').innerHTML='<tr><td colspan="7" class="empty">Scanning...</td></tr>';
     document.getElementById('rbox').className='empty';
     document.getElementById('rbox').textContent='Waiting for pipeline...';
     document.getElementById('fcount').textContent='0';
@@ -267,7 +328,8 @@ function startPoll(jobId,apiKey){
             setBadge(status,status);
             document.getElementById('prog').style.width=Math.min(d.progress||0,100)+'%';
             renderLogs(d.logs||[]);
-            renderFindings(d.findings||[]);
+            _allFindings=d.findings||[];
+            renderFindings(_allFindings);
             if(d.report&&d.report.content) renderReport(d.report.content);
             if(status==='done'||status==='failed'){
                 clearInterval(_poll);_poll=null;
@@ -303,24 +365,49 @@ function renderLogs(logs){
 function renderFindings(findings){
     document.getElementById('fcount').textContent=findings.length;
     var tb=document.getElementById('ftbody');
-    if(!findings.length) return;
+    if(!findings.length){
+        tb.innerHTML='<tr><td colspan="7" class="empty">No findings yet.</td></tr>';
+        return;
+    }
     tb.innerHTML='';
-findings.forEach(function(f){
-    var sev=(f.severity||'info').toLowerCase();
-    var conf=Math.round(((f.confidence_score!=null?f.confidence_score:f.confidence)||0)*100);
-    var ev=f.evidence_snippet||f.evidence||'';
-    var url=f.target_url||f.url||'-';
-    var evDisplay = esc(ev) || '-';  // ✅ evaluate fallback BEFORE building HTML
-    var tr=document.createElement('tr');
-    tr.innerHTML=
-        '<td class="s'+sev.charAt(0)+'">'+esc(f.severity||'?')+'</td>'+
-        '<td>'+esc(f.type||'Unknown')+'</td>'+
-        '<td>'+esc(f.param||f.parameter||'-')+'</td>'+
-        '<td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+esc(url)+'">'+esc(url.length>50?url.slice(0,50)+'...':url)+'</td>'+
-        '<td>'+conf+'%</td>'+
-        ' <td class="ev" title="' + esc(ev) + '">' + evDisplay + '</td>';
-    tb.appendChild(tr);
-});
+
+    // Apply filter
+    var filtered=findings;
+    if(_activeFilter!=='all'){
+        filtered=findings.filter(function(f){
+            var tier=getConfTier(f);
+            var fp=getFpLabel(f);
+            return tier===_activeFilter||fp===_activeFilter;
+        });
+    }
+
+    if(!filtered.length){
+        tb.innerHTML='<tr><td colspan="7" class="empty">No findings match filter.</td></tr>';
+        return;
+    }
+
+    filtered.forEach(function(f){
+        var sev=(f.severity||'info').toLowerCase();
+        var conf=Math.round(((f.confidence_score!=null?f.confidence_score:f.confidence)||0)*100);
+        var tier=getConfTier(f);
+        var fpLabel=getFpLabel(f);
+        var ev=f.evidence_snippet||f.evidence||'';
+        var url=f.target_url||f.url||'-';
+        var evDisplay=esc(ev)||'-';
+        var tr=document.createElement('tr');
+        tr.innerHTML=
+            '<td class="s'+sev.charAt(0)+'">'+esc(f.severity||'?')+'</td>'+
+            '<td>'+esc(f.type||'Unknown')+'</td>'+
+            '<td>'+esc(f.param||f.parameter||'-')+'</td>'+
+            '<td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+esc(url)+'">'+esc(url.length>50?url.slice(0,50)+'...':url)+'</td>'+
+            '<td><div class="conf-cell">'+
+              '<div class="conf-bar"><div class="conf-fill '+tier+'" style="width:'+conf+'%"></div></div>'+
+              '<span class="conf-pct '+tier+'">'+conf+'%</span>'+
+            '</div></td>'+
+            '<td><span class="fp-tag '+fpLabel+'">'+fpLabel.toUpperCase()+' FP</span></td>'+
+            '<td class="ev" title="'+esc(ev)+'">'+evDisplay+'</td>';
+        tb.appendChild(tr);
+    });
 }
 
 function renderReport(content){
@@ -361,8 +448,7 @@ async function loadJobs(){
                 '<div class="ji-url">'+esc(j.target_url||j.id)+'</div>'+
                 '<div class="ji-meta">'+
                   '<span class="ji-st '+st+'">'+st.toUpperCase()+'</span>'+
-                  // templates/index.html  line 363 — normalize tier display
-                  '<span>' + esc((j.tier||'Basic').charAt(0).toUpperCase() + (j.tier||'Basic').slice(1).toLowerCase()) + '</span>' +
+                  '<span>'+esc((j.tier||'Basic').charAt(0).toUpperCase()+(j.tier||'Basic').slice(1).toLowerCase())+'</span>'+
                   '<span>'+ago+'</span>'+
                 '</div>';
             div.onclick=function(){resumeJob(j.id);};
@@ -376,10 +462,10 @@ async function loadJobs(){
 function resumeJob(jobId){
     var apiKey=document.getElementById('apiKey').value.trim();
     if(_poll){clearInterval(_poll);_poll=null;}
-    _logCount=0; _activeJob=jobId;
+    _logCount=0; _activeJob=jobId; _allFindings=[];
     document.getElementById('jobId').value=jobId;
     document.getElementById('console').innerHTML='';
-    document.getElementById('ftbody').innerHTML='<tr><td colspan="6" class="empty">Loading...</td></tr>';
+    document.getElementById('ftbody').innerHTML='<tr><td colspan="7" class="empty">Loading...</td></tr>';
     document.getElementById('rbox').className='empty';
     document.getElementById('rbox').textContent='Loading report...';
     document.getElementById('fcount').textContent='0';

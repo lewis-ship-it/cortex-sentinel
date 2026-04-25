@@ -167,11 +167,11 @@ class ClientSideModule:
 
         # If there's a DOM sink, try injecting into the parameter
         dom_payloads = [
-            f"'><img src=x onerror=alert(1)>",
-            f"'><svg/onload=alert(1)>",
-            f"'><script>alert(1)</script>",
-            f"'><iframe src=javascript:alert(1)>",
-            f"jaVasCript:alert(1)//",
+            "'><img src=x onerror=alert(1)>",
+            "'><svg/onload=alert(1)>",
+            "'><script>alert(1)</script>",
+            "'><iframe src=javascript:alert(1)>",
+            "jaVasCript:alert(1)//",
         ]
         for payload in dom_payloads:
             test_url = self.scanner.param_engine.inject_payload(url, param, payload)
@@ -181,7 +181,7 @@ class ClientSideModule:
                     "type": "Cross-Site Scripting (XSS)", "subtype": "DOM-Based",
                     "url": test_url, "parameter": param, "payload": payload,
                     "severity": "High", "confidence": 0.85,
-                    "evidence": f"DOM sink + parameter reflection — payload in page source",
+                    "evidence": "DOM sink + parameter reflection — payload in page source",
                     "description": f"Parameter '{param}' flows into a DOM sink without sanitization.",
                 })
                 return

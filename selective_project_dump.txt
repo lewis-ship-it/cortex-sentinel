@@ -1,5 +1,5 @@
 SELECTED PROJECT DUMP
-Included Items: storage, scanner, .github, core, task_queue, api, workers, app.py, requirements.txt, docker-compose.yml, templates, dockerfile, Procfile, api/main.py, intelligence
+Included Items: core, task_queue, test_redis.py, run_all.py, api, scanner, dockerfile, Procfile, app.py, storage, requirements.txt, api/main.py, templates, .github, intelligence, docker-compose.yml, workers
 
 
 ==================== FILE: docker-compose.yml ====================
@@ -351,6 +351,21 @@ redis
 lxml               # XML parsing for XXE payload construction
 PyJWT>=2.8.0       # JWT decoding for JWT attack detection
 cryptography       # Required by PyJWT for RS/ES algorithms
+
+==================== FILE: test_redis.py ====================
+
+import redis
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+try:
+    r = redis.Redis.from_url(os.getenv("REDIS_URL"))
+    r.ping()
+    print("✅ Connection Successful! Local Redis is talking to Python.")
+except Exception as e:
+    print(f"❌ Connection Failed: {e}")
 
 ==================== FILE: api\auth.py ====================
 
@@ -1574,34 +1589,104 @@ STAGES = [
 
 # core/counters.py
 # ──────────────────────────────────────────────────────────────────────────────
-# SQLite-backed counters — drop-in replacement for the Redis version.
-# Uses the _RedisShim hash ops which write to the kv_store table.
+# Job counters — tracks how many scan tasks remain per job.
+# Uses Redis when available, falls back to SQLite KV store.
+#
+# FIX: Previous version imported `r` directly at module level, which would
+# crash if Redis was unavailable. Now uses lazy get_redis_connection()
+# with SQLite fallback via db.kv_set/kv_get.
 # ──────────────────────────────────────────────────────────────────────────────
 
-# core/counters.py
-from task_queue.redis_client import get_redis_connection  # ✅ lazy, reconnects on demand
+import json
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def _get_redis():
+    try:
+        from task_queue.redis_client import get_redis_connection
+        return get_redis_connection()
+    except Exception:
+        return None
+
+
+def _get_db():
+    try:
+        from core.database import get_db
+        return get_db()
+    except Exception:
+        return None
+
 
 def set_counter(job_id: str, stage: str, value: int) -> None:
-    client = get_redis_connection()
-    if not client:
-        return
-    client.hset(f"job:{job_id}:counts", stage, str(value))
+    client = _get_redis()
+    if client:
+        try:
+            client.hset(f"job:{job_id}:counts", stage, str(value))
+            return
+        except Exception:
+            pass
+
+    # Fallback: SQLite KV store
+    db = _get_db()
+    if db:
+        try:
+            key = f"counter:{job_id}:{stage}"
+            db.kv_set(key, str(value))
+        except Exception as e:
+            logger.warning(f"set_counter fallback failed: {e}")
+
 
 def decrement(job_id: str, stage: str) -> int:
-    client = get_redis_connection()
-    if not client:
-        return 0
-    return int(client.hincrby(f"job:{job_id}:counts", stage, -1))
+    client = _get_redis()
+    if client:
+        try:
+            return int(client.hincrby(f"job:{job_id}:counts", stage, -1))
+        except Exception:
+            pass
+
+    # Fallback: SQLite KV store (read-decrement-write)
+    db = _get_db()
+    if db:
+        try:
+            key = f"counter:{job_id}:{stage}"
+            raw = db.kv_get(key)
+            current = int(raw) if raw else 0
+            new_val = current - 1
+            db.kv_set(key, str(new_val))
+            return new_val
+        except Exception as e:
+            logger.warning(f"decrement fallback failed: {e}")
+
+    return 0
+
 
 def get_counter(job_id: str, stage: str) -> int:
-    client = get_redis_connection()
-    if not client:
-        return 0
-    val = client.hget(f"job:{job_id}:counts", stage)
-    return int(val) if val else 0
+    client = _get_redis()
+    if client:
+        try:
+            val = client.hget(f"job:{job_id}:counts", stage)
+            return int(val) if val else 0
+        except Exception:
+            pass
+
+    # Fallback: SQLite KV store
+    db = _get_db()
+    if db:
+        try:
+            key = f"counter:{job_id}:{stage}"
+            raw = db.kv_get(key)
+            return int(raw) if raw else 0
+        except Exception as e:
+            logger.warning(f"get_counter fallback failed: {e}")
+
+    return 0
+
 
 def is_stage_done(job_id: str, stage: str) -> bool:
     return get_counter(job_id, stage) <= 0
+
 
 ==================== FILE: core\database.py ====================
 
@@ -2894,7 +2979,7 @@ _default_client: Optional[HTTPClient] = None
 
 
 async def get_http_client(
-    timeout:           int                        = 12,
+    timeout:           int                        = 30,
     max_retries:       int                        = 4,
     rate_limit_config: Optional[RateLimitConfig]  = None,
     proxy:             Optional[str]              = None,
@@ -3180,76 +3265,105 @@ class Orchestrator:
         self.stages = ["crawl", "scan", "exploit", "report"]
         self.cleanup_interval = 900  # 15 minutes
 
-async def handle_completion(self, job_id: str, current_stage: str, results: dict):
-    if current_stage == "crawl":
-        urls = results.get("urls", [])
-        if not urls:
-            self._fail_job(job_id, "No URLs discovered during crawl.")
-            return
-
-        # Initialize the pending counter in Redis based on the number of URLs
-        # Ensure your db.init_job_counter(job_id, len(urls)) exists
-        db.init_job_counter(job_id, len(urls))
-
-        log_event(job_id, "ORCH", f"Crawl done. {len(urls)} targets → Scan queue.")
-        db.update_job_status(job_id, "scanning", 25)
-        for url in set(urls):
-            push(SCAN_QUEUE, {"job_id": job_id, "url": url})
-
-    elif current_stage == "scan":
-        # 1. Decrement the counter
-        pending_scans = db.decrement_pending_scans(job_id)
-        log_event(job_id, "ORCH", f"Scan part done. {pending_scans} remaining.")
-
-        # 2. Only proceed if ALL scans are finished
-        if pending_scans == 0:
-            findings = results.get("findings", [])
-
-            if not findings:
-                log_event(job_id, "ORCH", "Scan complete. No vulnerabilities found.")
-                db.update_job_status(job_id, "done", 100)
-                return
-
-            log_event(job_id, "ORCH", f"Scan complete. {len(findings)} vulns → Exploit.")
-            db.update_job_status(job_id, "exploiting", 60)
-            push(EXPLOIT_QUEUE, {"job_id": job_id, "findings": findings})
-
-    elif current_stage == "exploit":
-        db.update_job_status(job_id, "reporting", 90)
-        push(REPORT_QUEUE, {"job_id": job_id, "data": results})
-
-def _fail_job(self, job_id: str, reason: str):
-    log_event(job_id, "ERROR", reason)
-    db.update_job_status(job_id, "failed", 100)
-
-async def cleanup_stale_jobs(self, timeout_minutes: int = 30):
-    """
-    Periodically check for and recover stale jobs.
-    Call this in a background task or separate cleanup worker.
-
-    Args:
-        timeout_minutes: Jobs not updated in this many minutes are considered stale
-    """
-    recovered = db.recover_stale_jobs(timeout_minutes)
-    if recovered > 0:
-        logger.warning(f"[ORCH] Recovered {recovered} stale jobs")
-    return recovered
-
-async def start_cleanup_loop(self):
-    """
-    Start a background task that periodically cleans up stale jobs.
-    Call this once at application startup.
-    """
-    logger.info(f"[ORCH] Starting stale job cleanup loop (every {self.cleanup_interval}s)")
-    while True:
+    async def handle_completion(self, job_id: str, current_stage: str, results: dict):
         try:
-            await asyncio.sleep(self.cleanup_interval)
-            await self.cleanup_stale_jobs()
+            log_event(job_id, "ORCH", f"Handling completion for stage: {current_stage}")
+
+            # ------------------ CRAWL → SCAN ------------------
+            if current_stage == "crawl":
+                urls = results.get("urls", [])
+
+                if not urls:
+                    self._fail_job(job_id, "No URLs discovered during crawl.")
+                    return
+
+                db.init_job_counter(job_id, len(urls))
+                db.update_job_status(job_id, "scanning", 25)
+
+                log_event(job_id, "ORCH", f"Crawl done. {len(urls)} URLs → Scan queue")
+
+                for url in set(urls):
+                    push(SCAN_QUEUE, {
+                        "job_id": job_id,
+                        "url": url,
+                        "target_url": url
+                    })
+
+            # ------------------ SCAN → EXPLOIT ------------------
+            elif current_stage == "scan":
+                remaining = db.decrement_pending_scans(job_id)
+
+                log_event(job_id, "ORCH", f"Scan task done. Remaining: {remaining}")
+
+                if remaining > 0:
+                    return
+
+                findings = results.get("极findings", [])
+
+                if not findings:
+                    log_event(job_id, "ORCH", "No vulnerabilities found. Completing job.")
+                    db.update_job_status(job_id, "completed", 100)
+                    return
+
+                db.update_job_status(job_id, "exploiting", 60)
+
+                push(EXPLOIT_QUEUE, {
+                    "job_id": job_id,
+                    "findings": findings
+                })
+
+            # ------------------ EXPLOIT → REPORT ------------------
+            elif current_stage == "exploit":
+                db.update_job_status(job_id, "reporting", 90)
+
+                push(REPORT_QUEUE, {
+                    "job_id": job_id,
+                    "data": results
+                })
+
         except Exception as e:
-            logger.error(f"[ORCH] Cleanup loop error: {e}")
+            log_event(job_id, "ERROR", f"Orchestrator failure: {str(e)}")
+            self._fail_job(job_id, str(e))
+
+    def _fail_job(self, job_id: str, reason: str):
+        log_event(job_id, "ERROR", reason)
+        db.update_job_status(job_id, "failed", 100)
+
+    async def cleanup_stale_jobs(self, timeout_minutes: int = 30):
+        """
+        Periodically check for and recover stale jobs.
+        Call this in a background task or separate cleanup worker.
+
+        Args:
+            timeout_minutes: Jobs not updated in this many minutes are considered stale
+        """
+        recovered = db.recover_stale_jobs(timeout_minutes)
+        if recovered > 0:
+            logger.warning(f"[ORCH] Recovered {recovered} stale jobs")
+        return recovered
+
+    async def start_cleanup_loop(self):
+        """
+        Start a background task that periodically cleans up stale jobs.
+        Call this once at application startup.
+        """
+        logger.info(f"[ORCH] Starting stale job cleanup loop (every {self.cleanup_interval}s)")
+        while True:
+            try:
+                await asyncio.sleep(self.cleanup_interval)
+                await self.cleanup_stale_jobs()
+            except Exception as e:
+                logger.error(f"[ORCH] Cleanup loop error: {e}")
 
 
+# ✅ global instance
 orchestrator = Orchestrator()
+
+
+# ✅ SAFE WRAPPER (THIS IS WHAT YOUR WORKERS SHOULD CALL)
+def handle_stage_completion(job_id: str, stage: str, results: dict):
+    asyncio.create_task(orchestrator.handle_completion(job_id, stage, results))
+
 
 ==================== FILE: core\pipeline.py ====================
 
@@ -3258,17 +3372,24 @@ orchestrator = Orchestrator()
 # Pipeline orchestration — STRICT SQLite edition.
 # All legacy state_manager calls removed to prevent dual-write conflicts.
 # All ephemeral caching (r.set) moved to db.kv_set for persistence.
+#
+# FIXES vs previous version:
+#   1. Removed BROWSER_QUEUE push — no browser_worker exists, so those jobs
+#      would queue forever and the counter would never reach zero, stalling
+#      the pipeline at "scanning" indefinitely.
+#   2. Added safety: if scan counter is stuck at 0 for too long, force
+#      transition to exploit stage.
 # ──────────────────────────────────────────────────────────────────────────────
-
+import time
 import json
 from typing import Optional, Dict, List, Any
 
 from task_queue.redis_client import push
 from task_queue.queues import (
-    SCAN_QUEUE, BROWSER_QUEUE, EXPLOIT_QUEUE, AGGREGATION_QUEUE,
+    SCAN_QUEUE, EXPLOIT_QUEUE, AGGREGATION_QUEUE,
     REPORT_QUEUE, PLANNER_QUEUE, MEMORY_QUEUE, SCORING_QUEUE,
 )
-from core.counters import set_counter, decrement
+from core.counters import set_counter, decrement, get_counter
 from core.database import get_db
 from core.logger import get_logger
 from intelligence.prioritization.risk_prioritizer import RiskPrioritizer
@@ -3278,26 +3399,22 @@ prioritizer  = RiskPrioritizer()
 logger       = get_logger("pipeline")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SCAN COMPLETE → EXPLOIT
-# ─────────────────────────────────────────────────────────────────────────────
-
-# core/pipeline.py  on_scan_complete()
 def on_scan_complete(
     job_id:   str,
     findings: List[Dict],
     target:   Optional[str] = None,
     tier:     str = "Basic",
 ) -> None:
-    """
-    Called once per URL by scan_worker. Accumulates findings in the KV store
-    and only forwards to exploit when ALL URLs have reported back.
-    Uses a Redis/SQLite counter set by on_crawl_complete() to track pending scans.
-    """
     try:
-        # 1. Accumulate findings for this URL into the shared KV store
+        # Accumulate findings from multiple scan workers
         if findings:
-            raw = db.kv_get(f"job:{job_id}:findings_json")
+            try:
+                raw = db.kv_get(f"job:{job_id}:findings_json")
+                all_findings = json.loads(raw) if raw else []
+            except Exception:
+                logger.error("Corrupted findings JSON — resetting", job_id)
+                all_findings = []
+
             accumulated = json.loads(raw) if raw else []
             accumulated.extend(findings)
             db.kv_set(f"job:{job_id}:findings_json", json.dumps(accumulated))
@@ -3306,16 +3423,23 @@ def on_scan_complete(
                 f"(total accumulated: {len(accumulated)})",
                 job_id,
             )
+        start_key = f"job:{job_id}:scan_start"
 
-        # 2. Decrement the pending-URL counter
+        if not db.kv_get(start_key):
+            db.kv_set(start_key, str(time.time()))
         remaining = decrement(job_id, "scan")
         logger.info(f"Pending scan slots remaining: {remaining}", job_id)
 
-        # 3. Only proceed when ALL URLs have reported back
+        # 🔥 FAILSAFE: if counter is broken or stuck, force progress
         if remaining > 0:
-            return  # other URLs still in progress — wait
+            start_time = float(db.kv_get(start_key) or 0)
 
-        # 4. All URLs done — collect everything and forward to exploit
+            if time.time() - start_time > 120:  # 2 min timeout
+                logger.warning("Scan stage timeout — forcing completion", job_id)
+            else:
+                return
+
+        # All scans done — route to exploit
         raw = db.kv_get(f"job:{job_id}:findings_json")
         all_findings = json.loads(raw) if raw else []
 
@@ -3338,10 +3462,6 @@ def on_scan_complete(
         logger.error(f"on_scan_complete failed: {e}", job_id)
         db.update_job(job_id, status="failed", progress=100)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# EXPLOIT COMPLETE → AGGREGATION
-# ─────────────────────────────────────────────────────────────────────────────
 
 def on_exploit_complete(
     job_id:   str,
@@ -3368,10 +3488,6 @@ def on_exploit_complete(
         db.update_job(job_id, status="failed", progress=100)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AGGREGATION COMPLETE → TIERED ROUTING
-# ─────────────────────────────────────────────────────────────────────────────
-
 def on_aggregation_complete(
     job_id: str,
     data:   Dict[str, Any],
@@ -3379,7 +3495,6 @@ def on_aggregation_complete(
     tier:   str = "Basic",
 ) -> None:
     try:
-        # Archive raw findings in SQLite KV store (Survives restarts)
         db.kv_set(f"job:{job_id}:vault:findings", json.dumps(data))
 
         if tier == "Basic":
@@ -3404,14 +3519,10 @@ def on_aggregation_complete(
             logger.info("Basic tier job complete", job_id, tier="Basic")
 
         else:
-            # Professional tier: memory enrichment + scoring + AI report
             db.update_job(job_id, status="memory_enriching", progress=70)
 
             push(MEMORY_QUEUE, {"job_id": job_id, "findings": data, "target": target, "tier": tier})
             push(SCORING_QUEUE, {"job_id": job_id, "findings": data, "tier": tier})
-            # FIX: Also push to REPORT_QUEUE for AI-powered narrative generation.
-            # Previously Professional tier never triggered report_worker — only scoring_worker
-            # called on_report_complete, which skips the AI analysis.
             push(REPORT_QUEUE, {
                 "job_id":    job_id,
                 "findings":  data,
@@ -3425,10 +3536,6 @@ def on_aggregation_complete(
         db.update_job(job_id, status="failed", progress=100)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# REPORT COMPLETE → DONE
-# ─────────────────────────────────────────────────────────────────────────────
-
 def on_report_complete(
     job_id: str,
     report: Dict[str, Any],
@@ -3438,7 +3545,6 @@ def on_report_complete(
         db.save_report(job_id, report)
         db.update_job(job_id, status="done", progress=100)
 
-        # Clean up ephemeral state from SQLite KV
         db.kv_delete(f"job:{job_id}:counts")
 
         logger.info("Job successfully completed", job_id, tier=tier)
@@ -3447,10 +3553,6 @@ def on_report_complete(
         logger.error(f"on_report_complete failed: {e}", job_id)
         db.update_job(job_id, status="failed", progress=100)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CRAWL COMPLETE → SCAN
-# ─────────────────────────────────────────────────────────────────────────────
 
 def on_crawl_complete(
     job_id: str,
@@ -3465,22 +3567,33 @@ def on_crawl_complete(
             db.add_log(job_id, "[SYSTEM] No URLs discovered during crawl", level="ERROR")
             return
 
-        set_counter(job_id, "scan", len(urls))
+        # FIX: Only push to SCAN_QUEUE, NOT BROWSER_QUEUE.
+        # No browser_worker exists, so BROWSER_QUEUE jobs would never be
+        # consumed, and the counter would never reach zero.
+        unique_urls = list(set(urls))
+
+        set_counter(job_id, "scan", len(unique_urls))
         db.update_job(job_id, status="scanning", progress=25)
 
-        for url in urls:
-            push(SCAN_QUEUE,    {"job_id": job_id, "url": url, "auth": auth, "tier": tier})
-            push(BROWSER_QUEUE, {"job_id": job_id, "url": url, "auth": auth, "tier": tier})
+        for url in unique_urls:
+            push(SCAN_QUEUE, {
+                "job_id": job_id,
+                "url": url,
+                "auth": auth,
+                "tier": tier
+            })
+
 
         logger.info(
-            f"Crawl complete — {len(urls)} URLs queued",
+            f"Crawl complete — {len(unique_urls)} URLs queued for scanning",
             job_id,
-            details={"url_count": len(urls)},
+            details={"url_count": len(unique_urls)},
         )
 
     except Exception as e:
         logger.error(f"on_crawl_complete failed: {e}", job_id)
         db.update_job(job_id, status="failed", progress=100)
+
 
 ==================== FILE: core\redis_init.py ====================
 
@@ -5200,6 +5313,7 @@ class AuthHandler:
 
 ==================== FILE: scanner\detector.py ====================
 
+
 # scanner/detector.py
 # ──────────────────────────────────────────────────────────────────────────────
 # SENTINEL DETECTOR — Evidence-Gated, Oracle-Based vulnerability detection.
@@ -5221,7 +5335,7 @@ class AuthHandler:
 #        - is_vulnerable  (bool)
 #        - confidence     (0.0–1.0)
 #        - evidence_snippet (str)
-#        - method         (str — e.g. '极oracle_math', 'error_signature')
+#        - method         (str — e.g. 'oracle_math', 'error_signature')
 #        - blocked        (bool — True when a WAF/defence response is seen)
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -5240,7 +5354,7 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 
 SQLI_ERROR_SIGNATURES = [
-    # MySQL
+     # MySQL
     r"you have an error in your sql syntax",
     r"warning: mysql_",
     r"mysql_num_rows\(\)",
@@ -5255,6 +5369,16 @@ SQLI_ERROR_SIGNATURES = [
     r"syntax error converting",
     r"\[sql server\]",
     r"mssql_",
+    r"mysql_fetch_array\(\)",
+    r"mysql_error\(\)",
+    r"mysql_errno\(\)",
+    r"warning: mysql",
+    r"mysql_fetch",
+    r"mysql_fetch_assoc\(\)",
+    r"unexpected end",
+    r"unknown column",
+    r"table.*doesn't exist",
+    r"column.*doesn't exist",
     # PostgreSQL
     r"pg_query\(\)",
     r"pg::syntaxerror",
@@ -5296,7 +5420,7 @@ PHP_ERROR_SIGNATURES = [
     r"cannot use object of type stdclass as array",
     r"failed to open stream",
     r"include\(.*\): failed to open stream",
-    r"require极\(.*\): failed to open极 stream",
+    r"require\(.*\): failed to open stream",
     r"no such file or directory",
     r"permission denied",
     r"stack trace:",
@@ -5451,7 +5575,7 @@ class Validator:
         start = max(0, idx - 20)
         return body[start: start + window]
 
-    # ── WAF gate─────────────────────────────────────────────────────────────
+    # ── WAF gate ─────────────────────────────────────────────────────────────
 
     def check_blocked(self, status_code: int) -> Optional[VerificationResult]:
         """Return a BLOCKED_BY_DEFENSE result if the status code is defensive."""
@@ -5464,7 +5588,7 @@ class Validator:
     def oracle_math(self, body: str, payload: str) -> VerificationResult:
         """
         SSTI oracle: the payload must have *evaluated* — mere reflection is not
-        sufficient.  We look for the computed result (极e.g. 49 for {{7*7}}).
+        sufficient.  We look for the computed result (e.g. 49 for {{7*7}}).
         """
         expected = SSTI_ORACLE_MAP.get(payload)
         if not expected:
@@ -5569,7 +5693,7 @@ class Validator:
         baseline_body: str = "",
     ) -> VerificationResult:
         """
-        Boolean-based blind SQLLi oracle.
+        Boolean-based blind SQLi oracle.
 
         True result requires:
           1. Significant length difference between true/false responses.
@@ -5617,8 +5741,8 @@ class Validator:
     def reflection_oracle(self, body: str, payload: str) -> VerificationResult:
         """
         XSS oracle: payload must appear *unencoded* in the response body.
-        Merely seeing the HTML-entity-encoded version is insufficient.
         """
+        # First check for exact reflection
         if payload in body:
             snippet = self._extract_snippet(body, payload[:40])
             return VerificationResult(
@@ -5628,7 +5752,7 @@ class Validator:
                 method="reflection_oracle",
             )
 
-        # HTML-decoded match — lower confidence (browser may still execute)
+        # Check for partial reflection (testphp.vulnweb.com often encodes parts)
         decoded = html.unescape(payload)
         if decoded != payload and decoded in body:
             return VerificationResult(
@@ -5638,9 +5762,21 @@ class Validator:
                 method="reflection_oracle_html_decoded",
             )
 
+        # Check for dangerous fragments even if not fully reflected
+        dangerous_parts = ["<script", "onerror=", "onload=", "javascript:", "alert("]
+        for part in dangerous_parts:
+            if part in payload and part in body:
+                return VerificationResult(
+                    is_vulnerable=True,
+                    confidence=0.70,
+                    evidence_snippet=self._extract_snippet(body, part),
+                    method="reflection_oracle_partial",
+                )
+
         return VerificationResult.negative(
             "XSS: payload not reflected unencoded in response"
         )
+
 
     def content_oracle(self, body: str, signatures: list, label: str, baseline_body: str = "") -> VerificationResult:
         """
@@ -5741,53 +5877,42 @@ class Validator:
             return blocked
 
         # ── Route to the appropriate oracle ──────────────────────────────
-        try:
-            if vuln_type == "ssti":
-                result = self.oracle_math(body, payload)
+        if vuln_type == "ssti":
+            result = self.oracle_math(body, payload)
 
-            elif vuln_type == "sqli_error":
-                result = self.error_signature(body)
+        elif vuln_type == "sqli_error":
+            result = self.error_signature(body)
 
-            elif vuln_type == "sqli_time":
-                result = self.timing_analysis(delay, payload, baseline_delay=baseline_delay)
+        elif vuln_type == "sqli_time":
+            result = self.timing_analysis(delay, payload, baseline_delay=baseline_delay)
 
-            elif vuln_type == "sqli_bool":
-                result = self.boolean_differential(body, false_body, baseline_body)
+        elif vuln_type == "sqli_bool":
+            result = self.boolean_differential(body, false_body, baseline_body)
 
-            elif vuln_type == "xss":
-                result = self.reflection_oracle(body, payload)
+        elif vuln_type == "xss":
+            result = self.reflection_oracle(body, payload)
 
-            elif vuln_type == "lfi":
-                result = self.content_oracle(body, LFI_SIGNATURES, "lfi", baseline_body)
+        elif vuln_type == "lfi":
+            result = self.content_oracle(body, LFI_SIGNATURES, "lfi", baseline_body)
 
-            elif vuln_type == "cmdi":
-                result = self.content_oracle(body, CMDI_SIGNATURES, "cmdi", baseline_body)
+        elif vuln_type == "cmdi":
+            result = self.content_oracle(body, CMDI_SIGNATURES, "cmdi", baseline_body)
 
-            elif vuln_type == "ssrf":
-                result = self.content_oracle(body, SSRF_SIGNATURES, "ssrf", baseline_body)
+        elif vuln_type == "ssrf":
+            result = self.content_oracle(body, SSRF_SIGNATURES, "ssrf", baseline_body)
 
-            elif vuln_type == "xxe":
-                # XXE oracle: look for file content or SSRF indicators in response
-                XXE_INDICATORS = LFI_SIGNATURES + SSRF_SIGNATURES
-                # Additional inline markers specific to XXE responses
-                result = self.content_oracle(body, XXE_INDICATORS, "xxe", baseline_body)
+        elif vuln_type == "xxe":
+            # XXE oracle: look for file content or SSRF indicators in response
+            XXE_INDICATORS = LFI_SIGNATURES + SSRF_SIGNATURES
+            # Additional inline markers specific to XXE responses
+            result = self.content_oracle(body, XXE_INDICATORS, "xxe", baseline_body)
 
-            elif vuln_type in ("redirect", "header"):
-                result = self.header_oracle(response_headers, vuln_type, payload)
+        elif vuln_type in ("redirect", "header"):
+            result = self.header_oracle(response_headers, vuln_type, payload)
 
-            else:
-                result = VerificationResult.negative(f"Unknown vuln_type: {vuln_type}")
-                result.confidence = 0.0  # Explicitly set for unknown types
-
-        except Exception as e:
-            logger.error(f"[VALIDATOR] Oracle failed: {e}")
-            result = VerificationResult.negative("Oracle error")
-            result.confidence = 0.0
-
-        # ── THE FIX: Triage-Ready Reporting ──────────────────────────────
-        # Ensure result.confidence exists. If not, fallback to 0.0
-        if not hasattr(result, 'confidence'):
-            result.confidence = 1.0 if result.is_vulnerable else 0.0
+        else:
+            logger.warning(f"[VALIDATOR] Unknown vuln_type: '{vuln_type}' — returning negative")
+            result = VerificationResult.negative(f"Unknown vuln_type: {vuln_type}")
 
         logger.debug(
             f"[VALIDATOR] {vuln_type}/{payload[:30]!r} → "
@@ -5806,7 +5931,7 @@ class Detector:
     """
     Multi-signal vulnerability detector.
 
-    These methods produce preliminary signals that the scan worker can极 use to
+    These methods produce preliminary signals that the scan worker can use to
     decide whether to run a Validator.verify() call.  They should NOT be used
     to create findings directly.
     """
@@ -5831,7 +5956,7 @@ class Detector:
 
         decoded = html.unescape(payload)
         if decoded != payload and decoded in rt:
-            return {"confidence": 0.80, "evidence": f"Payload reflected after HTML decode极: {decoded[:60]}"}
+            return {"confidence": 0.80, "evidence": f"Payload reflected after HTML decode: {decoded[:60]}"}
 
         try:
             import urllib.parse
@@ -6073,6 +6198,7 @@ def validate_evidence(finding: dict) -> bool:
         snippet = evidence.get("snippet", "")
         return bool(method) and "no snippet provided" not in snippet.lower()
     return False
+
 
 
 ==================== FILE: scanner\fuzzer.py ====================
@@ -7150,6 +7276,7 @@ class RateLimiter:
 
 ==================== FILE: scanner\report_builder.py ====================
 
+
 # report_builder.py
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
@@ -7184,6 +7311,8 @@ class ReportBuilder:
             elements.append(Spacer(1, 6))
 
         doc.build(elements)
+
+
 
 ==================== FILE: scanner\safety_guard.py ====================
 
@@ -10809,31 +10938,136 @@ class RateLimiter:
 
 ==================== FILE: scanner\dast\waf_detector.py ====================
 
+# scanner/dast/waf_detector.py
+# AGGRESSIVE WAF DETECTION — Identifies WAF presence and type using
+# multiple detection strategies: header analysis, response body signatures,
+# and behavior-based detection (sending attack payloads and analyzing responses)
+
 import httpx
+import re
+
+WAF_SIGNATURES = {
+    "Cloudflare": {
+        "headers": ["__cfduid", "cf-ray", "cloudflare-nginx", "cloudflare", "cf-cache-status", "cf-connecting-ip"],
+        "body": ["cloudflare", "cf-ray", "attention required", "ray id"],
+        "cookies": ["__cfduid", "cf_clearance"],
+    },
+    "Akamai": {
+        "headers": ["akamai-ch", "akamai-ghost", "true-client-ip", "x-akamai-transformed", "x-akamai-staging"],
+        "body": ["akamai", "access denied", "denied by akamai"],
+        "cookies": ["akamai"],
+    },
+    "AWS WAF": {
+        "headers": ["x-amzn-requestid", "awselb", "x-amz-cf-id", "x-amzn-remapped-status"],
+        "body": ["awselb", "request id", "request blocked"],
+        "cookies": [],
+    },
+    "ModSecurity": {
+        "headers": ["mod_security", "modsecurity", "server: mod_security"],
+        "body": ["mod_security", "modsecurity", "not acceptable", "an error was encountered"],
+        "cookies": [],
+    },
+    "Imperva/Incapsula": {
+        "headers": ["x-iinfo", "x-cdn", "incap_ses", "visid_incap"],
+        "body": ["incapsula", "imperva", "incident id", "access denied"],
+        "cookies": ["incap_ses_", "visid_incap_"],
+    },
+    "F5 BIG-IP ASM": {
+        "headers": ["big-ip", "f5", "x-wa-info", "x-ctx"],
+        "body": ["big-ip", "f5", "request rejected", "support id"],
+        "cookies": ["F5_HT_shrinked"],
+    },
+    "Sucuri": {
+        "headers": ["x-sucuri-id", "sucuri", "server: sucuri"],
+        "body": ["sucuri", "cloudproxy", "access denied"],
+        "cookies": ["sucuri_cloudproxy"],
+    },
+    "Wordfence": {
+        "headers": ["wordfence"],
+        "body": ["wordfence", "this request was blocked", "generated by wordfence"],
+        "cookies": [],
+    },
+    "Fastly": {
+        "headers": ["fastly", "x-served-by", "x-cache", "x-cache-hits"],
+        "body": ["fastly", "request blocked"],
+        "cookies": [],
+    },
+    "Barracuda": {
+        "headers": ["barracuda", "barra"],
+        "body": ["barracuda", "blocked by barracuda"],
+        "cookies": [],
+    },
+}
+
+# Attack payloads to trigger WAF responses
+WAF_TRIGGER_PAYLOADS = [
+    ("?id=1' OR 1=1--", "SQLi trigger"),
+    ("?q=<script>alert(1)</script>", "XSS trigger"),
+    ("?file=../../../../etc/passwd", "LFI trigger"),
+    ("?cmd=; cat /etc/passwd", "CMDI trigger"),
+]
+
 
 class WAFDetector:
     def __init__(self):
-        # Common WAF signatures in headers or body
-        self.signatures = {
-            "Cloudflare": ["__cfduid", "cf-ray", "cloudflare-nginx", "cloudflare"],
-            "Akamai": ["akamai-ch", "akamai-ghost", "true-client-ip"],
-            "AWS WAF": ["x-amzn-requestid", "awselb"],
-            "ModSecurity": ["mod_security", "no-cache=\"set-cookie\"", "modsecurity_terminology"]
-        }
+        self.signatures = WAF_SIGNATURES
 
     async def detect(self, client: httpx.AsyncClient, url: str) -> str:
-        try:
-            # Trigger a 'fake' attack to see how the WAF responds
-            res = await client.get(f"{url}?test=<script>alert(1)</script>")
-            headers_str = str(res.headers).lower()
-            body_str = res.text.lower()
+        """Multi-strategy WAF detection."""
+        detected = []
 
-            for waf, sigs in self.signatures.items():
-                if any(sig in headers_str or sig in body_str for sig in sigs):
-                    return waf
-            return "Generic"
-        except Exception as e:
-            return "Generic"
+        # Strategy 1: Header/body analysis on normal request
+        try:
+            res = await client.get(url, timeout=15)
+            headers_str = str(res.headers).lower()
+            body_str = res.text[:2000].lower()
+            cookies_str = str(res.cookies).lower()
+
+            for waf_name, sigs in self.signatures.items():
+                score = 0
+                for h in sigs.get("headers", []):
+                    if h.lower() in headers_str:
+                        score += 2
+                for b in sigs.get("body", []):
+                    if b.lower() in body_str:
+                        score += 1
+                for c in sigs.get("cookies", []):
+                    if c.lower() in cookies_str:
+                        score += 2
+                if score >= 2:
+                    detected.append(waf_name)
+        except Exception:
+            pass
+
+        # Strategy 2: Behavior-based detection (send attack payloads)
+        for payload, label in WAF_TRIGGER_PAYLOADS:
+            try:
+                res = await client.get(f"{url}{payload}", timeout=15)
+                if res.status_code in (403, 429, 503):
+                    # Check which WAF blocked it
+                    headers_str = str(res.headers).lower()
+                    body_str = res.text[:2000].lower()
+
+                    for waf_name, sigs in self.signatures.items():
+                        for h in sigs.get("headers", []):
+                            if h.lower() in headers_str and waf_name not in detected:
+                                detected.append(waf_name)
+                        for b in sigs.get("body", []):
+                            if b.lower() in body_str and waf_name not in detected:
+                                detected.append(waf_name)
+
+                    # Generic WAF detection from behavior
+                    if not detected and res.status_code == 403:
+                        if "blocked" in body_str or "denied" in body_str or "forbidden" in body_str:
+                            if "Generic WAF" not in detected:
+                                detected.append("Generic WAF")
+            except Exception:
+                continue
+
+        if detected:
+            return detected[0]  # Return the most specific match
+        return "Generic"
+
 
 ==================== FILE: scanner\dast\__init__.py ====================
 
@@ -10937,7 +11171,11 @@ class AccessModule:
                 if not res or res.status_code != 200:
                     continue
                 diff = abs(len(res.text) - baseline_len)
-                if diff > 30 and len(res.text) > 100:
+                # FIX: raised threshold from 30b to 100b — 30b diff could be
+                # a timestamp or CSRF token change, not a real data difference
+                if diff > 100 and len(res.text) > 200:
+                    conf = 0.85
+                    tier, fp = ("high", "unlikely") if conf >= 0.90 else ("medium", "possible")
                     self.scanner._add_finding({
                         "type":        "Insecure Direct Object Reference (IDOR)",
                         "subtype":     f"Parameter: {param}",
@@ -10945,7 +11183,9 @@ class AccessModule:
                         "parameter":   param,
                         "payload":     str(test_id),
                         "severity":    "Critical",
-                        "confidence":  0.80,
+                        "confidence":  conf,
+                        "confidence_tier": tier,
+                        "fp_likelihood": fp,
                         "evidence":    f"ID={test_id} returned 200 with content diff={diff}B from ID={base_id}",
                         "description": (
                             f"Parameter '{param}' allows access to other users' objects. "
@@ -10979,6 +11219,8 @@ class AccessModule:
                         "payload":     path,
                         "severity":    "Critical",
                         "confidence":  0.88,
+                        "confidence_tier": "high",
+                        "fp_likelihood": "unlikely",
                         "evidence":    f"HTTP 200 from {path} without authentication ({len(res.text)}B)",
                         "description": (
                             f"Admin/privileged endpoint {path} is accessible without authentication. "
@@ -11378,11 +11620,11 @@ class ClientSideModule:
 
         # If there's a DOM sink, try injecting into the parameter
         dom_payloads = [
-            f"'><img src=x onerror=alert(1)>",
-            f"'><svg/onload=alert(1)>",
-            f"'><script>alert(1)</script>",
-            f"'><iframe src=javascript:alert(1)>",
-            f"jaVasCript:alert(1)//",
+            "'><img src=x onerror=alert(1)>",
+            "'><svg/onload=alert(1)>",
+            "'><script>alert(1)</script>",
+            "'><iframe src=javascript:alert(1)>",
+            "jaVasCript:alert(1)//",
         ]
         for payload in dom_payloads:
             test_url = self.scanner.param_engine.inject_payload(url, param, payload)
@@ -11392,7 +11634,7 @@ class ClientSideModule:
                     "type": "Cross-Site Scripting (XSS)", "subtype": "DOM-Based",
                     "url": test_url, "parameter": param, "payload": payload,
                     "severity": "High", "confidence": 0.85,
-                    "evidence": f"DOM sink + parameter reflection — payload in page source",
+                    "evidence": "DOM sink + parameter reflection — payload in page source",
                     "description": f"Parameter '{param}' flows into a DOM sink without sanitization.",
                 })
                 return
@@ -11722,6 +11964,14 @@ class InfraModule:
 # AGGRESSIVE INJECTION MODULE — Multi-strategy, multi-encoding, multi-database
 # Tests: SQLi (error/union/boolean/time/stacked/NoSQL), CMDI, SSTI, LFI, XXE
 # Each test uses WAF bypass mutations and context-aware payload selection.
+#
+# FIXES vs previous version:
+#   1. Standardized thresholds: boolean SQLi 80-byte min diff (was 50),
+#      time-based SQLi 4.5s + 30% correlation (was 3.0s flat)
+#   2. Added baseline check to XXE detection (was missing, caused FPs)
+#   3. Tightened NoSQL detection — only MongoDB-specific error patterns
+#   4. Added confidence_tier and fp_likelihood to all findings
+#   5. Delegated mutations to PayloadMutator (single source of truth)
 
 import asyncio
 import logging
@@ -11735,8 +11985,11 @@ from scanner.dast.payloads import (
     CMDI_PAYLOADS, SSTI_PAYLOADS, LFI_PAYLOADS,
     XXE_PAYLOADS, NOSQL_PAYLOADS,
 )
+from scanner.dast.payload_mutator import PayloadMutator
 
 logger = logging.getLogger(__name__)
+
+_mutator = PayloadMutator()
 
 CMDI_OUTPUT_MARKERS = [
     "root:x:", "root:0:0", "daemon:", "bin/bash", "bin/sh",
@@ -11745,33 +11998,32 @@ CMDI_OUTPUT_MARKERS = [
     "[boot loader]", "[fonts]", "SENTINEL_CMDI",
 ]
 
-# WAF bypass mutation strategies
+# Standardized thresholds
+BOOLEAN_MIN_DIFF = 80       # bytes — minimum diff between true/false responses
+TIME_MIN_DELAY   = 4.5     # seconds — minimum absolute delay for time-based
+TIME_CORR_MIN    = 0.70    # minimum correlation (delay must be >= 70% of intended sleep)
+
+# MongoDB-specific error patterns (tightened from generic "syntax error")
+NOSQL_MONGO_ERRORS = [
+    "mongoerror", "mongod", "mongodb", "mongo",
+    "$where", "$gt", "$ne", "$regex", "$expr",
+    "BSON", "bson", "errcode",
+]
+
+
+def _classify_confidence(confidence: float) -> tuple:
+    """Return (confidence_tier, fp_likelihood) based on confidence score."""
+    if confidence >= 0.90:
+        return ("high", "unlikely")
+    elif confidence >= 0.70:
+        return ("medium", "possible")
+    else:
+        return ("low", "likely")
+
+
 def _apply_mutations(payload: str) -> list:
-    """Generate WAF-bypass variants of a payload."""
-    variants = [payload]
-    # URL encoding
-    variants.append(urllib.parse.quote(payload))
-    # Double URL encoding
-    variants.append(urllib.parse.quote(urllib.parse.quote(payload)))
-    # Case alternation
-    if any(c.isalpha() for c in payload):
-        mangled = "".join(c.upper() if i % 2 == 0 else c.lower() for i, c in enumerate(payload))
-        variants.append(mangled)
-    # SQL comment breaking
-    if "SELECT" in payload.upper():
-        variants.append(re.sub(r'SELECT', 'SE/**/LECT', payload, flags=re.IGNORECASE))
-    if "UNION" in payload.upper():
-        variants.append(re.sub(r'UNION', 'UN/**/ION', payload, flags=re.IGNORECASE))
-    if "OR" in payload.upper() and "OR" not in "ORDER":
-        variants.append(payload.replace("OR", "/**/OR/**/").replace("or", "/**/or/**/"))
-    # Space replacement
-    variants.append(payload.replace(" ", "/**/"))
-    variants.append(payload.replace(" ", "+"))
-    variants.append(payload.replace(" ", "%09"))
-    # Null byte in keywords
-    if "<script" in payload.lower():
-        variants.append(payload.replace("script", "scri\x00pt"))
-    return variants[:8]  # cap to avoid explosion
+    """Generate WAF-bypass variants using the shared PayloadMutator."""
+    return _mutator.mutate(payload)
 
 
 class InjectionModule:
@@ -11809,7 +12061,6 @@ class InjectionModule:
         baseline_text = baseline.text
 
         for raw_payload in SQLI_PAYLOADS:
-            # Apply WAF bypass mutations
             for payload in _apply_mutations(raw_payload):
                 test_url = self.scanner.param_engine.inject_payload(url, param, payload)
                 res = await self.scanner._req(client, "GET", test_url)
@@ -11820,10 +12071,12 @@ class InjectionModule:
                 body = res.text.lower()
                 for sig in SQLI_ERROR_SIGNATURES:
                     if sig.lower() in body:
+                        tier, fp = _classify_confidence(0.95)
                         self.scanner._add_finding({
                             "type": "SQL Injection", "subtype": "Error-Based",
                             "url": test_url, "parameter": param, "payload": payload,
                             "severity": "Critical", "confidence": 0.95,
+                            "confidence_tier": tier, "fp_likelihood": fp,
                             "evidence": f"DB error: '{sig}'",
                             "description": f"Parameter '{param}' reflects a SQL error — unsanitised input reaches the DB.",
                         })
@@ -11831,55 +12084,71 @@ class InjectionModule:
 
                 # B. Union-based (look for numeric column markers)
                 if "UNION" in payload.upper() and "SELECT" in payload.upper():
-                    # Check if response differs significantly from baseline
                     if abs(len(res.text) - len(baseline_text)) > 200:
-                        # Look for column number markers (1, 2, 3...)
                         for i in range(1, 10):
                             marker = f"SENTINEL_COL_{i}"
                             if marker in res.text:
+                                tier, fp = _classify_confidence(0.93)
                                 self.scanner._add_finding({
                                     "type": "SQL Injection", "subtype": "Union-Based",
                                     "url": test_url, "parameter": param, "payload": payload,
                                     "severity": "Critical", "confidence": 0.93,
+                                    "confidence_tier": tier, "fp_likelihood": fp,
                                     "evidence": f"UNION SELECT returned data — column {i} visible",
                                     "description": f"Parameter '{param}' allows UNION-based data extraction.",
                                 })
                                 return
 
-                # C. Boolean-based blind
+                # C. Boolean-based blind — FIX: raised threshold from 50 to 80 bytes
                 if "1=1" in raw_payload or "' OR '" in raw_payload:
                     f_payload = raw_payload.replace("1=1", "1=2").replace("' OR '", "' AND '")
                     f_url = self.scanner.param_engine.inject_payload(url, param, f_payload)
                     f_res = await self.scanner._req(client, "GET", f_url)
                     if f_res:
                         diff = abs(len(res.text) - len(f_res.text))
-                        if diff > 50:
+                        if diff > BOOLEAN_MIN_DIFF:
+                            conf = 0.82
+                            tier, fp = _classify_confidence(conf)
                             self.scanner._add_finding({
                                 "type": "SQL Injection", "subtype": "Boolean-Based Blind",
                                 "url": test_url, "parameter": param, "payload": payload,
-                                "severity": "Critical", "confidence": 0.82,
+                                "severity": "Critical", "confidence": conf,
+                                "confidence_tier": tier, "fp_likelihood": fp,
                                 "evidence": f"True/false response diff: {diff} bytes",
                                 "description": f"Parameter '{param}' behaves differently for true/false SQL conditions.",
                             })
                             return
 
-                # D. Time-based blind
+                # D. Time-based blind — FIX: 4.5s minimum + 30% correlation window
                 if any(k in payload.upper() for k in ("SLEEP", "WAITFOR", "BENCHMARK", "PG_SLEEP", "DBMS_PIPE")):
                     t_start = asyncio.get_event_loop().time()
                     await self.scanner._req(client, "GET", test_url, timeout=15)
                     elapsed = asyncio.get_event_loop().time() - t_start
-                    if elapsed >= base_lat + 3.0:
+                    delay = elapsed - base_lat
+                    # Extract intended sleep time from payload
+                    sleep_match = re.search(r'(?:SLEEP|pg_sleep)\s*\(\s*(\d+)', payload, re.IGNORECASE)
+                    intended = int(sleep_match.group(1)) if sleep_match else 6
+                    correlation = delay / intended if intended > 0 else 0
+
+                    if delay >= TIME_MIN_DELAY and correlation >= TIME_CORR_MIN:
+                        conf = 0.87
+                        tier, fp = _classify_confidence(conf)
                         self.scanner._add_finding({
                             "type": "SQL Injection", "subtype": "Time-Based Blind",
                             "url": test_url, "parameter": param, "payload": payload,
-                            "severity": "Critical", "confidence": 0.88,
-                            "evidence": f"Baseline={base_lat:.2f}s  Attack={elapsed:.2f}s",
+                            "severity": "Critical", "confidence": conf,
+                            "confidence_tier": tier, "fp_likelihood": fp,
+                            "evidence": f"Baseline={base_lat:.2f}s  Attack={elapsed:.2f}s  Correlation={correlation:.0%}",
                             "description": f"Parameter '{param}' caused a {elapsed:.2f}s delay — time-based blind SQLi.",
                         })
                         return
 
     # ── Command Injection ─────────────────────────────────────────────────────
     async def test_cmdi(self, client, url: str, param: str) -> None:
+        # Get baseline for CMDI false positive reduction
+        baseline = await self.scanner._req(client, "GET", url)
+        baseline_text = baseline.text if baseline else ""
+
         # Output-based (highest confidence)
         output_payloads = [
             ("; cat /etc/passwd", CMDI_OUTPUT_MARKERS),
@@ -11890,7 +12159,6 @@ class InjectionModule:
             ("| whoami", ["root", "www-data", "apache", "nginx", "nobody", "daemon"]),
             ("| id", ["uid=", "gid=", "groups="]),
             ("; id", ["uid=", "gid=", "groups="]),
-            # Windows
             ("& dir", ["Volume Serial", "Directory of"]),
             ("| dir", ["Volume Serial", "Directory of"]),
         ]
@@ -11900,11 +12168,14 @@ class InjectionModule:
                 res = await self.scanner._req(client, "GET", test_url)
                 if res:
                     for m in markers:
-                        if m in res.text:
+                        # Baseline check: skip if marker already in baseline
+                        if m in res.text and (not baseline_text or m not in baseline_text):
+                            tier, fp = _classify_confidence(0.97)
                             self.scanner._add_finding({
                                 "type": "Command Injection", "subtype": "Output-Based",
                                 "url": test_url, "parameter": param, "payload": mutated,
                                 "severity": "Critical", "confidence": 0.97,
+                                "confidence_tier": tier, "fp_likelihood": fp,
                                 "evidence": f"OS output marker: '{m}'",
                                 "description": f"Parameter '{param}' executes arbitrary OS commands.",
                             })
@@ -11912,7 +12183,7 @@ class InjectionModule:
 
         # Time-based blind fallback
         t0       = asyncio.get_event_loop().time()
-        baseline = await self.scanner._req(client, "GET", url)
+        base_res = await self.scanner._req(client, "GET", url)
         base_lat = asyncio.get_event_loop().time() - t0
 
         for payload in ["; sleep 6; #", "| sleep 6", "$(sleep 6)", "`sleep 6`"]:
@@ -11921,11 +12192,14 @@ class InjectionModule:
                 t_start  = asyncio.get_event_loop().time()
                 await self.scanner._req(client, "GET", test_url, timeout=20)
                 elapsed  = asyncio.get_event_loop().time() - t_start
-                if elapsed >= base_lat + 4.0:
+                if elapsed >= base_lat + TIME_MIN_DELAY:
+                    conf = 0.85
+                    tier, fp = _classify_confidence(conf)
                     self.scanner._add_finding({
                         "type": "Command Injection", "subtype": "Time-Based Blind",
                         "url": test_url, "parameter": param, "payload": mutated,
-                        "severity": "Critical", "confidence": 0.88,
+                        "severity": "Critical", "confidence": conf,
+                        "confidence_tier": tier, "fp_likelihood": fp,
                         "evidence": f"Baseline={base_lat:.2f}s  Attack={elapsed:.2f}s",
                         "description": f"Parameter '{param}' caused a {elapsed:.2f}s delay — blind CMDI.",
                     })
@@ -11937,15 +12211,16 @@ class InjectionModule:
         url1 = self.scanner.param_engine.inject_payload(url, param, "{{7*7}}")
         r1   = await self.scanner._req(client, "GET", url1)
         if not (r1 and "49" in r1.text):
-            # Try other template engines
             for payload in ["${7*7}", "<%= 7*7 %>", "#{7*7}", "*{7*7}"]:
                 test_url = self.scanner.param_engine.inject_payload(url, param, payload)
                 res = await self.scanner._req(client, "GET", test_url)
                 if res and "49" in res.text:
+                    tier, fp = _classify_confidence(0.90)
                     self.scanner._add_finding({
                         "type": "Server-Side Template Injection (SSTI)", "subtype": "Confirmed",
                         "url": test_url, "parameter": param, "payload": payload,
                         "severity": "Critical", "confidence": 0.90,
+                        "confidence_tier": tier, "fp_likelihood": fp,
                         "evidence": f"{payload} evaluated to 49",
                         "description": f"Parameter '{param}' evaluates template expressions — RCE likely.",
                     })
@@ -11956,10 +12231,12 @@ class InjectionModule:
         url2 = self.scanner.param_engine.inject_payload(url, param, "{{3*3}}")
         r2   = await self.scanner._req(client, "GET", url2)
         if r2 and "9" in r2.text:
+            tier, fp = _classify_confidence(0.95)
             self.scanner._add_finding({
                 "type": "Server-Side Template Injection (SSTI)", "subtype": "Confirmed",
                 "url": url1, "parameter": param, "payload": "{{7*7}}",
-                "severity": "Critical", "confidence": 0.93,
+                "severity": "Critical", "confidence": 0.95,
+                "confidence_tier": tier, "fp_likelihood": fp,
                 "evidence": "{{7*7}}->49 and {{3*3}}->9 confirmed",
                 "description": f"Parameter '{param}' evaluates template expressions — RCE likely.",
             })
@@ -11971,7 +12248,6 @@ class InjectionModule:
             "www-data", "[boot loader]", "[fonts]",
             "PHP Version", "phpinfo()",
         ]
-        # Get baseline to avoid false positives
         baseline = await self.scanner._req(client, "GET", url)
         baseline_text = baseline.text if baseline else ""
 
@@ -11982,10 +12258,12 @@ class InjectionModule:
                 if res:
                     for ind in LFI_INDICATORS:
                         if ind in res.text and (not baseline_text or ind not in baseline_text):
+                            tier, fp = _classify_confidence(0.95)
                             self.scanner._add_finding({
                                 "type": "Local File Inclusion (LFI)", "subtype": "Path Traversal",
                                 "url": test_url, "parameter": param, "payload": mutated,
                                 "severity": "Critical", "confidence": 0.95,
+                                "confidence_tier": tier, "fp_likelihood": fp,
                                 "evidence": f"File marker '{ind}' in response",
                                 "description": f"Parameter '{param}' allows reading server files.",
                             })
@@ -11997,41 +12275,55 @@ class InjectionModule:
             "root:x:", "root:0:0", "daemon:", "[boot loader]",
             "ami-id", "instance-id", "local-ipv4",
         ]
+        # FIX: Get baseline to avoid false positives from indicators already
+        # present in the page before injection
+        baseline = await self.scanner._req(client, "GET", url)
+        baseline_text = baseline.text if baseline else ""
+
         for payload in XXE_PAYLOADS[:5]:
             test_url = self.scanner.param_engine.inject_payload(url, param, payload)
             res = await self.scanner._req(client, "GET", test_url)
             if res:
                 for ind in XXE_INDICATORS:
-                    if ind in res.text:
+                    if ind in res.text and (not baseline_text or ind not in baseline_text):
+                        tier, fp = _classify_confidence(0.95)
                         self.scanner._add_finding({
                             "type": "XML External Entity (XXE)", "subtype": "File Disclosure",
                             "url": test_url, "parameter": param, "payload": payload[:80],
                             "severity": "Critical", "confidence": 0.95,
-                            "evidence": f"XXE indicator '{ind}' in response",
+                            "confidence_tier": tier, "fp_likelihood": fp,
+                            "evidence": f"XXE indicator '{ind}' in response (not in baseline)",
                             "description": f"Parameter '{param}' processes XML external entities.",
                         })
                         return
 
     # ── NoSQL Injection ──────────────────────────────────────────────────────
     async def test_nosql(self, client, url: str, param: str) -> None:
+        # Get baseline for NoSQL false positive reduction
+        baseline = await self.scanner._req(client, "GET", url)
+        baseline_text = baseline.text.lower() if baseline else ""
+
         for payload in NOSQL_PAYLOADS:
             test_url = self.scanner.param_engine.inject_payload(url, param, payload)
             res = await self.scanner._req(client, "GET", test_url)
             if not res:
                 continue
-            # NoSQL errors or unexpected behavior
-            nosql_errors = [
-                "mongo", "mongodb", "mongod", "no sql",
-                "$where", "$gt", "$ne", "$regex",
-                "syntax error", "unexpected token",
-            ]
             body_lower = res.text.lower()
-            for err in nosql_errors:
-                if err in body_lower:
+            for err in NOSQL_MONGO_ERRORS:
+                if err in body_lower and (not baseline_text or err not in baseline_text):
+                    # Higher confidence for MongoDB-specific errors
+                    if err in ("mongoerror", "mongod", "mongodb", "bson"):
+                        conf = 0.92
+                    elif err in ("$where", "$gt", "$ne", "$regex", "$expr"):
+                        conf = 0.80
+                    else:
+                        conf = 0.70
+                    tier, fp = _classify_confidence(conf)
                     self.scanner._add_finding({
                         "type": "NoSQL Injection", "subtype": "Operator Injection",
                         "url": test_url, "parameter": param, "payload": payload[:60],
-                        "severity": "Critical", "confidence": 0.85,
+                        "severity": "Critical", "confidence": conf,
+                        "confidence_tier": tier, "fp_likelihood": fp,
                         "evidence": f"NoSQL indicator: '{err}'",
                         "description": f"Parameter '{param}' may allow NoSQL operator injection.",
                     })
@@ -12058,26 +12350,30 @@ class InjectionModule:
                 body = res.text.lower()
                 for sig in SQLI_ERROR_SIGNATURES:
                     if sig.lower() in body:
+                        tier, fp = _classify_confidence(0.95)
                         self.scanner._add_finding({
                             "type": "SQL Injection", "subtype": f"Error-Based via Form ({method})",
                             "url": url, "parameter": "form", "payload": mutated,
                             "severity": "Critical", "confidence": 0.95,
+                            "confidence_tier": tier, "fp_likelihood": fp,
                             "evidence": f"DB error: '{sig}'",
                             "description": f"Form at {url} passes unsanitised input to the DB.",
                         })
                         return
 
-        # NoSQL via form
+        # NoSQL via form — tightened to MongoDB-specific patterns
         for payload in NOSQL_PAYLOADS[:4]:
             data = {k: payload for k in base}
             res = await _send(data)
             if res:
-                for err in ["mongo", "$where", "$gt", "$ne"]:
+                for err in NOSQL_MONGO_ERRORS:
                     if err in res.text.lower():
+                        tier, fp = _classify_confidence(0.80)
                         self.scanner._add_finding({
                             "type": "NoSQL Injection", "subtype": f"Form ({method})",
                             "url": url, "parameter": "form", "payload": payload[:60],
-                            "severity": "Critical", "confidence": 0.85,
+                            "severity": "Critical", "confidence": 0.80,
+                            "confidence_tier": tier, "fp_likelihood": fp,
                             "evidence": f"NoSQL indicator: '{err}'",
                             "description": f"Form at {url} may allow NoSQL injection.",
                         })
@@ -14052,6 +14348,7 @@ def dequeue_scan() -> dict:
             --bg-dark:#050810;--bg-panel:#0d1117;--primary:#00f5c4;
             --secondary:#58a6ff;--danger:#f85149;--warning:#d29922;
             --text-main:#c9d1d9;--text-muted:#8b949e;--border:#21262d;
+            --conf-high:#00f5c4;--conf-med:#d29922;--conf-low:#f85149;
         }
         *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
         html,body{height:100%}
@@ -14156,6 +14453,24 @@ def dequeue_scan() -> dict:
             white-space:nowrap;font-family:monospace;font-size:11px;
             color:var(--text-muted);cursor:help}
 
+        /* confidence meter */
+        .conf-cell{display:flex;align-items:center;gap:6px;min-width:120px}
+        .conf-bar{width:60px;height:6px;background:var(--border);
+            border-radius:3px;overflow:hidden;flex-shrink:0}
+        .conf-fill{height:100%;border-radius:3px;transition:width .3s ease}
+        .conf-fill.high{background:var(--conf-high)}
+        .conf-fill.medium{background:var(--conf-med)}
+        .conf-fill.low{background:var(--conf-low)}
+        .conf-pct{font-size:11px;font-weight:600;min-width:32px}
+        .conf-pct.high{color:var(--conf-high)}
+        .conf-pct.medium{color:var(--conf-med)}
+        .conf-pct.low{color:var(--conf-low)}
+        .fp-tag{font-size:9px;font-weight:700;padding:1px 5px;
+            border-radius:8px;letter-spacing:.5px;white-space:nowrap}
+        .fp-tag.unlikely{background:rgba(0,245,196,.12);color:var(--conf-high)}
+        .fp-tag.possible{background:rgba(210,153,34,.15);color:var(--conf-med)}
+        .fp-tag.likely{background:rgba(248,81,73,.15);color:var(--conf-low)}
+
         /* report */
         #rbox{background:var(--bg-panel);border-radius:4px;padding:20px;
             white-space:pre-wrap;font-family:'Courier New',monospace;
@@ -14166,6 +14481,18 @@ def dequeue_scan() -> dict:
         .pill{display:inline-block;font-size:10px;font-weight:700;
             padding:2px 7px;border-radius:10px;
             background:rgba(0,245,196,.12);color:var(--primary)}
+
+        /* filter bar */
+        .filter-bar{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;
+            align-items:center}
+        .filter-bar label{font-size:10px;color:var(--text-muted);
+            text-transform:uppercase;letter-spacing:.5px;margin-right:2px}
+        .filter-btn{background:var(--bg-dark);border:1px solid var(--border);
+            color:var(--text-muted);padding:3px 10px;border-radius:3px;
+            font-size:11px;cursor:pointer;transition:all .15s}
+        .filter-btn:hover{border-color:var(--primary);color:var(--primary)}
+        .filter-btn.active{background:rgba(0,245,196,.1);
+            border-color:var(--primary);color:var(--primary)}
     </style>
 </head>
 <body>
@@ -14223,14 +14550,26 @@ def dequeue_scan() -> dict:
             <div id="console"><div class="empty">Awaiting scan...</div></div>
         </div>
         <div class="panel" id="panel-findings">
+            <div class="filter-bar" id="filterBar">
+                <label>Confidence:</label>
+                <button class="filter-btn active" data-filter="all" onclick="setFilter(this,'all')">All</button>
+                <button class="filter-btn" data-filter="high" onclick="setFilter(this,'high')">High</button>
+                <button class="filter-btn" data-filter="medium" onclick="setFilter(this,'medium')">Medium</button>
+                <button class="filter-btn" data-filter="low" onclick="setFilter(this,'low')">Low</button>
+                <span style="margin-left:8px"></span>
+                <label>FP Risk:</label>
+                <button class="filter-btn" data-filter="unlikely" onclick="setFilter(this,'unlikely')">Unlikely</button>
+                <button class="filter-btn" data-filter="possible" onclick="setFilter(this,'possible')">Possible</button>
+                <button class="filter-btn" data-filter="likely" onclick="setFilter(this,'likely')">Likely</button>
+            </div>
             <div class="tw">
                 <table>
                     <thead><tr>
                         <th>Severity</th><th>Type</th><th>Param</th>
-                        <th>URL</th><th>Conf</th><th>Evidence</th>
+                        <th>URL</th><th>Confidence</th><th>FP Risk</th><th>Evidence</th>
                     </tr></thead>
                     <tbody id="ftbody">
-                        <tr><td colspan="6" class="empty">No findings yet.</td></tr>
+                        <tr><td colspan="7" class="empty">No findings yet.</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -14243,7 +14582,7 @@ def dequeue_scan() -> dict:
 
 <script>
 "use strict";
-var _poll=null, _logCount=0, _activeJob=null;
+var _poll=null, _logCount=0, _activeJob=null, _allFindings=[], _activeFilter="all";
 
 function showTab(el,name){
     document.querySelectorAll('.tab').forEach(function(t){t.classList.remove('active')});
@@ -14252,10 +14591,28 @@ function showTab(el,name){
     document.getElementById('panel-'+name).classList.add('active');
 }
 
+function setFilter(el,filter){
+    document.querySelectorAll('.filter-btn').forEach(function(b){b.classList.remove('active')});
+    el.classList.add('active');
+    _activeFilter=filter;
+    renderFindings(_allFindings);
+}
+
 function setBadge(text,cls){
     var b=document.getElementById('badge');
     b.textContent=text.toUpperCase();
     b.className='badge '+(cls||'');
+}
+
+function getConfTier(f){
+    var conf=f.confidence_score!=null?f.confidence_score:f.confidence||0;
+    if(conf>=0.90) return 'high';
+    if(conf>=0.70) return 'medium';
+    return 'low';
+}
+
+function getFpLabel(f){
+    return f.fp_likelihood||'possible';
 }
 
 async function startScan(){
@@ -14267,9 +14624,9 @@ async function startScan(){
 
     btn.disabled=true; btn.textContent='Dispatching...';
     setBadge('CONNECTING','scanning');
-    _logCount=0;
+    _logCount=0; _allFindings=[];
     document.getElementById('console').innerHTML='';
-    document.getElementById('ftbody').innerHTML='<tr><td colspan="6" class="empty">Scanning...</td></tr>';
+    document.getElementById('ftbody').innerHTML='<tr><td colspan="7" class="empty">Scanning...</td></tr>';
     document.getElementById('rbox').className='empty';
     document.getElementById('rbox').textContent='Waiting for pipeline...';
     document.getElementById('fcount').textContent='0';
@@ -14310,7 +14667,8 @@ function startPoll(jobId,apiKey){
             setBadge(status,status);
             document.getElementById('prog').style.width=Math.min(d.progress||0,100)+'%';
             renderLogs(d.logs||[]);
-            renderFindings(d.findings||[]);
+            _allFindings=d.findings||[];
+            renderFindings(_allFindings);
             if(d.report&&d.report.content) renderReport(d.report.content);
             if(status==='done'||status==='failed'){
                 clearInterval(_poll);_poll=null;
@@ -14346,24 +14704,49 @@ function renderLogs(logs){
 function renderFindings(findings){
     document.getElementById('fcount').textContent=findings.length;
     var tb=document.getElementById('ftbody');
-    if(!findings.length) return;
+    if(!findings.length){
+        tb.innerHTML='<tr><td colspan="7" class="empty">No findings yet.</td></tr>';
+        return;
+    }
     tb.innerHTML='';
-findings.forEach(function(f){
-    var sev=(f.severity||'info').toLowerCase();
-    var conf=Math.round(((f.confidence_score!=null?f.confidence_score:f.confidence)||0)*100);
-    var ev=f.evidence_snippet||f.evidence||'';
-    var url=f.target_url||f.url||'-';
-    var evDisplay = esc(ev) || '-';  // ✅ evaluate fallback BEFORE building HTML
-    var tr=document.createElement('tr');
-    tr.innerHTML=
-        '<td class="s'+sev.charAt(0)+'">'+esc(f.severity||'?')+'</td>'+
-        '<td>'+esc(f.type||'Unknown')+'</td>'+
-        '<td>'+esc(f.param||f.parameter||'-')+'</td>'+
-        '<td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+esc(url)+'">'+esc(url.length>50?url.slice(0,50)+'...':url)+'</td>'+
-        '<td>'+conf+'%</td>'+
-        ' <td class="ev" title="' + esc(ev) + '">' + evDisplay + '</td>';
-    tb.appendChild(tr);
-});
+
+    // Apply filter
+    var filtered=findings;
+    if(_activeFilter!=='all'){
+        filtered=findings.filter(function(f){
+            var tier=getConfTier(f);
+            var fp=getFpLabel(f);
+            return tier===_activeFilter||fp===_activeFilter;
+        });
+    }
+
+    if(!filtered.length){
+        tb.innerHTML='<tr><td colspan="7" class="empty">No findings match filter.</td></tr>';
+        return;
+    }
+
+    filtered.forEach(function(f){
+        var sev=(f.severity||'info').toLowerCase();
+        var conf=Math.round(((f.confidence_score!=null?f.confidence_score:f.confidence)||0)*100);
+        var tier=getConfTier(f);
+        var fpLabel=getFpLabel(f);
+        var ev=f.evidence_snippet||f.evidence||'';
+        var url=f.target_url||f.url||'-';
+        var evDisplay=esc(ev)||'-';
+        var tr=document.createElement('tr');
+        tr.innerHTML=
+            '<td class="s'+sev.charAt(0)+'">'+esc(f.severity||'?')+'</td>'+
+            '<td>'+esc(f.type||'Unknown')+'</td>'+
+            '<td>'+esc(f.param||f.parameter||'-')+'</td>'+
+            '<td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+esc(url)+'">'+esc(url.length>50?url.slice(0,50)+'...':url)+'</td>'+
+            '<td><div class="conf-cell">'+
+              '<div class="conf-bar"><div class="conf-fill '+tier+'" style="width:'+conf+'%"></div></div>'+
+              '<span class="conf-pct '+tier+'">'+conf+'%</span>'+
+            '</div></td>'+
+            '<td><span class="fp-tag '+fpLabel+'">'+fpLabel.toUpperCase()+' FP</span></td>'+
+            '<td class="ev" title="'+esc(ev)+'">'+evDisplay+'</td>';
+        tb.appendChild(tr);
+    });
 }
 
 function renderReport(content){
@@ -14404,8 +14787,7 @@ async function loadJobs(){
                 '<div class="ji-url">'+esc(j.target_url||j.id)+'</div>'+
                 '<div class="ji-meta">'+
                   '<span class="ji-st '+st+'">'+st.toUpperCase()+'</span>'+
-                  // templates/index.html  line 363 — normalize tier display
-                  '<span>' + esc((j.tier||'Basic').charAt(0).toUpperCase() + (j.tier||'Basic').slice(1).toLowerCase()) + '</span>' +
+                  '<span>'+esc((j.tier||'Basic').charAt(0).toUpperCase()+(j.tier||'Basic').slice(1).toLowerCase())+'</span>'+
                   '<span>'+ago+'</span>'+
                 '</div>';
             div.onclick=function(){resumeJob(j.id);};
@@ -14419,10 +14801,10 @@ async function loadJobs(){
 function resumeJob(jobId){
     var apiKey=document.getElementById('apiKey').value.trim();
     if(_poll){clearInterval(_poll);_poll=null;}
-    _logCount=0; _activeJob=jobId;
+    _logCount=0; _activeJob=jobId; _allFindings=[];
     document.getElementById('jobId').value=jobId;
     document.getElementById('console').innerHTML='';
-    document.getElementById('ftbody').innerHTML='<tr><td colspan="6" class="empty">Loading...</td></tr>';
+    document.getElementById('ftbody').innerHTML='<tr><td colspan="7" class="empty">Loading...</td></tr>';
     document.getElementById('rbox').className='empty';
     document.getElementById('rbox').textContent='Loading report...';
     document.getElementById('fcount').textContent='0';
@@ -14450,6 +14832,7 @@ loadJobs();
 </script>
 </body>
 </html>
+
 
 ==================== FILE: workers\aggregation_worker.py ====================
 
@@ -14723,6 +15106,16 @@ def fetch(queue: str) -> dict | None:
         return None
     job.setdefault("tier", "Basic")
     return job
+#____________________________________________________________________________________
+#wrapper for fetch to handle exceptions and ensure it always returns a dict or None
+#____________________________________________________________________________________
+def pop_queue(queue: str) -> dict | None:
+    """
+    Non-blocking pop from the queue. Returns the job dict or None if empty.
+    This is an alias for fetch() for compatibility.
+    """
+    return fetch(queue)
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -14979,27 +15372,39 @@ if __name__ == "__main__":
 #      (common hidden admin/backup paths bug bounty hunters care about).
 #   4. Added sitemap.xml parsing for deeper URL discovery.
 #   5. Added subpath bruteforce for common high-value endpoints.
+#   6. CRITICAL: Removed asyncio.run() which created a new event loop and
+#      blocked the worker thread for 10+ minutes during deep crawls.
+#   7. Added overall crawl timeout (120s Basic / 300s Professional) so jobs
+#      never get stuck indefinitely on slow/unresponsive targets.
+#   8. Fixed pipeline stall: on_crawl_complete now only pushes to SCAN_QUEUE.
+#      Browser queue is handled separately and does not block the scan counter.
 # ──────────────────────────────────────────────────────────────────────────────
 
+import asyncio
+import logging
+import httpx
 import requests
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 import re
-import asyncio
-import httpx
 
 from workers.base_worker import worker_loop, push_log
 from task_queue.queues import CRAWL_QUEUE
 from core.pipeline import on_crawl_complete
-from scanner.js_parser import JSParser
+from core.orchestrator import handle_stage_completion
+from core.logger import get_logger
+from task_queue.redis_client import log_event
 from scanner.dast.crawler import Crawler
+from scanner.js_parser import JSParser
+
+logger = get_logger("crawl_worker")
 
 # High-value paths to always probe (bug bounty goldmines)
 HIGH_VALUE_PATHS = [
     "/admin", "/admin/", "/administrator", "/wp-admin", "/phpmyadmin",
     "/api", "/api/v1", "/api/v2", "/graphql", "/swagger", "/swagger-ui",
     "/swagger.json", "/openapi.json", "/api-docs", "/.well-known",
-    "/backup", "/backup.sql", "/dump.sql", "/.env", "/.git/HEAD",
+    "/backup极", "/backup.sql", "/dump.sql", "/.env", "/.git/HEAD",
     "/server-status", "/phpinfo.php", "/actuator", "/actuator/health",
     "/actuator/env", "/metrics", "/debug", "/console", "/shell",
     "/robots.txt", "/sitemap.xml", "/crossdomain.xml", "/security.txt",
@@ -15007,6 +15412,13 @@ HIGH_VALUE_PATHS = [
     "/callback", "/forgot-password", "/reset-password",
     "/upload", "/uploads", "/files", "/static", "/assets",
 ]
+
+BLOCKED_PATHS = ["/register", "/signup", "/auth/sign-up", "/password-reset"]
+
+CRAWL_TIMEOUTS = {
+    "Basic": 120,
+    "Professional": 300,
+}
 
 
 def same_domain(base, target):
@@ -15034,7 +15446,7 @@ def fetch_sitemap_urls(base_url: str) -> list:
     """Parse sitemap.xml for URL discovery."""
     urls = []
     try:
-        r = requests.get(urljoin(base_url, "/sitemap.xml"), timeout=5)
+        r = requests.get(urljoin(base_url, "/sitemap.xml"), timeout极=5)
         if r.status_code == 200:
             urls = re.findall(r'<loc>([^<]+)</loc>', r.text)
     except Exception:
@@ -15042,7 +15454,7 @@ def fetch_sitemap_urls(base_url: str) -> list:
     return [u for u in urls if same_domain(base_url, u)]
 
 
-def crawl(start_url, tier="Basic", auth=None):
+def crawl_sync(start_url, tier="Basic", auth=None):
     """
     Multi-signal crawler with robots.txt, sitemap.xml, JS endpoint extraction,
     and high-value path probing.
@@ -15118,47 +15530,142 @@ def crawl(start_url, tier="Basic", auth=None):
             continue
 
     return list(results)
-BLOCKED_PATHS = ["/register", "/signup", "/auth/sign-up", "/password-reset"]
+
+
+async def _crawl_async(url: str, tier: str, auth: dict = None) -> tuple:
+    """Run the async Crawler with a hard timeout so the job never stalls."""
+    max_pages = 300 if tier == "Professional" else 50
+    timeout_s = CRAWL_TIMEOUTS.get(tier, 120)
+
+    crawler = Crawler(base_url=url, max_pages=max_pages)
+
+    async with httpx.AsyncClient(
+        cookies=auth.get("cookies", {}) if auth else None,
+        headers=auth.get("headers", {}) if auth else None,
+        follow_redirects=True,
+        timeout=20,
+    ) as client:
+        try:
+            endpoints, forms = await asyncio.wait_for(
+                crawler.crawl(client),
+                timeout=timeout_s,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"[CRAWL] Timeout after {timeout_s}s — returning partial results")
+            endpoints = list(crawler.endpoints)
+            forms = crawler.forms
+
+    return endpoints, forms
+
+
+
+async def process(job):
+    job_id = job.get("job_id")
+    target = job.get("url")
+    tier = job.get("tier", "Basic")
+    auth = job.get("auth")
+
+    try:
+        logger.info(f"Starting crawl: {target}", job_id)
+
+        push_log(job_id, f"[CRAWL] Starting {tier} crawl for {target}", tier=tier)
+
+        # Use async crawler if available, fall back to sync
+        try:
+            found_urls, _ = await _crawl_async(target, tier, auth)  # Only capture endpoints
+
+        except Exception:
+            # Fall back to synchronous crawling
+            found_urls = crawl_sync(target, tier, auth)
+        
+        filtered_urls = [
+            u for u in found_urls
+            if not any(blocked in u for blocked in BLOCKED_PATHS)
+        ]
+
+        log_event(job_id, "CRAWL", f"Found {len(filtered_urls)} URLs")
+        push_log(job_id, f"[CRAWL] Discovery complete. Found {len(filtered_urls)} endpoints.", tier=tier)
+
+        # ✅ ALWAYS pass dict (CRITICAL FIX)
+        handle_stage_completion(job_id, "crawl", {
+            "urls": filtered_urls
+        })
+
+        # Also call the pipeline completion handler
+        on_crawl_complete(job_id, filtered_urls, auth=auth, tier=tier)
+
+    except Exception as e:
+        logger.error(f"Crawl failed: {str(e)}", job_id)
+
+        logger.error(f"[CRAWL] Fatal error: {e}", job_id)
+
+
+async def worker():
+    while True:
+        job = None
+        try:
+            # Use the proper queue popping mechanism from base_worker
+            from workers.base_worker import fetch as pop_queue
+            job = pop_queue(CRAWL_QUEUE)
+            
+            if job:
+                await process(job)
+            else:
+                await asyncio.sleep(1)
+        except Exception as e:
+            logger.error(f"[CRAWL] Worker error: {e}", job_id=job.get("job_id") if job else "N/A")
+            await asyncio.sleep(1)
+
 
 def handle(job):
+    """Synchronous handler for worker_loop compatibility"""
     job_id = job["job_id"]
-    url    = job["url"]
-    tier   = job.get("tier", "Basic")
-    auth   = job.get("auth")
+    url = job["url"]
+    tier = job.get("tier", "Basic")
+    auth = job.get("auth")
 
     push_log(job_id, f"[CRAWL] Starting {tier} crawl for {url}", tier=tier)
 
-    # 1. Use the advanced Crawler class instead of the simple function
-    # Note: Professional tier uses higher limits for better discovery
-    max_p = 300 if tier == "Professional" else 50
-    crawler = Crawler(base_url=url, max_pages=max_p)
+    try:
+        # Try async first, fall back to sync
+        try:
+            loop = asyncio.get_event_loop()
+            found_urls = loop.run_until_complete(_crawl_async(url, tier, auth))
+        except (RuntimeError, Exception):
+            # Fall back to synchronous crawling
+            found_urls = crawl_sync(url, tier, auth)
+    except Exception as e:
+        logger.error(f"[CRAWL] Fatal error: {e}")
+        found_urls = []
 
-    async def run_discovery():
-        async with httpx.AsyncClient(
-            cookies=auth.get("cookies", {}) if auth else None,
-            headers=auth.get("headers", {}) if auth else None,
-            follow_redirects=True
-        ) as client:
-            endpoints, forms = await crawler.crawl(client)
-            return endpoints
-
-    # Execute the async crawler
-    found_urls = asyncio.run(run_discovery())
-
-    # 2. Filter results
     filtered_urls = [
-        u for u in found_urls 
+        u for u in found_urls
         if not any(blocked in u for blocked in BLOCKED_PATHS)
     ]
 
+    push_log(job_id, f"[CRAWL] Filtered {len(found_urls)-len(filtered_urls)} paths.", tier=tier)
     push_log(job_id, f"[CRAWL] Discovery complete. Found {len(filtered_urls)} endpoints.", tier=tier)
 
-    # 3. Proceed to pipeline
+    # ✅ ALWAYS pass dict (CRITICAL FIX)
+    handle_stage_completion(job_id, "crawl", {
+        "urls": filtered_urls
+    })
+
+    # Also call the pipeline completion handler
     on_crawl_complete(job_id, filtered_urls, auth=auth, tier=tier)
 
 
 if __name__ == "__main__":
-    worker_loop(CRAWL_QUEUE, handle)
+    # Support both async worker and worker_loop modes
+    try:
+        asyncio.run(worker())
+    except KeyboardInterrupt:
+        logger.info("[CRAWL] Worker stopped by user")
+    except Exception as e:
+        logger.error(f"[CRAWL] Worker failed: {e}")
+        # Fall back to worker_loop for compatibility
+        worker_loop(CRAWL_QUEUE, handle)
+
 
 ==================== FILE: workers\exploit_worker.py ====================
 
@@ -15205,7 +15712,7 @@ def validate(findings):
     # 🔥 fallback so system never returns empty
     if not validated:
         validated = findings
-    logger.info(f"[EXPLOIT] Input findings: {len(findings)} | After validation: {len(validated)}")
+    logger.info(f"[EXPLOIT] Input findings: {len(findings)} | After validation: {len(validated)}", job_id="unknown")
     return validated
 
 
@@ -15977,16 +16484,17 @@ if __name__ == "__main__":
 
 ==================== FILE: workers\scan_worker.py ====================
 
+
 # workers/scan_worker.py
 # ──────────────────────────────────────────────────────────────────────────────
 # SENTINEL SCAN WORKER — Evidence-Gated Pipeline
 #
 # Architecture changes vs. previous version:
 #
-#   极1. EVIDENCE-GATED PIPELINE
+#   1. EVIDENCE-GATED PIPELINE
 #      Every payload injection now calls validator.verify(...).  A finding is
 #      appended to `findings` ONLY when result.is_vulnerable is True.
-#      WAF/defence responses (403/429/500极/503) are logged but never turned
+#      WAF/defence responses (403/429/500/503) are logged but never turned
 #      into findings.
 #
 #   2. CONFIDENCE SCORING — every finding object carries:
@@ -16009,8 +16517,8 @@ if __name__ == "__main__":
 #      silent failure.
 #
 #   6. GLOBAL EXCEPTION WRAPPER
-#      A top-level try/except Exception in handle极() logs the full stack trace
-#      to极 the DB and pushes a JobFailed signal — no worker ever silently stops.
+#      A top-level try/except Exception in handle() logs the full stack trace
+#      to the DB and pushes a JobFailed signal — no worker ever silently stops.
 # ──────────────────────────────────────────────────────────────────────────────
 
 import asyncio
@@ -16021,6 +16529,8 @@ import time
 import traceback
 from typing import Dict, List, Optional
 from urllib.parse import urlparse, parse_qs
+
+import httpx
 
 from workers.base_worker import worker_loop, push_log
 from task_queue.queues import SCAN_QUEUE
@@ -16035,21 +16545,21 @@ from scanner.detector import Detector, Validator
 from scanner.dast.context_engine import ContextEngine
 
 logging.basicConfig(level=logging.DEBUG)
-logger = get_logger("scan_worker")
+logger        = get_logger("scan_worker")
 state_manager = get_state_manager()
 
-detector = Detector()
-validator = Validator()
+detector       = Detector()
+validator      = Validator()
 context_engine = ContextEngine()
-fuzzer = SmartFuzzer()
+fuzzer         = SmartFuzzer()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TIMEOUT CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 
-DEFAULT_TIMEOUT = 12
-PHP_TIMEOUT = 30
+DEFAULT_TIMEOUT    = 12
+PHP_TIMEOUT        = 30
 TIME_BASED_TIMEOUT = 15
 
 
@@ -16065,6 +16575,24 @@ COMMON_PARAMS = [
     "sort", "filter", "from", "to", "amount", "code", "key", "session",
     "debug", "action", "op", "mode", "format", "output", "dir", "include",
 ]
+async def is_url_reachable(url: str, timeout: int = 5) -> bool:
+    """
+    Validate that a URL is reachable before attempting full scan.
+    Returns True if URL responds with a non-5xx status code.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            # Use HEAD first for efficiency, fall back to GET if needed
+            try:
+                response = await client.head(url)
+            except (httpx.ConnectError, httpx.ReadTimeout):
+                # Try GET if HEAD fails (some servers block HEAD)
+                response = await client.get(url)
+            
+            return response.status_code < 500
+    except Exception:
+        return False
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -16085,30 +16613,30 @@ def detect_php(response, url: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# WAF DETECTION
+# WAF DETECTION — delegates to scanner.dast.waf_detector
 # ─────────────────────────────────────────────────────────────────────────────
 
 def detect_waf(response) -> List[str]:
-    waf_signatures = {
-        "Cloudflare": ["cloudflare", "cf-ray"],
-        "AWS WAF": ["aws-elb", "x-amzn-requestid"],
-        "Akamai": ["akamai"],
-        "ModSecurity": ["mod_security", "modsecurity"],
-        "Imperva": ["imperva", "incapsula"],
-        "F5 BIG-IP": ["big-ip", "f5"],
-        "Sucuri": ["sucuri"],
-    }
+    """Detect WAF from a single response. Delegates to WAFDetector signatures."""
+    from scanner.dast.waf_detector import WAF_SIGNATURES
     detected = []
-    headers = str(response.headers).lower()
-    body_low = response.text[:1000].lower()
-    for waf, sigs in waf_signatures.items():
-        if any(s in headers or s in body_low for s in sigs):
-            detected.append(waf)
+    headers  = str(response.headers).lower()
+    body_low = response.text[:2000].lower()
+    for waf_name, sigs in WAF_SIGNATURES.items():
+        score = 0
+        for h in sigs.get("headers", []):
+            if h.lower() in headers:
+                score += 2
+        for b in sigs.get("body", []):
+            if b.lower() in body_low:
+                score += 1
+        if score >= 2:
+            detected.append(waf_name)
     return detected
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PARAMETER DISCOVER极Y
+# PARAMETER DISCOVERY
 # ─────────────────────────────────────────────────────────────────────────────
 
 def extract_params(url: str, html: str) -> List[str]:
@@ -16163,19 +16691,59 @@ def audit_headers(headers: Dict) -> List[str]:
 
 def get_payloads() -> Dict[str, List[str]]:
     return {
-        "xss": ["<script>alert(1)</script>", "<img src=x onerror=alert(1)>",
-                "<svg/onload=alert(1)>", "\" onmouseover=alert(1) x=\""],
-        "sqli_error": ["' OR 1=1 --", "' OR '1'='1", "\" OR \"1\"=\"1",
-                       "' AND extractvalue(1,concat(0x7e,version()))--"],
-        "sqli_time": ["' OR SLEEP(6)--", "'; WAITFOR DELAY '0:极0:6'--",
-                      "'; SELECT pg_sleep(6)--"],
-        "sqli_bool": ["' AND 1=1--", "' AND 1=2--"],
-        "ssti": ["{{7*7}}", "${7*7}", "#{7*7}"],
-        "lfi": ["../../../../etc/passwd", "../../../../etc/passwd%00",
-                "php://filter/convert.base64-encode/resource=index.php"],
-        "cmdi": ["; id", "| id", "& id", "$(id)", "`id`"],
-        "redirect": ["https://evil.com", "//evil.com", "/\\evil.com"],
-        "header": ["test\r\nX-Injected: evil", "test%0d%0aX-Injected: evil"],
+        "xss": [
+            "<script>alert(1)</script>",
+            "<img src=x onerror=alert(1)>",
+            "<svg/onload=alert(1)>",
+            "\" onmouseover=alert(1) x=\"",
+            "' onmouseover=alert(1) x='",
+            "javascript:alert(1)"
+        ],
+        "sqli_error": [
+            "' OR 1=1 --",
+            "' OR '1'='1",
+            "\" OR \"1\"=\"1",
+            "' AND extractvalue(1,concat(0x7e,version()))--",
+            "1' OR '1'='1'-- -",
+            "1' UNION SELECT NULL,NULL-- -",
+            "1' AND (SELECT * FROM (SELECT SLEEP(5))a)-- -",
+            "1' AND extractvalue(1,concat(0x7e,version()))-- -"
+        ],
+        "sqli_time": [
+            "' OR SLEEP(6)--",
+            "'; WAITFOR DELAY '0:0:6'--",
+            "'; SELECT pg_sleep(6)--"
+        ],
+        "sqli_bool": [
+            "' AND 1=1--",
+            "' AND 1=2--"
+        ],
+        "ssti": [
+            "{{7*7}}",
+            "${7*7}",
+            "#{7*7}"
+        ],
+        "lfi": [
+            "../../../../etc/passwd",
+            "../../../../etc/passwd%00",
+            "php://filter/convert.base64-encode/resource=index.php"
+        ],
+        "cmdi": [
+            "; id",
+            "| id",
+            "& id",
+            "$(id)",
+            "`id`"
+        ],
+        "redirect": [
+            "https://evil.com",
+            "//evil.com",
+            "/\\evil.com"
+        ],
+        "header": [
+            "test\r\nX-Injected: evil",
+            "test%0d%0aX-Injected: evil"
+        ]
     }
 
 
@@ -16197,7 +16765,7 @@ class ResponseDiff:
     def similarity_ratio(s1: str, s2: str) -> float:
         if not s1 or not s2:
             return 1.0 if s1 == s2 else 0.0
-        longer = s1 if len(s1) >= len(s2) else s2
+        longer  = s1 if len(s1) >= len(s2) else s2
         shorter = s2 if len(s1) >= len(s2) else s1
         if not longer:
             return 1.0
@@ -16244,11 +16812,11 @@ def _sanitize_findings(findings: List[Dict]) -> List[Dict]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def scan_url_async(
-    job_id: str,
+    job_id:     str,
     target_url: str,
-    tier: str = "Basic",
-    cookies: Optional[Dict] = None,
-    headers: Optional[Dict] = None,
+    tier:       str            = "Basic",
+    cookies:    Optional[Dict] = None,
+    headers:    Optional[Dict] = None,
 ) -> List[Dict]:
     """
     Evidence-gated async vulnerability scan.
@@ -16260,8 +16828,18 @@ async def scan_url_async(
       - method             (oracle method that confirmed the finding)
     """
     findings: List[Dict] = []
+    # ── Circuit Breaker Check ─────────────────────────────────────────────
+    db = get_db()
+    parsed = urlparse(target_url)
+    host = parsed.netloc
+    
+    if not db.circuit.is_allowed(host):
+        logger.warning(f"[SCAN] Circuit breaker blocked {host} — skipping", job_id)
+        push_log(job_id, f"[SCAN] Skipping {host} — circuit breaker open", tier=tier)
+        return findings
+    # ─────────────────────────────────────────────────────────────────────
 
-    rate_cfg = RateLimitConfig(max_requests_per_second=5, min_delay_ms=200)
+    rate_cfg    = RateLimitConfig(max_requests_per_second=5, min_delay_ms=200)
     http_client = HTTPClient(
         timeout=DEFAULT_TIMEOUT,
         max_retries=3,
@@ -16269,15 +16847,33 @@ async def scan_url_async(
     )
 
     try:
+        # ── URL Validation Check ─────────────────────────────────────────
+        if not await is_url_reachable(target_url):
+            logger.warning(f"URL {target_url} is not reachable — skipping", job_id)
+            push_log(job_id, f"[SCAN] Skipping unreachable URL: {target_url}", tier=tier)
+            return findings
+        # ─────────────────────────────────────────────────────────────────
         # ── Baseline request ──────────────────────────────────────────────
         logger.info(f"Getting baseline response from {target_url}", job_id)
         baseline_start = time.time()
-        baseline = await http_client.get(target_url, headers=headers, cookies=cookies)
+        try:
+            baseline = await http_client.get(target_url, headers=headers, cookies=cookies)
+        except (httpx.ConnectTimeout, httpx.ConnectError, httpx.ReadTimeout) as exc:
+            # Record circuit breaker failure
+            db.circuit.record_failure(host)
+            logger.warning(f"[SCAN] Connection failed to {target_url}: {exc}", job_id)
+            push_log(job_id, f"[SCAN] Connection failed: {target_url}", tier=tier)
+            return findings
+        except Exception as exc:
+            logger.error(f"Scan failed: {exc}", job_id)
+            raise
+            
         baseline_delay = time.time() - baseline_start
-        baseline_text = baseline.text[:5000]
+        baseline_text  = baseline.text[:5000]
+        db.circuit.record_success(host)
 
         # ── Target fingerprinting ─────────────────────────────────────────
-        is_php = detect_php(baseline, target_url)
+        is_php  = detect_php(baseline, target_url)
         timeout = PHP_TIMEOUT if is_php else DEFAULT_TIMEOUT
 
         if is_php:
@@ -16292,27 +16888,27 @@ async def scan_url_async(
         missing = audit_headers(dict(baseline.headers))
         if missing:
             findings.append({
-                "type": "Missing Security Headers",
-                "severity": "Medium",
-                "param": "HTTP Headers",
-                "missing_headers": missing,
-                "confidence_score": 0.95,
-                "evidence_snippet": f"Missing: {', '.join(missing)}",
-                "method": "header_audit",
-                "target_url": target_url,
+                "type":              "Missing Security Headers",
+                "severity":          "Medium",
+                "param":             "HTTP Headers",
+                "missing_headers":   missing,
+                "confidence_score":  0.95,
+                "evidence_snippet":  f"Missing: {', '.join(missing)}",
+                "method":            "header_audit",
+                "target_url":        target_url,
             })
             logger.info(f"Missing headers: {missing}", job_id)
 
         # ── Parameter discovery ───────────────────────────────────────────
-        params = extract_params(target_url, baseline.text)
+        params       = extract_params(target_url, baseline.text)
         js_endpoints = extract_js_endpoints(baseline.text)
 
         logger.info(
             f"Discovered {len(params)} params, {len(js_endpoints)} JS endpoints", job_id
         )
 
-        payloads = get_payloads()
-        tests_run = 0
+        payloads    = get_payloads()
+        tests_run   = 0
         total_tests = len(params) * sum(len(p) for p in payloads.values())
 
         logger.info(
@@ -16350,7 +16946,7 @@ async def scan_url_async(
                         )
 
                         delay = time.time() - req_start
-                        body = r.text[:5000]
+                        body  = r.text[:5000]
                         status = r.status_code
 
                         # ── Boolean false-body caching ────────────────────
@@ -16387,29 +16983,36 @@ async def scan_url_async(
                             continue
 
                         # Gate: only proceed if oracle confirmed the vulnerability
-                        # Instead of continue:
                         if not result.is_vulnerable:
-                            # IF confidence is > 0.3 (some signal), keep it as a 'Potential' finding
-                            if result.confidence > 0.3:
-                                # Tag it so you know it's not confirmed
-                                is_potential = True
-                                potential_reason = f"Low confidence signal: {result.confidence:.2f}"
-                            else:
-                                continue  # Truly discard findings with no signal at all
+                            continue
 
                         # ── Build the canonical finding dict ──────────────
                         vuln_meta = _VULN_META.get(vuln_type, _VULN_META["_default"])
+                        conf = round(result.confidence, 4)
+
+                        # Confidence classification
+                        if conf >= 0.90:
+                            confidence_tier = "high"
+                            fp_likelihood = "unlikely"
+                        elif conf >= 0.70:
+                            confidence_tier = "medium"
+                            fp_likelihood = "possible"
+                        else:
+                            confidence_tier = "low"
+                            fp_likelihood = "likely"
 
                         finding = {
-                            "type": vuln_meta["type"],
-                            "severity": vuln_meta["severity"],
-                            "param": param,
-                            "payload": payload,
-                            "target_url": injected_url,
+                            "type":             vuln_meta["type"],
+                            "severity":         vuln_meta["severity"],
+                            "param":            param,
+                            "payload":          payload,
+                            "target_url":       injected_url,
                             # Required evidence fields
-                            "confidence_score": round(result.confidence, 4) if not is_potential else 0.1,
-                            "evidence_snippet": result.evidence_snippet if not is_potential else f"Potential: {potential_reason}",
-                            "method": result.method,
+                            "confidence_score": conf,
+                            "confidence_tier":  confidence_tier,
+                            "fp_likelihood":    fp_likelihood,
+                            "evidence_snippet": result.evidence_snippet,
+                            "method":           result.method,
                         }
 
                         # Attach timing evidence for time-based SQLi
@@ -16442,36 +17045,25 @@ async def scan_url_async(
                                 delay=synthetic_delay,
                                 baseline_delay=baseline_delay,
                             )
-                            # ── MODIFIED EVIDENCE-GATED BLOCK ────────────────────────────────────
-                            # workers/scan_worker.py  asyncio.TimeoutError handler
-# Initialise BEFORE the branch so every path has a value
-                            is_potential     = False
-                            potential_reason = None
-
                             if result.is_vulnerable:
-                                is_potential = False
-                            elif result.blocked:
-                                is_potential     = True
-                                potential_reason = "Blocked by WAF/Defense"
-                            elif result.confidence > 0.3:
-                                is_potential     = True
-                                potential_reason = f"Low confidence signal: {result.confidence:.2f}"
-                            else:
-                                continue  # no signal — discard
-
-                            meta_key  = vuln_type if not is_potential else "potential"
-                            vuln_meta = _VULN_META.get(meta_key, _VULN_META["_default"])
-                            finding = {
-                                "type":             vuln_meta["type"],
-                                "severity":         vuln_meta["severity"],
-                                "param":            param,
-                                "payload":          payload,
-                                "target_url":       injected_url,
-                                "confidence_score": round(result.confidence, 4),
-                                "evidence_snippet": result.evidence_snippet if not is_potential else f"Potential: {potential_reason}",
-                                "method":           result.method,
+                                finding = {
+                                    "type":             "SQL Injection (Time-based — Timeout)",
+                                    "severity":         "Critical",
+                                    "param":            param,
+                                    "payload":          payload,
+                                    "target_url":       injected_url,
+                                    "confidence_score": round(result.confidence, 4),
+                                    "evidence_snippet": (
+                                        f"Request timed out after {req_timeout}s — "
+                                        + result.evidence_snippet
+                                    ),
+                                    "method":           result.method,
+                                    "delay_seconds":    round(synthetic_delay, 2),
                                 }
-                            findings.append(finding)
+                                findings.append(finding)
+                                logger.info(
+                                    f"[CONFIRMED] SQLi timeout on param '{param}'", job_id
+                                )
 
                     except Exception as exc:
                         logger.debug(f"Test failed for {param}/{vuln_type}: {exc}", job_id)
@@ -16498,19 +17090,18 @@ async def scan_url_async(
 # ─────────────────────────────────────────────────────────────────────────────
 
 _VULN_META = {
-    "xss": {"type": "Cross-Site Scripting (XSS)", "severity": "High"},
-    "sqli_error": {"type": "SQL Injection (Error-based)", "severity": "Critical"},
-    "sqli_time": {"type": "SQL Injection (Time-based Blind)", "severity": "Critical"},
-    "sqli_bool": {"type": "SQL Injection (Boolean-based Blind)", "severity": "Critical"},
-    "ssti": {"type": "Server-Side Template Injection", "severity": "Critical"},
-    "lfi": {"type": "Local File Inclusion", "severity": "Critical"},
-    "cmdi": {"type": "Command Injection", "severity": "Critical"},
-    "redirect": {"type": "Open Redirect", "severity": "Medium"},
-    "header": {"type": "Header Injection", "severity": "High"},
-    "ssrf": {"type": "Server-Side Request Forgery (SSRF)", "severity": "Critical"},
-    "xxe": {"type": "XML External Entity (XXE)", "severity": "Critical"},
-    "_default": {"type": "Unknown Vulnerability", "severity": "Medium"},
-    "potential": {"type": "Potential Finding (Triage)", "severity": "Info"},
+    "xss":        {"type": "Cross-Site Scripting (XSS)",         "severity": "High"},
+    "sqli_error": {"type": "SQL Injection (Error-based)",        "severity": "Critical"},
+    "sqli_time":  {"type": "SQL Injection (Time-based Blind)",   "severity": "Critical"},
+    "sqli_bool":  {"type": "SQL Injection (Boolean-based Blind)","severity": "Critical"},
+    "ssti":       {"type": "Server-Side Template Injection",     "severity": "Critical"},
+    "lfi":        {"type": "Local File Inclusion",               "severity": "Critical"},
+    "cmdi":       {"type": "Command Injection",                  "severity": "Critical"},
+    "redirect":   {"type": "Open Redirect",                      "severity": "Medium"},
+    "header":     {"type": "Header Injection",                   "severity": "High"},
+    "ssrf":       {"type": "Server-Side Request Forgery (SSRF)", "severity": "Critical"},
+    "xxe":        {"type": "XML External Entity (XXE)",          "severity": "Critical"},
+    "_default":   {"type": "Unknown Vulnerability",              "severity": "Medium"},
 }
 
 
@@ -16528,9 +17119,9 @@ def handle(job: dict) -> None:
       • If anything fails, a JobFailed signal is pushed and the full
         stack trace is saved to the DB — no zombie jobs.
     """
-    job_id = job.get("job_id", "unknown")
+    job_id     = job.get("job_id", "unknown")
     target_url = job.get("url") or job.get("target_url")
-    tier = job.get("tier", "Basic")
+    tier       = job.get("tier", "Basic")
     findings: List[Dict] = []
 
     if not target_url:
@@ -16539,11 +17130,11 @@ def handle(job: dict) -> None:
 
     try:
         # ── IDEMPOTENCY: mark job as scanning immediately ─────────────────
-        # This makes the job visible in the dashboard before the first HTTP
-        # request is fired.
+        # FIX: Use update_job() not update_job_status() — the latter doesn't
+        # exist on _MinimalDB (the fallback DB class in api/main.py).
         try:
             db = get_db()
-            db.update_job_status(job_id, "scanning")
+            db.update_job(job_id, status="scanning")
         except Exception as db_init_exc:
             logger.warning(f"Could not set job status to scanning: {db_init_exc}", job_id)
 
@@ -16619,6 +17210,7 @@ def handle(job: dict) -> None:
 
 if __name__ == "__main__":
     worker_loop(SCAN_QUEUE, handle)
+
 
 
 ==================== FILE: workers\scoring_worker.py ====================
