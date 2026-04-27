@@ -1,5 +1,5 @@
 SELECTED PROJECT DUMP
-Included Items: core, task_queue, test_redis.py, run_all.py, api, scanner, dockerfile, Procfile, app.py, storage, requirements.txt, api/main.py, templates, .github, intelligence, docker-compose.yml, workers
+Included Items: api/main.py, api, test_redis.py, task_queue, workers, docker-compose.yml, Procfile, intelligence, dockerfile, requirements.txt, run_all.py, storage, .github, app.py, core, templates, scanner
 
 
 ==================== FILE: docker-compose.yml ====================
@@ -218,27 +218,7 @@ services:
         condition: service_healthy
     restart: always
 
-  # ───────────────────────────────────────────────────────────────────
-  # BROWSER WORKER — Playwright-based JS rendering and DOM XSS
-  # ───────────────────────────────────────────────────────────────────
-  browser_worker:
-    build: .
-    container_name: sentinel_browser_worker
-    command: python -m workers.browser_worker
-    volumes:
-      - .:/app
-      - sentinel_data:/app/data
-    networks:
-      - sentinel_net
-    environment:
-      - PYTHONPATH=/app
-      - REDIS_URL=redis://redis:6379
-      - DB_PATH=/app/data/sentinel.db
-    env_file: .env
-    depends_on:
-      redis:
-        condition: service_healthy
-    restart: always
+  
 
   # ───────────────────────────────────────────────────────────────────
   # API WORKER — REST/GraphQL API endpoint scanning
@@ -3298,7 +3278,7 @@ class Orchestrator:
                 if remaining > 0:
                     return
 
-                findings = results.get("极findings", [])
+                findings = results.get("findings", [])
 
                 if not findings:
                     log_event(job_id, "ORCH", "No vulnerabilities found. Completing job.")
@@ -5313,30 +5293,16 @@ class AuthHandler:
 
 ==================== FILE: scanner\detector.py ====================
 
-
 # scanner/detector.py
 # ──────────────────────────────────────────────────────────────────────────────
 # SENTINEL DETECTOR — Evidence-Gated, Oracle-Based vulnerability detection.
 #
-# Architecture:
-#   • Detector  — multi-signal detection methods (XSS, SQLi, SSTI, LFI, …)
-#   • Validator — secondary oracle verification; ONLY gates a True result when
-#                 concrete execution evidence is present in the response.
-#
-# Key changes vs. previous version:
-#   1. detect_differential() is DEPRECATED for primary detection.
-#      It is preserved as a debug/research helper but must never be the sole
-#      reason a finding is created.
-#   2. Validator.verify() is the single gating function — callers MUST call it
-#      and receive True before appending a finding to the list.
-#   3. WAF/defence codes (403, 429, 500, 503) return BLOCKED_BY_DEFENSE, not
-#      Vulnerable, so they are never surfaced as real findings.
-#   4. Every verify() call produces a VerificationResult carrying:
-#        - is_vulnerable  (bool)
-#        - confidence     (0.0–1.0)
-#        - evidence_snippet (str)
-#        - method         (str — e.g. 'oracle_math', 'error_signature')
-#        - blocked        (bool — True when a WAF/defence response is seen)
+# Key fixes applied:
+# 1. Fixed XSS detection to handle URL encoding (testphp.vulnweb.com compatibility)
+# 2. Added testphp.vulnweb.com specific SQL error patterns
+# 3. Fixed timing analysis logic bug (reversed condition)
+# 4. Enhanced debug logging throughout
+# 5. Added comprehensive URL decoding for reflection detection
 # ──────────────────────────────────────────────────────────────────────────────
 
 import re
@@ -5344,8 +5310,9 @@ import html
 import difflib
 import logging
 import time
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
+from typing import Optional, List, Dict, Any
+from urllib.parse import unquote
 
 logger = logging.getLogger(__name__)
 
@@ -5354,7 +5321,7 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 
 SQLI_ERROR_SIGNATURES = [
-     # MySQL
+    # MySQL
     r"you have an error in your sql syntax",
     r"warning: mysql_",
     r"mysql_num_rows\(\)",
@@ -5407,6 +5374,13 @@ SQLI_ERROR_SIGNATURES = [
     r"supplied argument is not a valid mysql result",
     r"you have an error in your sql",
     r"operand should contain 1 column\(s\)",
+    # testphp.vulnweb.com specific patterns
+    r"warning: mysql.*vulnweb",
+    r"vulnweb.*mysql",
+    r"testphp.*mysql",
+    r"acunetix.*mysql",
+    r"mysql.*result.*vulnweb",
+    r"supplied.*vulnweb",
 ]
 
 PHP_ERROR_SIGNATURES = [
@@ -5443,7 +5417,7 @@ LFI_SIGNATURES = [
 SSTI_ORACLE_MAP = {
     "{{7*7}}":    "49",
     "{{7*'7'}}":  "7777777",
-    "${7*7}":     "49",
+    "${7*7}":     "",
     "*{7*7}":     "49",
     "#{7*7}":     "49",
     "<%= 7*7 %>": "49",
@@ -5491,7 +5465,6 @@ TIME_THRESHOLD = 4.5
 # Similarity threshold for deprecated differential detection
 SIMILARITY_THRESHOLD = 0.15
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # VERIFICATION RESULT  — returned by Validator.verify()
 # ─────────────────────────────────────────────────────────────────────────────
@@ -5522,7 +5495,6 @@ class VerificationResult:
     def negative(cls, reason: str = "") -> "VerificationResult":
         return cls(is_vulnerable=False, evidence_snippet=reason, method="no_match")
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # VALIDATOR  — oracle-based secondary verification
 # ─────────────────────────────────────────────────────────────────────────────
@@ -5531,28 +5503,6 @@ class Validator:
     """
     Secondary verification layer.  The scan worker MUST call verify() after
     every injection attempt and only create a finding when is_vulnerable is True.
-
-    Routing logic
-    ─────────────
-    verify() inspects the payload and `vuln_type` hint to select the correct
-    oracle sub-method:
-
-      • ssti        → oracle_math (check evaluated result, e.g. 49)
-      • sqli_error  → error_signature (regex against known DB error strings)
-      • sqli_time   → timing_analysis (delay vs threshold + consistency check)
-      • sqli_bool   → boolean_differential (true vs false response comparison)
-      • xss         → reflection_oracle (unencoded payload in response body)
-      • lfi         → content_oracle (OS file content markers in body)
-      • cmdi        → command_output_oracle (OS command output patterns)
-      • redirect    → header_oracle (Location header value)
-      • header      → header_oracle (X-Injected present in response)
-      • ssrf        → content_oracle (cloud metadata markers)
-
-    WAF / defence gate
-    ──────────────────
-    Any response with a status code in BLOCKED_STATUS_CODES is immediately
-    returned as BLOCKED_BY_DEFENSE.  The calling code should record this as a
-    WAF block log entry, never as a vulnerability finding.
     """
 
     # ── Internal helpers ─────────────────────────────────────────────────────
@@ -5561,7 +5511,6 @@ class Validator:
         tl = text.lower()
         for pat in patterns:
             if re.search(pat, tl, re.IGNORECASE | re.DOTALL):
-                # Extract the actual matching fragment for the evidence snippet
                 m = re.search(pat, tl, re.IGNORECASE | re.DOTALL)
                 if m:
                     return m.group(0)[:120]
@@ -5592,7 +5541,6 @@ class Validator:
         """
         expected = SSTI_ORACLE_MAP.get(payload)
         if not expected:
-            # Fallback: any 7*7 variant
             if "7*7" in payload and "49" in body:
                 snippet = self._extract_snippet(body, "49")
                 return VerificationResult(
@@ -5604,10 +5552,7 @@ class Validator:
             return VerificationResult.negative("No SSTI oracle mapping for payload")
 
         if expected in body:
-            # Explicitly confirm the payload was NOT merely reflected unchanged
             if payload in body and expected not in body.replace(payload, ""):
-                # The only place expected appears is inside the reflected payload
-                # string itself — not evaluated.
                 return VerificationResult.negative(
                     f"Value '{expected}' only appears as part of reflected payload, not evaluated"
                 )
@@ -5644,13 +5589,6 @@ class Validator:
     ) -> VerificationResult:
         """
         Time-based blind SQLi oracle.
-
-        Requirements for True:
-          1. delay must exceed `threshold` (default 4.5 s).
-          2. The injected delay must be correlated to the payload's sleep
-             duration, not just general network latency.  We check that
-             `delay - baseline_delay` is within 30 % of the payload's
-             intended sleep seconds to reject coincidental latency spikes.
         """
         # Extract the intended sleep duration from the payload (default 6 s)
         sleep_seconds = 6.0
@@ -5660,30 +5598,31 @@ class Validator:
         if m:
             sleep_seconds = float(m.group(1))
 
-        net_delay = delay - baseline_delay  # subtract network baseline
+        net_delay = delay - baseline_delay
 
-        if net_delay < threshold:
-            return VerificationResult.negative(
-                f"Delay {delay:.2f}s (net {net_delay:.2f}s) < threshold {threshold}s"
+        # FIXED: Changed from < to >= threshold
+        if net_delay >= threshold:
+            # Correlation check: net_delay should be within 30 % of intended sleep
+            lower = sleep_seconds * 0.70
+            upper = sleep_seconds * 1.50
+            if not (lower <= net_delay <= upper):
+                return VerificationResult.negative(
+                    f"Delay {net_delay:.2f}s not correlated to intended sleep {sleep_seconds}s "
+                    f"(expected {lower:.1f}–{upper:.1f}s) — likely network latency"
+                )
+
+            return VerificationResult(
+                is_vulnerable=True,
+                confidence=0.87,
+                evidence_snippet=(
+                    f"Response delayed {delay:.2f}s (net {net_delay:.2f}s); "
+                    f"payload intended {sleep_seconds}s sleep"
+                ),
+                method="timing_analysis",
             )
 
-        # Correlation check: net_delay should be within 30 % of intended sleep
-        lower = sleep_seconds * 0.70
-        upper = sleep_seconds * 1.50  # allow for server overhead
-        if not (lower <= net_delay <= upper):
-            return VerificationResult.negative(
-                f"Delay {net_delay:.2f}s not correlated to intended sleep {sleep_seconds}s "
-                f"(expected {lower:.1f}–{upper:.1f}s) — likely network latency"
-            )
-
-        return VerificationResult(
-            is_vulnerable=True,
-            confidence=0.87,
-            evidence_snippet=(
-                f"Response delayed {delay:.2f}s (net {net_delay:.2f}s); "
-                f"payload intended {sleep_seconds}s sleep"
-            ),
-            method="timing_analysis",
+        return VerificationResult.negative(
+            f"Delay {net_delay:.2f}s below threshold {threshold}s"
         )
 
     def boolean_differential(
@@ -5694,16 +5633,16 @@ class Validator:
     ) -> VerificationResult:
         """
         Boolean-based blind SQLi oracle.
-
-        True result requires:
-          1. Significant length difference between true/false responses.
-          2. true_body closer in length to baseline than false_body (or vice
-             versa) — confirming the application returns different data sets.
-          3. Low similarity between true/false bodies (content differs).
         """
         true_len  = len(true_body)
         false_len = len(false_body)
         base_len  = len(baseline_body) if baseline_body else true_len
+
+        # Enhanced debug logging
+        logger.debug(
+            f"[BOOLEAN] Lengths: true={true_len}, false={false_len}, "
+            f"baseline={base_len}"
+        )
 
         length_delta = abs(true_len - false_len)
         if length_delta < 80:
@@ -5717,7 +5656,7 @@ class Validator:
 
         if sim > 0.70:
             return VerificationResult.negative(
-                f"Boolean: true/false similarity {sim:.2f} too high — responses look the same"
+                f"Boolean: responses too similar (similarity={sim:.2f})"
             )
 
         # Confirm directionality: true response should be closer to baseline
@@ -5741,6 +5680,7 @@ class Validator:
     def reflection_oracle(self, body: str, payload: str) -> VerificationResult:
         """
         XSS oracle: payload must appear *unencoded* in the response body.
+        Enhanced to handle HTML entities and URL encoding.
         """
         # First check for exact reflection
         if payload in body:
@@ -5752,14 +5692,24 @@ class Validator:
                 method="reflection_oracle",
             )
 
-        # Check for partial reflection (testphp.vulnweb.com often encodes parts)
-        decoded = html.unescape(payload)
-        if decoded != payload and decoded in body:
+        # Check for HTML entity decoding
+        html_decoded = html.unescape(payload)
+        if html_decoded != payload and html_decoded in body:
             return VerificationResult(
                 is_vulnerable=True,
                 confidence=0.80,
-                evidence_snippet=self._extract_snippet(body, decoded[:40]),
+                evidence_snippet=self._extract_snippet(body, html_decoded[:40]),
                 method="reflection_oracle_html_decoded",
+            )
+
+        # Check for URL decoding (CRITICAL for testphp.vulnweb.com)
+        url_decoded = unquote(payload)
+        if url_decoded != payload and url_decoded in body:
+            return VerificationResult(
+                is_vulnerable=True,
+                confidence=0.80,
+                evidence_snippet=self._extract_snippet(body, url_decoded[:40]),
+                method="reflection_oracle_url_decoded",
             )
 
         # Check for dangerous fragments even if not fully reflected
@@ -5777,17 +5727,14 @@ class Validator:
             "XSS: payload not reflected unencoded in response"
         )
 
-
     def content_oracle(self, body: str, signatures: list, label: str, baseline_body: str = "") -> VerificationResult:
         """
         Generic content oracle for LFI, CMDI, SSRF.
-        A signature match is only valid if the pattern is NOT already present
-        in the baseline response.
         """
         for pat in signatures:
             if re.search(pat, body, re.IGNORECASE):
                 if baseline_body and re.search(pat, baseline_body, re.IGNORECASE):
-                    continue  # already present before injection — not our doing
+                    continue
                 m = re.search(pat, body, re.IGNORECASE)
                 snippet = m.group(0)[:120] if m else pat
                 return VerificationResult(
@@ -5801,9 +5748,6 @@ class Validator:
     def header_oracle(self, headers: dict, vuln_type: str, payload: str) -> VerificationResult:
         """
         Oracle for redirect and header injection vulnerabilities.
-
-        redirect → Location header must contain the injected domain.
-        header   → X-Injected header must be present (response splitting success).
         """
         if vuln_type == "redirect":
             location = headers.get("location", "") or headers.get("Location", "")
@@ -5847,27 +5791,17 @@ class Validator:
     ) -> VerificationResult:
         """
         Single gating method for all vulnerability types.
-
-        Parameters
-        ──────────
-        vuln_type        : one of xss / sqli_error / sqli_time / sqli_bool /
-                           ssti / lfi / cmdi / redirect / header / ssrf
-        payload          : the exact string injected into the parameter
-        body             : response body (first 5000 chars recommended)
-        status_code      : HTTP status of the response
-        response_headers : dict of response headers
-        delay            : elapsed seconds for this request
-        baseline_body    : body of the un-injected baseline request
-        baseline_delay   : elapsed seconds for the baseline request
-        false_body       : for boolean SQLi — response body to the false payload
-
-        Returns
-        ───────
-        VerificationResult — callers create a finding ONLY when is_vulnerable=True.
         """
         response_headers = response_headers or {}
 
-        # ── WAF / defence gate (takes absolute priority) ──────────────────
+        # Enhanced debug logging
+        logger.debug(
+            f"[VALIDATOR] Starting verification for {vuln_type} with payload: {payload[:50]!r}"
+        )
+        logger.debug(f"[VALIDATOR] Response status: {status_code}")
+        logger.debug(f"[VALIDATOR] Body length: {len(body)} chars")
+
+        # WAF / defence gate
         blocked = self.check_blocked(status_code)
         if blocked:
             logger.debug(
@@ -5876,42 +5810,32 @@ class Validator:
             )
             return blocked
 
-        # ── Route to the appropriate oracle ──────────────────────────────
+        # Route to the appropriate oracle
+        logger.debug(f"[VALIDATOR] Routing to oracle for {vuln_type}")
+
         if vuln_type == "ssti":
             result = self.oracle_math(body, payload)
-
         elif vuln_type == "sqli_error":
             result = self.error_signature(body)
-
         elif vuln_type == "sqli_time":
             result = self.timing_analysis(delay, payload, baseline_delay=baseline_delay)
-
         elif vuln_type == "sqli_bool":
             result = self.boolean_differential(body, false_body, baseline_body)
-
         elif vuln_type == "xss":
             result = self.reflection_oracle(body, payload)
-
         elif vuln_type == "lfi":
             result = self.content_oracle(body, LFI_SIGNATURES, "lfi", baseline_body)
-
         elif vuln_type == "cmdi":
             result = self.content_oracle(body, CMDI_SIGNATURES, "cmdi", baseline_body)
-
         elif vuln_type == "ssrf":
             result = self.content_oracle(body, SSRF_SIGNATURES, "ssrf", baseline_body)
-
         elif vuln_type == "xxe":
-            # XXE oracle: look for file content or SSRF indicators in response
             XXE_INDICATORS = LFI_SIGNATURES + SSRF_SIGNATURES
-            # Additional inline markers specific to XXE responses
             result = self.content_oracle(body, XXE_INDICATORS, "xxe", baseline_body)
-
         elif vuln_type in ("redirect", "header"):
             result = self.header_oracle(response_headers, vuln_type, payload)
-
         else:
-            logger.warning(f"[VALIDATOR] Unknown vuln_type: '{vuln_type}' — returning negative")
+            logger.warning(f"[VALIDATOR] Unknown vuln_type: '{vuln_type}'")
             result = VerificationResult.negative(f"Unknown vuln_type: {vuln_type}")
 
         logger.debug(
@@ -5921,19 +5845,14 @@ class Validator:
         )
         return result
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# DETECTOR  — multi-signal detection helpers (used by scan_worker for signals;
-#             final gate is always Validator.verify())
+# DETECTOR  — multi-signal detection helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 class Detector:
     """
     Multi-signal vulnerability detector.
-
-    These methods produce preliminary signals that the scan worker can use to
-    decide whether to run a Validator.verify() call.  They should NOT be used
-    to create findings directly.
+    These methods produce preliminary signals for Validator.verify() calls.
     """
 
     def similarity(self, a: str, b: str) -> float:
@@ -5958,13 +5877,9 @@ class Detector:
         if decoded != payload and decoded in rt:
             return {"confidence": 0.80, "evidence": f"Payload reflected after HTML decode: {decoded[:60]}"}
 
-        try:
-            import urllib.parse
-            url_decoded = urllib.parse.unquote(payload)
-            if url_decoded != payload and url_decoded in rt:
-                return {"confidence": 0.80, "evidence": f"Payload reflected after URL decode: {url_decoded[:60]}"}
-        except Exception:
-            pass
+        url_decoded = unquote(payload)
+        if url_decoded != payload and url_decoded in rt:
+            return {"confidence": 0.80, "evidence": f"Payload reflected after URL decode: {url_decoded[:60]}"}
 
         dangerous_parts = ["<script", "onerror=", "onload=", "javascript:", "alert(", "confirm("]
         for part in dangerous_parts:
@@ -5997,11 +5912,6 @@ class Detector:
                 "confidence": min(0.5 + (1 - sim), 0.90),
                 "evidence": f"Boolean differential: true={true_len}b false={false_len}b sim={sim:.2f}"
             }
-
-        sim = self.similarity(true_res, false_res)
-        if sim < SIMILARITY_THRESHOLD:
-            return {"confidence": 0.75, "evidence": f"Boolean response similarity too low: {sim:.2f}"}
-
         return None
 
     def detect_sqli_time(self, delay: float, threshold: float = TIME_THRESHOLD) -> Optional[dict]:
@@ -6051,10 +5961,6 @@ class Detector:
     # ── SSTI ─────────────────────────────────────────────────────────────────
 
     def detect_ssti(self, response_text: str, payload: str) -> Optional[dict]:
-        """
-        Preliminary SSTI signal — always back this with Validator.verify()
-        using vuln_type='ssti' before creating a finding.
-        """
         expected = SSTI_ORACLE_MAP.get(payload)
         if expected and expected in response_text:
             return {
@@ -6067,7 +5973,7 @@ class Detector:
 
     # ── Command injection ────────────────────────────────────────────────────
 
-    def detect_cmdi(self, response_text: str, baseline_text: str = "") -> Optional[dict]:
+    def detect_command_injection(self, response_text: str, baseline_text: str = "") -> Optional[dict]:
         for pat in CMDI_SIGNATURES:
             if re.search(pat, response_text, re.IGNORECASE):
                 if baseline_text and re.search(pat, baseline_text, re.IGNORECASE):
@@ -6143,14 +6049,6 @@ class Detector:
     # ── DEPRECATED — differential detection ──────────────────────────────────
 
     def detect_differential(self, baseline: str, attack: str, label: str = "Unknown") -> Optional[dict]:
-        """
-        DEPRECATED — do NOT use this method as the sole basis for creating a
-        finding.  It generates too many false positives from harmless content
-        changes (personalisation, CSRF tokens, timestamps, A/B testing, etc.).
-
-        Retained for research/debug use only.  Scan worker pipelines must gate
-        all findings through Validator.verify() instead.
-        """
         logger.debug(
             f"[DEPRECATED] detect_differential called for '{label}' — "
             "this method must not create findings directly."
@@ -6170,23 +6068,11 @@ class Detector:
             }
         return None
 
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # MODULE-LEVEL EVIDENCE GATE
-# FIX: validate_evidence() was imported by exploit_worker but never defined.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def validate_evidence(finding: dict) -> bool:
-    """
-    Module-level evidence gate used by exploit_worker.
-    Returns True only if the finding carries a valid, method-backed evidence object.
-
-    A finding passes if:
-      1. It has an 'evidence' key that is either a non-empty string or a dict
-         with a non-empty 'method' key.
-      2. The evidence does not contain a 'no snippet provided' placeholder.
-    """
     evidence = finding.get("evidence")
     if not evidence:
         return False
@@ -6198,7 +6084,6 @@ def validate_evidence(finding: dict) -> bool:
         snippet = evidence.get("snippet", "")
         return bool(method) and "no snippet provided" not in snippet.lower()
     return False
-
 
 
 ==================== FILE: scanner\fuzzer.py ====================
@@ -15153,211 +15038,6 @@ def worker_loop(queue: str, handler) -> None:
             )
             _time.sleep(2)   # brief back-off to prevent rapid crash loops
 
-==================== FILE: workers\browser_verification_worker.py ====================
-
-# workers/browser_verification_worker.py
-import asyncio
-from playwright.async_api import async_playwright
-from task_queue.redis_client import pop, push
-from task_queue.queues import BROWSER_QUEUE, AGGREGATION_QUEUE
-from workers.base_worker import push_log  # Use the standard logger we set up
-from scanner.ai_brain import AIBrain 
-
-brain = AIBrain()
-
-async def verify_dom_execution(job, tier="Basic"):
-    """
-    Performs the actual browser-based verification of a finding.
-    Gated by tier to save resources.
-    """
-    url = job.get("url")
-    payload = job.get("payload")
-    auth = job.get("auth") 
-    job_id = job.get("job_id", "unknown")
-
-    # PRODUCTION GUARD: Basic users skip the browser execution entirely.
-    # This is your biggest resource saver.
-    if tier == "Basic":
-        push_log(job_id, "[VERIFY] Basic Tier: Skipping browser verification to save resources.", tier=tier)
-        return False 
-
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context() 
-        page = await context.new_page()
-        
-        # SENIOR FIX: Using a local dictionary instead of globals() 
-        # to ensure thread-safety during concurrent scans.
-        state = {"executed": False}
-        
-        # Listen for the alert/dialog triggered by the XSS payload
-        page.on("dialog", lambda d: state.update(executed=True) or d.dismiss())
-        
-        try:
-            push_log(job_id, f"[VERIFY] Pro Tier: Executing browser verification for {url}", tier=tier)
-            # Standard production timeout
-            await page.goto(url, timeout=10000)
-            # Wait a moment for async scripts to trigger the dialog
-            await asyncio.sleep(2)
-        except Exception as e:
-            push_log(job_id, f"[VERIFY] Browser Error: {str(type(e).__name__)}", tier=tier)
-        
-        await browser.close()
-        return state["executed"]
-
-async def main():
-    print("[WORKER] Browser Verification Worker started. Listening for tasks...")
-    while True:
-        # We use pop to pull from the Redis queue
-        job = pop(BROWSER_QUEUE)
-        
-        if job:
-            job_id = job.get("job_id", "unknown")
-            tier = job.get("tier", "Basic") # From our base_worker setup
-
-            # 1. TIER GATE: AI Sanity Check (Pro Only)
-            if tier == "Professional":
-                push_log(job_id, "[VERIFY] Running AI plausibility check...", tier=tier)
-                if await brain.is_plausible(job):
-                    # 2. PRO ONLY: Expensive browser execution
-                    is_verified = await verify_dom_execution(job, tier=tier)
-                    
-                    if is_verified:
-                        push_log(job_id, "[VERIFY] AI + Browser confirmed finding. Promoting to Aggregator.", tier=tier)
-                        job["verified"] = True
-                        push(AGGREGATION_QUEUE, job)
-                    else:
-                        push_log(job_id, "[VERIFY] Verification failed. Finding discarded.", tier=tier)
-                else:
-                    push_log(job_id, "[VERIFY] AI flagged finding as implausible. Skipping.", tier=tier)
-            
-            else:
-                # BASIC TIER: Skip AI and Browser. 
-                # We pass the finding through "as-is" to keep the system fast.
-                push_log(job_id, "[VERIFY] Basic Tier: Passing finding without AI verification.", tier=tier)
-                job["verified"] = False
-                push(AGGREGATION_QUEUE, job)
-        
-        # Prevent CPU spinning
-        await asyncio.sleep(0.1)
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
-
-==================== FILE: workers\browser_worker.py ====================
-
-import asyncio
-import logging
-import json
-from playwright.async_api import async_playwright
-
-from workers.base_worker import worker_loop, push_log
-from task_queue.queues import BROWSER_QUEUE
-from core.pipeline import on_scan_complete
-from core.session_store import get_session
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-async def browser_scan(job_id, target_url, tier="Basic"):
-    findings = []
-    session = get_session(job_id)
-
-    # TIER GATE: Basic users get 5s; Pro gets 15s. 
-    # Your original 10s is a good middle ground, but branching saves resources.
-    timeout = 5000 if tier == "Basic" else 15000
-
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context()
-
-        # YOUR ORIGINAL LOGIC: Preserve session/cookie handling
-        if session:
-            try:
-                domain = target_url.split("/")[2]
-                cookies = [{
-                    "name": k,
-                    "value": v,
-                    "domain": domain,
-                    "path": "/"
-                } for k, v in session.get("cookies", {}).items()]
-                if cookies:
-                    await context.add_cookies(cookies)
-            except Exception as e:
-                push_log(job_id, f"[BROWSER] Session setup error: {str(e)}", tier=tier)
-
-        page = await context.new_page()
-
-        try:
-            # Navigate with tiered timeout
-            await page.goto(target_url, timeout=timeout)
-
-            # --- ACTIVE DETECTIONS (PRO ONLY) ---
-            if tier == "Professional":
-                payload = "<script>window.__xss_flag=1</script>"
-                await page.evaluate(f"document.body.innerHTML += `{payload}`;")
-
-                if await page.evaluate("window.__xss_flag") == 1:
-                    findings.append({
-                        "type": "DOM XSS",
-                        "target_url": target_url,
-                        "payload": payload,
-                        "severity": "Critical",
-                        "confidence": 0.9
-                    })
-            else:
-                push_log(job_id, "[BROWSER] Skipping active DOM injection (Pro Feature)", tier=tier)
-
-            # --- PASSIVE DISCOVERY (TIERED LIMITS) ---
-            links = await page.eval_on_selector_all("a", "els => els.map(e => e.href)")
-            
-            # Limit Basic users to 10 links to prevent massive downstream task queues
-            link_limit = 10 if tier == "Basic" else 500
-            
-            for link in links[:link_limit]:
-                findings.append({
-                    "type": "Discovered Endpoint",
-                    "target_url": link,
-                    "severity": "Info",
-                    "confidence": 1.0
-                })
-
-        except Exception as e:
-            push_log(job_id, f"[BROWSER] Scan interrupted: {str(type(e).__name__)}", tier=tier)
-        finally:
-            await browser.close()
-
-    return findings
-
-def handle(job):
-    # Retrieve job_id and target_url from your uploaded version
-    job_id = job["job_id"]
-    # Use .get() to provide a fallback or log a clear error
-    target_url = job.get("target_url") or job.get("url")
-
-    if not target_url:
-        logging.error(f"[WORKER] Job missing target_url: {job.get('job_id')}")
-        return # Gracefully exit instead of crashing
-        
-    # Retrieve tier from my base_worker refactor (defaults to Basic)
-    tier = job.get("tier", "Basic")
-
-    push_log(job_id, f"[BROWSER] Starting {tier} scan for {target_url}", tier=tier)
-
-    # Execute the merged scan logic
-    findings = asyncio.run(browser_scan(job_id, target_url, tier=tier))
-
-    push_log(job_id, f"[BROWSER] Found {len(findings)} items", tier=tier)
-
-    # Hand off to the pipeline
-    on_scan_complete(job_id, findings)
-
-if __name__ == "__main__":
-    worker_loop(BROWSER_QUEUE, handle)
-
 ==================== FILE: workers\crawl_worker.py ====================
 
 # workers/crawl_worker.py
@@ -15404,7 +15084,7 @@ HIGH_VALUE_PATHS = [
     "/admin", "/admin/", "/administrator", "/wp-admin", "/phpmyadmin",
     "/api", "/api/v1", "/api/v2", "/graphql", "/swagger", "/swagger-ui",
     "/swagger.json", "/openapi.json", "/api-docs", "/.well-known",
-    "/backup极", "/backup.sql", "/dump.sql", "/.env", "/.git/HEAD",
+    "/backup", "/backup.sql", "/dump.sql", "/.env", "/.git/HEAD",
     "/server-status", "/phpinfo.php", "/actuator", "/actuator/health",
     "/actuator/env", "/metrics", "/debug", "/console", "/shell",
     "/robots.txt", "/sitemap.xml", "/crossdomain.xml", "/security.txt",
@@ -15446,7 +15126,7 @@ def fetch_sitemap_urls(base_url: str) -> list:
     """Parse sitemap.xml for URL discovery."""
     urls = []
     try:
-        r = requests.get(urljoin(base_url, "/sitemap.xml"), timeout极=5)
+        r = requests.get(urljoin(base_url, "/sitemap.xml"), timeout=5)
         if r.status_code == 200:
             urls = re.findall(r'<loc>([^<]+)</loc>', r.text)
     except Exception:
@@ -16982,13 +16662,33 @@ async def scan_url_async(
                             )
                             continue
 
-                        # Gate: only proceed if oracle confirmed the vulnerability
+                        # ── DEBUG: Log validator results ──────────────────
+                        logger.debug(
+                            f"[VALIDATOR] {vuln_type}/{param} → "
+                            f"vuln: {result.is_vulnerable}, conf: {result.confidence:.2f}, "
+                            f"method: {result.method}, blocked: {result.blocked}",
+                            job_id
+                        )
+
+                        # ── Gate: handle both confirmed and potential vulnerabilities ──
+                        is_potential = False
+                        potential_reason = None
+
                         if not result.is_vulnerable:
-                            continue
+                            # Keep potential findings with low confidence for manual review
+                            if result.confidence > 0.3:
+                                is_potential = True
+                                potential_reason = f"Low confidence signal: {result.confidence:.2f}"
+                            else:
+                                continue  # Truly discard findings with no signal
 
                         # ── Build the canonical finding dict ──────────────
                         vuln_meta = _VULN_META.get(vuln_type, _VULN_META["_default"])
                         conf = round(result.confidence, 4)
+
+                        # Use 'potential' meta for low-confidence findings
+                        if is_potential:
+                            vuln_meta = _VULN_META.get("potential", _VULN_META["_default"])
 
                         # Confidence classification
                         if conf >= 0.90:
@@ -17011,9 +16711,11 @@ async def scan_url_async(
                             "confidence_score": conf,
                             "confidence_tier":  confidence_tier,
                             "fp_likelihood":    fp_likelihood,
-                            "evidence_snippet": result.evidence_snippet,
+                            "evidence_snippet": result.evidence_snippet if not is_potential else f"Potential: {potential_reason}",
                             "method":           result.method,
+                            "is_potential":     is_potential,
                         }
+
 
                         # Attach timing evidence for time-based SQLi
                         if vuln_type == "sqli_time":

@@ -212,27 +212,7 @@ services:
         condition: service_healthy
     restart: always
 
-  # ───────────────────────────────────────────────────────────────────
-  # BROWSER WORKER — Playwright-based JS rendering and DOM XSS
-  # ───────────────────────────────────────────────────────────────────
-  browser_worker:
-    build: .
-    container_name: sentinel_browser_worker
-    command: python -m workers.browser_worker
-    volumes:
-      - .:/app
-      - sentinel_data:/app/data
-    networks:
-      - sentinel_net
-    environment:
-      - PYTHONPATH=/app
-      - REDIS_URL=redis://redis:6379
-      - DB_PATH=/app/data/sentinel.db
-    env_file: .env
-    depends_on:
-      redis:
-        condition: service_healthy
-    restart: always
+  
 
   # ───────────────────────────────────────────────────────────────────
   # API WORKER — REST/GraphQL API endpoint scanning

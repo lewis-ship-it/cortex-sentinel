@@ -34,3 +34,4 @@ class ReportBuilder:
 
         doc.build(elements)
 
+

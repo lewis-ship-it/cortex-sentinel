@@ -1,3 +1,4 @@
+
 # core/session_store.py
 
 import redis
@@ -19,3 +20,4 @@ def get_session(job_id):
 
 def delete_session(job_id):
     r.delete(f"session:{job_id}")
+

@@ -1,3 +1,4 @@
+
 # workers/aggregation_worker.py
 
 import json
@@ -48,3 +49,4 @@ def handle(job):
 
 if __name__ == "__main__":
     worker_loop(AGGREGATION_QUEUE, handle)
+

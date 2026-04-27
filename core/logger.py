@@ -1,3 +1,4 @@
+
 """
 core/logger.py
 
@@ -212,3 +213,4 @@ def get_logger(component: str = "sentinel") -> SystemLogger:
     if component not in _loggers:
         _loggers[component] = SystemLogger(component=component)
     return _loggers[component]
+

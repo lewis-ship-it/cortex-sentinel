@@ -1,3 +1,4 @@
+
 # api/auth.py
 # ──────────────────────────────────────────────────────────────────────────────
 # FIXES vs previous version:
@@ -80,4 +81,6 @@ def login(req: LoginRequest):
         "api_key": user["api_key"],
         "user_id": user["id"]
     }
+
+
 

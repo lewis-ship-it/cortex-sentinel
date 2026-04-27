@@ -1,3 +1,4 @@
+
 # scanner/dast/json_mutator.py
 import copy
 
@@ -36,3 +37,4 @@ def get_json_paths(data, current_path=None):
             yield from get_json_paths(v, current_path + [i])
     else:
         yield current_path
+

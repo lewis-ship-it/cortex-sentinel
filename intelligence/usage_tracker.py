@@ -1,3 +1,4 @@
+
 import time
 import logging
 
@@ -53,3 +54,4 @@ class UsageTracker:
         # Added a safety check in case is_active was never flipped
         self.stats["budget_tripped"] = not self.is_active
         return self.stats
+

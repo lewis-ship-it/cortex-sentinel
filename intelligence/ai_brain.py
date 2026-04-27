@@ -1,3 +1,4 @@
+
 # intelligence/ai_brain.py
 # ──────────────────────────────────────────────────────────────────────────────
 # INTELLIGENCE AI BRAIN — Ollama/qwen2.5-coder only. No external provider.
@@ -79,3 +80,4 @@ Return ONLY JSON:
 """
         text = await _call_ollama(prompt)
         return _extract_json(text)
+

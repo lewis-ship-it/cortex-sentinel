@@ -1,3 +1,4 @@
+
 # workers/scoring_worker.py
 # ──────────────────────────────────────────────────────────────────────────────
 # FIXES vs previous version:
@@ -106,3 +107,4 @@ def handle(job):
 
 if __name__ == "__main__":
     worker_loop(SCORING_QUEUE, handle)
+

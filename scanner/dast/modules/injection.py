@@ -3,14 +3,6 @@
 # AGGRESSIVE INJECTION MODULE — Multi-strategy, multi-encoding, multi-database
 # Tests: SQLi (error/union/boolean/time/stacked/NoSQL), CMDI, SSTI, LFI, XXE
 # Each test uses WAF bypass mutations and context-aware payload selection.
-#
-# FIXES vs previous version:
-#   1. Standardized thresholds: boolean SQLi 80-byte min diff (was 50),
-#      time-based SQLi 4.5s + 30% correlation (was 3.0s flat)
-#   2. Added baseline check to XXE detection (was missing, caused FPs)
-#   3. Tightened NoSQL detection — only MongoDB-specific error patterns
-#   4. Added confidence_tier and fp_likelihood to all findings
-#   5. Delegated mutations to PayloadMutator (single source of truth)
 
 import asyncio
 import logging
@@ -24,11 +16,8 @@ from scanner.dast.payloads import (
     CMDI_PAYLOADS, SSTI_PAYLOADS, LFI_PAYLOADS,
     XXE_PAYLOADS, NOSQL_PAYLOADS,
 )
-from scanner.dast.payload_mutator import PayloadMutator
 
 logger = logging.getLogger(__name__)
-
-_mutator = PayloadMutator()
 
 CMDI_OUTPUT_MARKERS = [
     "root:x:", "root:0:0", "daemon:", "bin/bash", "bin/sh",
@@ -37,32 +26,33 @@ CMDI_OUTPUT_MARKERS = [
     "[boot loader]", "[fonts]", "SENTINEL_CMDI",
 ]
 
-# Standardized thresholds
-BOOLEAN_MIN_DIFF = 80       # bytes — minimum diff between true/false responses
-TIME_MIN_DELAY   = 4.5     # seconds — minimum absolute delay for time-based
-TIME_CORR_MIN    = 0.70    # minimum correlation (delay must be >= 70% of intended sleep)
-
-# MongoDB-specific error patterns (tightened from generic "syntax error")
-NOSQL_MONGO_ERRORS = [
-    "mongoerror", "mongod", "mongodb", "mongo",
-    "$where", "$gt", "$ne", "$regex", "$expr",
-    "BSON", "bson", "errcode",
-]
-
-
-def _classify_confidence(confidence: float) -> tuple:
-    """Return (confidence_tier, fp_likelihood) based on confidence score."""
-    if confidence >= 0.90:
-        return ("high", "unlikely")
-    elif confidence >= 0.70:
-        return ("medium", "possible")
-    else:
-        return ("low", "likely")
-
-
+# WAF bypass mutation strategies
 def _apply_mutations(payload: str) -> list:
-    """Generate WAF-bypass variants using the shared PayloadMutator."""
-    return _mutator.mutate(payload)
+    """Generate WAF-bypass variants of a payload."""
+    variants = [payload]
+    # URL encoding
+    variants.append(urllib.parse.quote(payload))
+    # Double URL encoding
+    variants.append(urllib.parse.quote(urllib.parse.quote(payload)))
+    # Case alternation
+    if any(c.isalpha() for c in payload):
+        mangled = "".join(c.upper() if i % 2 == 0 else c.lower() for i, c in enumerate(payload))
+        variants.append(mangled)
+    # SQL comment breaking
+    if "SELECT" in payload.upper():
+        variants.append(re.sub(r'SELECT', 'SE/**/LECT', payload, flags=re.IGNORECASE))
+    if "UNION" in payload.upper():
+        variants.append(re.sub(r'UNION', 'UN/**/ION', payload, flags=re.IGNORECASE))
+    if "OR" in payload.upper() and "OR" not in "ORDER":
+        variants.append(payload.replace("OR", "/**/OR/**/").replace("or", "/**/or/**/"))
+    # Space replacement
+    variants.append(payload.replace(" ", "/**/"))
+    variants.append(payload.replace(" ", "+"))
+    variants.append(payload.replace(" ", "%09"))
+    # Null byte in keywords
+    if "<script" in payload.lower():
+        variants.append(payload.replace("script", "scri\x00pt"))
+    return variants[:8]  # cap to avoid explosion
 
 
 class InjectionModule:
@@ -100,94 +90,89 @@ class InjectionModule:
         baseline_text = baseline.text
 
         for raw_payload in SQLI_PAYLOADS:
+            # Apply WAF bypass mutations
             for payload in _apply_mutations(raw_payload):
                 test_url = self.scanner.param_engine.inject_payload(url, param, payload)
                 res = await self.scanner._req(client, "GET", test_url)
                 if not res:
                     continue
 
-                # A. Error-based
-                body = res.text.lower()
+                # A. Error-based — check both string match and regex match
+                body = res.text
+                body_lower = body.lower()
+                found_sig = None
                 for sig in SQLI_ERROR_SIGNATURES:
-                    if sig.lower() in body:
-                        tier, fp = _classify_confidence(0.95)
-                        self.scanner._add_finding({
-                            "type": "SQL Injection", "subtype": "Error-Based",
-                            "url": test_url, "parameter": param, "payload": payload,
-                            "severity": "Critical", "confidence": 0.95,
-                            "confidence_tier": tier, "fp_likelihood": fp,
-                            "evidence": f"DB error: '{sig}'",
-                            "description": f"Parameter '{param}' reflects a SQL error — unsanitised input reaches the DB.",
-                        })
-                        return
+                    sig_lower = sig.lower()
+                    if sig_lower in body_lower:
+                        found_sig = sig
+                        break
+                    try:
+                        if re.search(sig, body, re.IGNORECASE | re.DOTALL):
+                            found_sig = sig
+                            break
+                    except re.error:
+                        continue
+                if found_sig:
+                    self.scanner._add_finding({
+                        "type": "SQL Injection", "subtype": "Error-Based",
+                        "url": test_url, "parameter": param, "payload": payload,
+                        "severity": "Critical", "confidence": 0.95,
+                        "evidence": f"DB error: '{found_sig}'",
+                        "description": f"Parameter '{param}' reflects a SQL error — unsanitised input reaches the DB.",
+                    })
+                    return
 
                 # B. Union-based (look for numeric column markers)
                 if "UNION" in payload.upper() and "SELECT" in payload.upper():
+                    # Check if response differs significantly from baseline
                     if abs(len(res.text) - len(baseline_text)) > 200:
+                        # Look for column number markers (1, 2, 3...)
                         for i in range(1, 10):
                             marker = f"SENTINEL_COL_{i}"
                             if marker in res.text:
-                                tier, fp = _classify_confidence(0.93)
                                 self.scanner._add_finding({
                                     "type": "SQL Injection", "subtype": "Union-Based",
                                     "url": test_url, "parameter": param, "payload": payload,
                                     "severity": "Critical", "confidence": 0.93,
-                                    "confidence_tier": tier, "fp_likelihood": fp,
                                     "evidence": f"UNION SELECT returned data — column {i} visible",
                                     "description": f"Parameter '{param}' allows UNION-based data extraction.",
                                 })
                                 return
 
-                # C. Boolean-based blind — FIX: raised threshold from 50 to 80 bytes
+                # C. Boolean-based blind
                 if "1=1" in raw_payload or "' OR '" in raw_payload:
                     f_payload = raw_payload.replace("1=1", "1=2").replace("' OR '", "' AND '")
                     f_url = self.scanner.param_engine.inject_payload(url, param, f_payload)
                     f_res = await self.scanner._req(client, "GET", f_url)
                     if f_res:
                         diff = abs(len(res.text) - len(f_res.text))
-                        if diff > BOOLEAN_MIN_DIFF:
-                            conf = 0.82
-                            tier, fp = _classify_confidence(conf)
+                        if diff > 50:
                             self.scanner._add_finding({
                                 "type": "SQL Injection", "subtype": "Boolean-Based Blind",
                                 "url": test_url, "parameter": param, "payload": payload,
-                                "severity": "Critical", "confidence": conf,
-                                "confidence_tier": tier, "fp_likelihood": fp,
+                                "severity": "Critical", "confidence": 0.82,
                                 "evidence": f"True/false response diff: {diff} bytes",
                                 "description": f"Parameter '{param}' behaves differently for true/false SQL conditions.",
                             })
                             return
 
-                # D. Time-based blind — FIX: 4.5s minimum + 30% correlation window
+                # D. Time-based blind
                 if any(k in payload.upper() for k in ("SLEEP", "WAITFOR", "BENCHMARK", "PG_SLEEP", "DBMS_PIPE")):
                     t_start = asyncio.get_event_loop().time()
                     await self.scanner._req(client, "GET", test_url, timeout=15)
                     elapsed = asyncio.get_event_loop().time() - t_start
-                    delay = elapsed - base_lat
-                    # Extract intended sleep time from payload
-                    sleep_match = re.search(r'(?:SLEEP|pg_sleep)\s*\(\s*(\d+)', payload, re.IGNORECASE)
-                    intended = int(sleep_match.group(1)) if sleep_match else 6
-                    correlation = delay / intended if intended > 0 else 0
-
-                    if delay >= TIME_MIN_DELAY and correlation >= TIME_CORR_MIN:
-                        conf = 0.87
-                        tier, fp = _classify_confidence(conf)
+                    if elapsed >= base_lat + 3.0:
                         self.scanner._add_finding({
                             "type": "SQL Injection", "subtype": "Time-Based Blind",
                             "url": test_url, "parameter": param, "payload": payload,
-                            "severity": "Critical", "confidence": conf,
-                            "confidence_tier": tier, "fp_likelihood": fp,
-                            "evidence": f"Baseline={base_lat:.2f}s  Attack={elapsed:.2f}s  Correlation={correlation:.0%}",
+                            "severity": "Critical", "confidence": 0.88,
+                            "evidence": f"Baseline={base_lat:.2f}s  Attack={elapsed:.2f}s",
                             "description": f"Parameter '{param}' caused a {elapsed:.2f}s delay — time-based blind SQLi.",
                         })
                         return
 
     # ── Command Injection ─────────────────────────────────────────────────────
     async def test_cmdi(self, client, url: str, param: str) -> None:
-        # Get baseline for CMDI false positive reduction
-        baseline = await self.scanner._req(client, "GET", url)
-        baseline_text = baseline.text if baseline else ""
-
         # Output-based (highest confidence)
         output_payloads = [
             ("; cat /etc/passwd", CMDI_OUTPUT_MARKERS),
@@ -198,6 +183,7 @@ class InjectionModule:
             ("| whoami", ["root", "www-data", "apache", "nginx", "nobody", "daemon"]),
             ("| id", ["uid=", "gid=", "groups="]),
             ("; id", ["uid=", "gid=", "groups="]),
+            # Windows
             ("& dir", ["Volume Serial", "Directory of"]),
             ("| dir", ["Volume Serial", "Directory of"]),
         ]
@@ -207,14 +193,11 @@ class InjectionModule:
                 res = await self.scanner._req(client, "GET", test_url)
                 if res:
                     for m in markers:
-                        # Baseline check: skip if marker already in baseline
-                        if m in res.text and (not baseline_text or m not in baseline_text):
-                            tier, fp = _classify_confidence(0.97)
+                        if m in res.text:
                             self.scanner._add_finding({
                                 "type": "Command Injection", "subtype": "Output-Based",
                                 "url": test_url, "parameter": param, "payload": mutated,
                                 "severity": "Critical", "confidence": 0.97,
-                                "confidence_tier": tier, "fp_likelihood": fp,
                                 "evidence": f"OS output marker: '{m}'",
                                 "description": f"Parameter '{param}' executes arbitrary OS commands.",
                             })
@@ -222,7 +205,7 @@ class InjectionModule:
 
         # Time-based blind fallback
         t0       = asyncio.get_event_loop().time()
-        base_res = await self.scanner._req(client, "GET", url)
+        baseline = await self.scanner._req(client, "GET", url)
         base_lat = asyncio.get_event_loop().time() - t0
 
         for payload in ["; sleep 6; #", "| sleep 6", "$(sleep 6)", "`sleep 6`"]:
@@ -231,14 +214,11 @@ class InjectionModule:
                 t_start  = asyncio.get_event_loop().time()
                 await self.scanner._req(client, "GET", test_url, timeout=20)
                 elapsed  = asyncio.get_event_loop().time() - t_start
-                if elapsed >= base_lat + TIME_MIN_DELAY:
-                    conf = 0.85
-                    tier, fp = _classify_confidence(conf)
+                if elapsed >= base_lat + 4.0:
                     self.scanner._add_finding({
                         "type": "Command Injection", "subtype": "Time-Based Blind",
                         "url": test_url, "parameter": param, "payload": mutated,
-                        "severity": "Critical", "confidence": conf,
-                        "confidence_tier": tier, "fp_likelihood": fp,
+                        "severity": "Critical", "confidence": 0.88,
                         "evidence": f"Baseline={base_lat:.2f}s  Attack={elapsed:.2f}s",
                         "description": f"Parameter '{param}' caused a {elapsed:.2f}s delay — blind CMDI.",
                     })
@@ -250,16 +230,15 @@ class InjectionModule:
         url1 = self.scanner.param_engine.inject_payload(url, param, "{{7*7}}")
         r1   = await self.scanner._req(client, "GET", url1)
         if not (r1 and "49" in r1.text):
+            # Try other template engines
             for payload in ["${7*7}", "<%= 7*7 %>", "#{7*7}", "*{7*7}"]:
                 test_url = self.scanner.param_engine.inject_payload(url, param, payload)
                 res = await self.scanner._req(client, "GET", test_url)
                 if res and "49" in res.text:
-                    tier, fp = _classify_confidence(0.90)
                     self.scanner._add_finding({
                         "type": "Server-Side Template Injection (SSTI)", "subtype": "Confirmed",
                         "url": test_url, "parameter": param, "payload": payload,
                         "severity": "Critical", "confidence": 0.90,
-                        "confidence_tier": tier, "fp_likelihood": fp,
                         "evidence": f"{payload} evaluated to 49",
                         "description": f"Parameter '{param}' evaluates template expressions — RCE likely.",
                     })
@@ -270,12 +249,10 @@ class InjectionModule:
         url2 = self.scanner.param_engine.inject_payload(url, param, "{{3*3}}")
         r2   = await self.scanner._req(client, "GET", url2)
         if r2 and "9" in r2.text:
-            tier, fp = _classify_confidence(0.95)
             self.scanner._add_finding({
                 "type": "Server-Side Template Injection (SSTI)", "subtype": "Confirmed",
                 "url": url1, "parameter": param, "payload": "{{7*7}}",
-                "severity": "Critical", "confidence": 0.95,
-                "confidence_tier": tier, "fp_likelihood": fp,
+                "severity": "Critical", "confidence": 0.93,
                 "evidence": "{{7*7}}->49 and {{3*3}}->9 confirmed",
                 "description": f"Parameter '{param}' evaluates template expressions — RCE likely.",
             })
@@ -287,6 +264,7 @@ class InjectionModule:
             "www-data", "[boot loader]", "[fonts]",
             "PHP Version", "phpinfo()",
         ]
+        # Get baseline to avoid false positives
         baseline = await self.scanner._req(client, "GET", url)
         baseline_text = baseline.text if baseline else ""
 
@@ -297,12 +275,10 @@ class InjectionModule:
                 if res:
                     for ind in LFI_INDICATORS:
                         if ind in res.text and (not baseline_text or ind not in baseline_text):
-                            tier, fp = _classify_confidence(0.95)
                             self.scanner._add_finding({
                                 "type": "Local File Inclusion (LFI)", "subtype": "Path Traversal",
                                 "url": test_url, "parameter": param, "payload": mutated,
                                 "severity": "Critical", "confidence": 0.95,
-                                "confidence_tier": tier, "fp_likelihood": fp,
                                 "evidence": f"File marker '{ind}' in response",
                                 "description": f"Parameter '{param}' allows reading server files.",
                             })
@@ -314,55 +290,41 @@ class InjectionModule:
             "root:x:", "root:0:0", "daemon:", "[boot loader]",
             "ami-id", "instance-id", "local-ipv4",
         ]
-        # FIX: Get baseline to avoid false positives from indicators already
-        # present in the page before injection
-        baseline = await self.scanner._req(client, "GET", url)
-        baseline_text = baseline.text if baseline else ""
-
         for payload in XXE_PAYLOADS[:5]:
             test_url = self.scanner.param_engine.inject_payload(url, param, payload)
             res = await self.scanner._req(client, "GET", test_url)
             if res:
                 for ind in XXE_INDICATORS:
-                    if ind in res.text and (not baseline_text or ind not in baseline_text):
-                        tier, fp = _classify_confidence(0.95)
+                    if ind in res.text:
                         self.scanner._add_finding({
                             "type": "XML External Entity (XXE)", "subtype": "File Disclosure",
                             "url": test_url, "parameter": param, "payload": payload[:80],
                             "severity": "Critical", "confidence": 0.95,
-                            "confidence_tier": tier, "fp_likelihood": fp,
-                            "evidence": f"XXE indicator '{ind}' in response (not in baseline)",
+                            "evidence": f"XXE indicator '{ind}' in response",
                             "description": f"Parameter '{param}' processes XML external entities.",
                         })
                         return
 
     # ── NoSQL Injection ──────────────────────────────────────────────────────
     async def test_nosql(self, client, url: str, param: str) -> None:
-        # Get baseline for NoSQL false positive reduction
-        baseline = await self.scanner._req(client, "GET", url)
-        baseline_text = baseline.text.lower() if baseline else ""
-
         for payload in NOSQL_PAYLOADS:
             test_url = self.scanner.param_engine.inject_payload(url, param, payload)
             res = await self.scanner._req(client, "GET", test_url)
             if not res:
                 continue
+            # NoSQL errors or unexpected behavior
+            nosql_errors = [
+                "mongo", "mongodb", "mongod", "no sql",
+                "$where", "$gt", "$ne", "$regex",
+                "syntax error", "unexpected token",
+            ]
             body_lower = res.text.lower()
-            for err in NOSQL_MONGO_ERRORS:
-                if err in body_lower and (not baseline_text or err not in baseline_text):
-                    # Higher confidence for MongoDB-specific errors
-                    if err in ("mongoerror", "mongod", "mongodb", "bson"):
-                        conf = 0.92
-                    elif err in ("$where", "$gt", "$ne", "$regex", "$expr"):
-                        conf = 0.80
-                    else:
-                        conf = 0.70
-                    tier, fp = _classify_confidence(conf)
+            for err in nosql_errors:
+                if err in body_lower:
                     self.scanner._add_finding({
                         "type": "NoSQL Injection", "subtype": "Operator Injection",
                         "url": test_url, "parameter": param, "payload": payload[:60],
-                        "severity": "Critical", "confidence": conf,
-                        "confidence_tier": tier, "fp_likelihood": fp,
+                        "severity": "Critical", "confidence": 0.85,
                         "evidence": f"NoSQL indicator: '{err}'",
                         "description": f"Parameter '{param}' may allow NoSQL operator injection.",
                     })
@@ -386,33 +348,41 @@ class InjectionModule:
                 res  = await _send(data)
                 if not res:
                     continue
-                body = res.text.lower()
+                body = res.text
+                body_lower = body.lower()
+                found_sig = None
                 for sig in SQLI_ERROR_SIGNATURES:
-                    if sig.lower() in body:
-                        tier, fp = _classify_confidence(0.95)
-                        self.scanner._add_finding({
-                            "type": "SQL Injection", "subtype": f"Error-Based via Form ({method})",
-                            "url": url, "parameter": "form", "payload": mutated,
-                            "severity": "Critical", "confidence": 0.95,
-                            "confidence_tier": tier, "fp_likelihood": fp,
-                            "evidence": f"DB error: '{sig}'",
-                            "description": f"Form at {url} passes unsanitised input to the DB.",
-                        })
-                        return
+                    sig_lower = sig.lower()
+                    if sig_lower in body_lower:
+                        found_sig = sig
+                        break
+                    try:
+                        if re.search(sig, body, re.IGNORECASE | re.DOTALL):
+                            found_sig = sig
+                            break
+                    except re.error:
+                        continue
+                if found_sig:
+                    self.scanner._add_finding({
+                        "type": "SQL Injection", "subtype": f"Error-Based via Form ({method})",
+                        "url": url, "parameter": "form", "payload": mutated,
+                        "severity": "Critical", "confidence": 0.95,
+                        "evidence": f"DB error: '{found_sig}'",
+                        "description": f"Form at {url} passes unsanitised input to the DB.",
+                    })
+                    return
 
-        # NoSQL via form — tightened to MongoDB-specific patterns
+        # NoSQL via form
         for payload in NOSQL_PAYLOADS[:4]:
             data = {k: payload for k in base}
             res = await _send(data)
             if res:
-                for err in NOSQL_MONGO_ERRORS:
+                for err in ["mongo", "$where", "$gt", "$ne"]:
                     if err in res.text.lower():
-                        tier, fp = _classify_confidence(0.80)
                         self.scanner._add_finding({
                             "type": "NoSQL Injection", "subtype": f"Form ({method})",
                             "url": url, "parameter": "form", "payload": payload[:60],
-                            "severity": "Critical", "confidence": 0.80,
-                            "confidence_tier": tier, "fp_likelihood": fp,
+                            "severity": "Critical", "confidence": 0.85,
                             "evidence": f"NoSQL indicator: '{err}'",
                             "description": f"Form at {url} may allow NoSQL injection.",
                         })

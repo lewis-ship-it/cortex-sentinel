@@ -1,3 +1,4 @@
+
 """
 Redis initialization - clear queues on startup to ensure clean state.
 """
@@ -48,3 +49,4 @@ def clear_redis_queues():
 
 if __name__ == "__main__":
     clear_redis_queues()
+

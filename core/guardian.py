@@ -1,3 +1,4 @@
+
 import re
 
 def rules(url: str):
@@ -15,3 +16,4 @@ def rules(url: str):
         return {"allowed": False, "reason": "Restricted domain policy activated."}
 
     return {"allowed": True, "rate_limit": 1.0}
+

@@ -496,13 +496,33 @@ async def scan_url_async(
                             )
                             continue
 
-                        # Gate: only proceed if oracle confirmed the vulnerability
+                        # ── DEBUG: Log validator results ──────────────────
+                        logger.debug(
+                            f"[VALIDATOR] {vuln_type}/{param} → "
+                            f"vuln: {result.is_vulnerable}, conf: {result.confidence:.2f}, "
+                            f"method: {result.method}, blocked: {result.blocked}",
+                            job_id
+                        )
+
+                        # ── Gate: handle both confirmed and potential vulnerabilities ──
+                        is_potential = False
+                        potential_reason = None
+
                         if not result.is_vulnerable:
-                            continue
+                            # Keep potential findings with low confidence for manual review
+                            if result.confidence > 0.3:
+                                is_potential = True
+                                potential_reason = f"Low confidence signal: {result.confidence:.2f}"
+                            else:
+                                continue  # Truly discard findings with no signal
 
                         # ── Build the canonical finding dict ──────────────
                         vuln_meta = _VULN_META.get(vuln_type, _VULN_META["_default"])
                         conf = round(result.confidence, 4)
+
+                        # Use 'potential' meta for low-confidence findings
+                        if is_potential:
+                            vuln_meta = _VULN_META.get("potential", _VULN_META["_default"])
 
                         # Confidence classification
                         if conf >= 0.90:
@@ -525,9 +545,11 @@ async def scan_url_async(
                             "confidence_score": conf,
                             "confidence_tier":  confidence_tier,
                             "fp_likelihood":    fp_likelihood,
-                            "evidence_snippet": result.evidence_snippet,
+                            "evidence_snippet": result.evidence_snippet if not is_potential else f"Potential: {potential_reason}",
                             "method":           result.method,
+                            "is_potential":     is_potential,
                         }
+
 
                         # Attach timing evidence for time-based SQLi
                         if vuln_type == "sqli_time":

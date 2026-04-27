@@ -1,3 +1,4 @@
+
 # scanner/safety_guard.py
 from urllib.parse import urlparse
 
@@ -38,3 +39,4 @@ class SafetyGuard:
         except Exception:
             # If URL is malformed, block it by default
             return False
+

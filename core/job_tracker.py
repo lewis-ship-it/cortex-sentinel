@@ -1,3 +1,4 @@
+
 # core/job_tracker.py
 from core.database import DatabaseManager
 
@@ -24,3 +25,4 @@ def update_stage(job_id: str, stage: str, progress: int):
 def append_findings(job_id: str, findings: list):
     """Save raw vulnerability findings to the database."""
     db.save_vulnerabilities(job_id, findings)
+

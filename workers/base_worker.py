@@ -1,3 +1,4 @@
+
 # workers/base_worker.py
 # ──────────────────────────────────────────────────────────────────────────────
 # FIXES IN THIS VERSION
@@ -103,16 +104,6 @@ def fetch(queue: str) -> dict | None:
         return None
     job.setdefault("tier", "Basic")
     return job
-#____________________________________________________________________________________
-#wrapper for fetch to handle exceptions and ensure it always returns a dict or None
-#____________________________________________________________________________________
-def pop_queue(queue: str) -> dict | None:
-    """
-    Non-blocking pop from the queue. Returns the job dict or None if empty.
-    This is an alias for fetch() for compatibility.
-    """
-    return fetch(queue)
-
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -149,3 +140,4 @@ def worker_loop(queue: str, handler) -> None:
                 f"[WORKER] Unhandled exception in {queue}: {exc}", exc_info=True
             )
             _time.sleep(2)   # brief back-off to prevent rapid crash loops
+

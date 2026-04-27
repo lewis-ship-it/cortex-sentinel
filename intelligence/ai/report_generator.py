@@ -1,3 +1,4 @@
+
 # intelligence/ai/report_generator.py
 # ──────────────────────────────────────────────────────────────────────────────
 # REPORT GENERATOR — powered exclusively by local Ollama / qwen2.5-coder.
@@ -76,3 +77,4 @@ Generate a professional executive report as JSON:
             "risk_score":        0,
             "findings":          [],
         }
+

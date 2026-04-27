@@ -1,3 +1,4 @@
+
 # scanner/api_engine.py
 
 import asyncio
@@ -860,3 +861,4 @@ class APIEngine:
                 else f"Bearer {auth_token}"
             headers["Authorization"] = token
         return headers
+

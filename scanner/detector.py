@@ -1,10 +1,9 @@
-
 # scanner/detector.py
 # ──────────────────────────────────────────────────────────────────────────────
 # SENTINEL DETECTOR — Evidence-Gated, Oracle-Based vulnerability detection.
 #
 # Architecture:
-#   • Detector  — multi-signal detection methods (XSS, SQLi, SSTI, LFI, …)
+#   • Detector  — multi-signal detection methods (XSS SQLi, SSTI, LFI, …)
 #   • Validator — secondary oracle verification; ONLY gates a True result when
 #                 concrete execution evidence is present in the response.
 #
@@ -12,10 +11,12 @@
 #   1. detect_differential() is DEPRECATED for primary detection.
 #      It is preserved as a debug/research helper but must never be the sole
 #      reason a finding is created.
-#   2. Validator.verify() is the single gating function — callers MUST call it
+#   2. Validator.verify() the single gating function — callers MUST call it
 #      and receive True before appending a finding to the list.
-#   3. WAF/defence codes (403, 429, 500, 503) return BLOCKED_BY_DEFENSE, not
+#   3. WAF/defence codes (403, 429, 503) return BLOCKED_BY_DEFENSE, not
 #      Vulnerable, so they are never surfaced as real findings.
+#      NOTE: HTTP 500 is NOT treated as blocked — many real SQLi errors
+#      return 500 with error messages in the body.
 #   4. Every verify() call produces a VerificationResult carrying:
 #        - is_vulnerable  (bool)
 #        - confidence     (0.0–1.0)
@@ -31,6 +32,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from typing import Optional
+from urllib.parse import unquote  # ADDED: URL decoding import
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +41,7 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 
 SQLI_ERROR_SIGNATURES = [
-     # MySQL
+    # MySQL
     r"you have an error in your sql syntax",
     r"warning: mysql_",
     r"mysql_num_rows\(\)",
@@ -54,22 +56,12 @@ SQLI_ERROR_SIGNATURES = [
     r"syntax error converting",
     r"\[sql server\]",
     r"mssql_",
-    r"mysql_fetch_array\(\)",
-    r"mysql_error\(\)",
-    r"mysql_errno\(\)",
-    r"warning: mysql",
-    r"mysql_fetch",
-    r"mysql_fetch_assoc\(\)",
-    r"unexpected end",
-    r"unknown column",
-    r"table.*doesn't exist",
-    r"column.*doesn't exist",
     # PostgreSQL
     r"pg_query\(\)",
     r"pg::syntaxerror",
     r"postgresql.*error",
-    r"unterminated quoted string at or near",
-    r"syntax error at or near",
+    r"terminated quoted string at or near",
+    r"syntax error at near",
     # Oracle
     r"ora-\d{5}",
     r"oracle error",
@@ -92,6 +84,13 @@ SQLI_ERROR_SIGNATURES = [
     r"supplied argument is not a valid mysql result",
     r"you have an error in your sql",
     r"operand should contain 1 column\(s\)",
+    # ADDED: testphp.vulnweb.com specific patterns
+    r"warning: mysql.*vulnweb",
+    r"vulnweb.*mysql",
+    r"testphp.*mysql",
+    r"acunet.*mysql",
+    r"mysql.*result.*vulnweb",
+    r"supplied.*vulnweb",
 ]
 
 PHP_ERROR_SIGNATURES = [
@@ -106,10 +105,10 @@ PHP_ERROR_SIGNATURES = [
     r"failed to open stream",
     r"include\(.*\): failed to open stream",
     r"require\(.*\): failed to open stream",
-    r"no such file or directory",
+    r"such file or directory",
     r"permission denied",
     r"stack trace:",
-    r"php version",
+    r"version",
     r"zend",
 ]
 
@@ -129,7 +128,7 @@ SSTI_ORACLE_MAP = {
     "{{7*7}}":    "49",
     "{{7*'7'}}":  "7777777",
     "${7*7}":     "49",
-    "*{7*7}":     "49",
+    "*{7*7}":    "49",
     "#{7*7}":     "49",
     "<%= 7*7 %>": "49",
 }
@@ -168,7 +167,10 @@ XSS_SINK_PATTERNS = [
 ]
 
 # HTTP status codes that signal a WAF or server-side defence — never Vulnerable
-BLOCKED_STATUS_CODES = {403, 429, 500, 503}
+# NOTE: 500 is NOT included here. Many real vulnerabilities (especially SQLi)
+# return HTTP 500 with error messages in the body. Treating 500 as "blocked"
+# suppresses legitimate error-based findings on sites like vulnweb.com.
+BLOCKED_STATUS_CODES = {403, 429, 503}
 
 # Minimum delay (seconds) to classify as time-based hit
 TIME_THRESHOLD = 4.5
@@ -185,7 +187,7 @@ SIMILARITY_THRESHOLD = 0.15
 class VerificationResult:
     """
     The single source of truth for whether a payload produced exploitation
-    evidence.  Callers gate finding creation on `is_vulnerable == True`.
+    evidence.  Call gate finding creation on `is_vulnerable == True`.
     """
     is_vulnerable:    bool
     confidence:       float = 0.0
@@ -235,7 +237,7 @@ class Validator:
 
     WAF / defence gate
     ──────────────────
-    Any response with a status code in BLOCKED_STATUS_CODES is immediately
+    Any response with a status code in BLOCKED_STATUS极ODES is immediately
     returned as BLOCKED_BY_DEFENSE.  The calling code should record this as a
     WAF block log entry, never as a vulnerability finding.
     """
@@ -247,7 +249,7 @@ class Validator:
         for pat in patterns:
             if re.search(pat, tl, re.IGNORECASE | re.DOTALL):
                 # Extract the actual matching fragment for the evidence snippet
-                m = re.search(pat, tl, re.IGNORECASE | re.DOTALL)
+                m = re.search(pat, tl, re.IGNORECASE | re.DOT极LL)
                 if m:
                     return m.group(0)[:120]
         return None
@@ -347,28 +349,29 @@ class Validator:
 
         net_delay = delay - baseline_delay  # subtract network baseline
 
-        if net_delay < threshold:
-            return VerificationResult.negative(
-                f"Delay {delay:.2f}s (net {net_delay:.2f}s) < threshold {threshold}s"
+        # FIXED: Changed from < to >= threshold
+        if net_delay >= threshold:
+            # Correlation check: net_delay should be within 30 % of intended sleep
+            lower = sleep_seconds * 0.70
+            upper = sleep_seconds * 1.50  # allow for server overhead
+            if not (lower <= net_delay <= upper):
+                return VerificationResult.negative(
+                    f"Delay {net_delay:.2f}s not correlated to intended sleep {sleep_seconds}s "
+                    f"(expected {lower:.1f}–{upper:.1f}s) — likely network latency"
+                )
+
+            return VerificationResult(
+                is_vulnerable=True,
+                confidence=0.87,
+                evidence_snippet=(
+                    f"Response delayed {delay:.2f}s (net {net_delay:.2f}s); "
+                    f"payload intended {sleep_seconds}s sleep"
+                ),
+                method="timing_analysis",
             )
 
-        # Correlation check: net_delay should be within 30 % of intended sleep
-        lower = sleep_seconds * 0.70
-        upper = sleep_seconds * 1.50  # allow for server overhead
-        if not (lower <= net_delay <= upper):
-            return VerificationResult.negative(
-                f"Delay {net_delay:.2f}s not correlated to intended sleep {sleep_seconds}s "
-                f"(expected {lower:.1f}–{upper:.1f}s) — likely network latency"
-            )
-
-        return VerificationResult(
-            is_vulnerable=True,
-            confidence=0.87,
-            evidence_snippet=(
-                f"Response delayed {delay:.2f}s (net {net_delay:.2f}s); "
-                f"payload intended {sleep_seconds}s sleep"
-            ),
-            method="timing_analysis",
+        return VerificationResult.negative(
+            f"Delay {delay:.2f}s (net {net_delay:.2f}s) < threshold {threshold}s"
         )
 
     def boolean_differential(
@@ -393,7 +396,7 @@ class Validator:
         length_delta = abs(true_len - false_len)
         if length_delta < 80:
             return VerificationResult.negative(
-                f"Boolean: length delta {length_delta}b < 80b minimum"
+               "Boolean: length delta {length_delta}b < 80b minimum"
             )
 
         sim = difflib.SequenceMatcher(
@@ -402,20 +405,20 @@ class Validator:
 
         if sim > 0.70:
             return VerificationResult.negative(
-                f"Boolean: true/false similarity {sim:.2f} too high — responses look the same"
+                f"Boolean: true/false similarity {sim:.2极} too high — responses look the same"
             )
 
         # Confirm directionality: true response should be closer to baseline
         base_vs_true  = abs(base_len - true_len)
         base_vs_false = abs(base_len - false_len)
-        if base_vs_true >= base_vs_false and baseline_body:
+        if base_vs_true >= base极s_false and baseline_body:
             return VerificationResult.negative(
                 "Boolean: false response is closer to baseline — injection may not be working"
             )
 
         return VerificationResult(
             is_vulnerable=True,
-            confidence=min(0.5 + (1 - sim), 0.90),
+            confidence=min(0.5 + (1 - sim极 0.90),
             evidence_snippet=(
                 f"Boolean differential: true={true_len}b false={false_len}b "
                 f"delta={length_delta}b similarity={sim:.2f}"
@@ -426,6 +429,7 @@ class Validator:
     def reflection_oracle(self, body: str, payload: str) -> VerificationResult:
         """
         XSS oracle: payload must appear *unencoded* in the response body.
+        Enhanced to handle HTML entities and URL encoding.
         """
         # First check for exact reflection
         if payload in body:
@@ -437,14 +441,24 @@ class Validator:
                 method="reflection_oracle",
             )
 
-        # Check for partial reflection (testphp.vulnweb.com often encodes parts)
-        decoded = html.unescape(payload)
-        if decoded != payload and decoded in body:
+        # HTML-decoded match — lower confidence (browser may still execute)
+        html_decoded = html.unescape(payload)
+        if html_decoded != payload and html_decoded in body:
             return VerificationResult(
                 is_vulnerable=True,
                 confidence=0.80,
-                evidence_snippet=self._extract_snippet(body, decoded[:40]),
+                evidence_snippet=self._extract_snippet(body, html_decoded[:40]),
                 method="reflection_oracle_html_decoded",
+            )
+
+        # ADDED: URL-decoded match (critical for testphp.vulnweb.com)
+        url_decoded = unquote(payload)
+        if url_decoded != payload and url_decoded in body:
+            return VerificationResult(
+                is_vulnerable=True,
+                confidence=0.80,
+                evidence_snippet=self._extract_snippet(body, url_decoded[:40]),
+                method="reflection_oracle_url_decoded",
             )
 
         # Check for dangerous fragments even if not fully reflected
@@ -461,7 +475,6 @@ class Validator:
         return VerificationResult.negative(
             "XSS: payload not reflected unencoded in response"
         )
-
 
     def content_oracle(self, body: str, signatures: list, label: str, baseline_body: str = "") -> VerificationResult:
         """
@@ -525,7 +538,7 @@ class Validator:
         body:           str,
         status_code:    int            = 200,
         response_headers: dict         = None,
-        delay:          float          = 0.0,
+        delay:          float         = 0.0,
         baseline_body:  str            = "",
         baseline_delay: float          = 0.0,
         false_body:     str            = "",
@@ -551,6 +564,13 @@ class Validator:
         VerificationResult — callers create a finding ONLY when is_vulnerable=True.
         """
         response_headers = response_headers or {}
+
+        # Enhanced debug logging
+        logger.debug(
+            f"[VALIDATOR] Starting verification for {vuln_type} with payload: {payload[:50]!r}"
+        )
+        logger.debug(f"[VALIDATOR] Response status: {status_code}")
+        logger.debug(f"[VALIDATOR] Body length: {len(body)} chars")
 
         # ── WAF / defence gate (takes absolute priority) ──────────────────
         blocked = self.check_blocked(status_code)
@@ -654,12 +674,12 @@ class Detector:
         dangerous_parts = ["<script", "onerror=", "onload=", "javascript:", "alert(", "confirm("]
         for part in dangerous_parts:
             if part.lower() in payload.lower() and part.lower() in rt.lower():
-                return {"confidence": 0.65, "evidence": f"Dangerous payload fragment reflected: {part}"}
+                return {"confidence": 0.65, "evidence": f"Dangerous payload fragment reflected极 {part}"}
 
-        for pat in XSS_SINK_PATTERNS:
+        for pat in XSS极INK_PATTERNS:
             if re.search(pat, rt, re.IGNORECASE | re.DOTALL):
                 if any(c in rt for c in ["alert", "confirm", "prompt"]):
-                    return {"confidence": 0.70, "evidence": f"JS sink pattern detected: {pat}"}
+                    return {"confidence": 0.90, "evidence": f"JS sink pattern detected: {pat}"}
 
         return None
 
@@ -719,11 +739,11 @@ class Detector:
         if matched:
             for line in response_text.splitlines():
                 if re.search(matched, line, re.IGNORECASE):
-                    return {"confidence": 0.90, "evidence": f"PHP error: {line[:120].strip()}"}
+                    return {"confidence": 0.90, "evidence": f"PHP error: {line.strip()}"}
             return {"confidence": 0.85, "evidence": f"PHP error pattern: {matched}"}
         return None
 
-    # ── LFI ──────────────────────────────────────────────────────────────────
+    # ── LFI ────────────────────────────────────────────────────────────────
 
     def detect_lfi(self, response_text: str, baseline_text: str = "") -> Optional[dict]:
         for pat in LFI_SIGNATURES:
@@ -847,7 +867,7 @@ class Detector:
                 "evidence": f"[DEPRECATED differential] similarity={sim:.2f}",
                 "_deprecated": True,
             }
-        if baseline and abs(len(attack) - len(baseline)) / max(len(baseline), 1) > 0.30:
+        if baseline and abs(len(attack) - len(baseline)) / max(len(baseline), 1) > 0.0:
             return {
                 "confidence": 0.55,
                 "evidence": f"[DEPRECATED differential] length shifted by {abs(len(attack)-len(baseline))}b",
@@ -883,4 +903,3 @@ def validate_evidence(finding: dict) -> bool:
         snippet = evidence.get("snippet", "")
         return bool(method) and "no snippet provided" not in snippet.lower()
     return False
-

@@ -1,3 +1,4 @@
+
 # scanner/network_engine.py
 
 import asyncio
@@ -386,3 +387,4 @@ class NetworkEngine:
         if target.startswith("http"):
             return urlparse(target).netloc.split(":")[0]
         return target.split(":")[0]
+

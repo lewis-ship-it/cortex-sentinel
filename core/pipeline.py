@@ -1,17 +1,11 @@
+
 # core/pipeline.py
 # ──────────────────────────────────────────────────────────────────────────────
 # Pipeline orchestration — STRICT SQLite edition.
 # All legacy state_manager calls removed to prevent dual-write conflicts.
 # All ephemeral caching (r.set) moved to db.kv_set for persistence.
-#
-# FIXES vs previous version:
-#   1. Removed BROWSER_QUEUE push — no browser_worker exists, so those jobs
-#      would queue forever and the counter would never reach zero, stalling
-#      the pipeline at "scanning" indefinitely.
-#   2. Added safety: if scan counter is stuck at 0 for too long, force
-#      transition to exploit stage.
 # ──────────────────────────────────────────────────────────────────────────────
-import time
+
 import json
 from typing import Optional, Dict, List, Any
 
@@ -20,7 +14,7 @@ from task_queue.queues import (
     SCAN_QUEUE, EXPLOIT_QUEUE, AGGREGATION_QUEUE,
     REPORT_QUEUE, PLANNER_QUEUE, MEMORY_QUEUE, SCORING_QUEUE,
 )
-from core.counters import set_counter, decrement, get_counter
+from core.counters import set_counter, decrement
 from core.database import get_db
 from core.logger import get_logger
 from intelligence.prioritization.risk_prioritizer import RiskPrioritizer
@@ -30,6 +24,10 @@ prioritizer  = RiskPrioritizer()
 logger       = get_logger("pipeline")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SCAN COMPLETE → EXPLOIT
+# ─────────────────────────────────────────────────────────────────────────────
+
 def on_scan_complete(
     job_id:   str,
     findings: List[Dict],
@@ -37,54 +35,26 @@ def on_scan_complete(
     tier:     str = "Basic",
 ) -> None:
     try:
-        # Accumulate findings from multiple scan workers
-        if findings:
-            try:
-                raw = db.kv_get(f"job:{job_id}:findings_json")
-                all_findings = json.loads(raw) if raw else []
-            except Exception:
-                logger.error("Corrupted findings JSON — resetting", job_id)
-                all_findings = []
+        if not findings:
+            logger.warning(f"Scan complete but no findings", job_id)
+            db.update_job(job_id, status="exploiting", progress=55)
+            push(EXPLOIT_QUEUE, {"job_id": job_id, "findings": [], "tier": tier})
+            return
 
-            accumulated = json.loads(raw) if raw else []
-            accumulated.extend(findings)
-            db.kv_set(f"job:{job_id}:findings_json", json.dumps(accumulated))
-            logger.info(
-                f"Scan result received — +{len(findings)} findings "
-                f"(total accumulated: {len(accumulated)})",
-                job_id,
-            )
-        start_key = f"job:{job_id}:scan_start"
-
-        if not db.kv_get(start_key):
-            db.kv_set(start_key, str(time.time()))
-        remaining = decrement(job_id, "scan")
-        logger.info(f"Pending scan slots remaining: {remaining}", job_id)
-
-        # 🔥 FAILSAFE: if counter is broken or stuck, force progress
-        if remaining > 0:
-            start_time = float(db.kv_get(start_key) or 0)
-
-            if time.time() - start_time > 120:  # 2 min timeout
-                logger.warning("Scan stage timeout — forcing completion", job_id)
-            else:
-                return
-
-        # All scans done — route to exploit
-        raw = db.kv_get(f"job:{job_id}:findings_json")
-        all_findings = json.loads(raw) if raw else []
+        # Cache findings in SQLite KV store instead of raw Redis
+        db.kv_set(f"job:{job_id}:findings_json", json.dumps(findings))
 
         db.update_job(job_id, status="exploiting", progress=55)
 
         logger.info(
-            f"All URLs scanned — routing {len(all_findings)} total findings to exploit",
+            f"Scan complete — routing {len(findings)} findings to exploit",
             job_id,
-            details={"finding_count": len(all_findings), "tier": tier},
+            details={"finding_count": len(findings), "tier": tier},
         )
 
         push(EXPLOIT_QUEUE, {
             "job_id":   job_id,
-            "findings": all_findings,
+            "findings": findings,
             "tier":     tier,
             "target":   target or "unknown",
         })
@@ -93,6 +63,10 @@ def on_scan_complete(
         logger.error(f"on_scan_complete failed: {e}", job_id)
         db.update_job(job_id, status="failed", progress=100)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EXPLOIT COMPLETE → AGGREGATION
+# ─────────────────────────────────────────────────────────────────────────────
 
 def on_exploit_complete(
     job_id:   str,
@@ -119,6 +93,10 @@ def on_exploit_complete(
         db.update_job(job_id, status="failed", progress=100)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# AGGREGATION COMPLETE → TIERED ROUTING
+# ─────────────────────────────────────────────────────────────────────────────
+
 def on_aggregation_complete(
     job_id: str,
     data:   Dict[str, Any],
@@ -126,6 +104,7 @@ def on_aggregation_complete(
     tier:   str = "Basic",
 ) -> None:
     try:
+        # Archive raw findings in SQLite KV store (Survives restarts)
         db.kv_set(f"job:{job_id}:vault:findings", json.dumps(data))
 
         if tier == "Basic":
@@ -150,10 +129,14 @@ def on_aggregation_complete(
             logger.info("Basic tier job complete", job_id, tier="Basic")
 
         else:
+            # Professional tier: memory enrichment + scoring + AI report
             db.update_job(job_id, status="memory_enriching", progress=70)
 
             push(MEMORY_QUEUE, {"job_id": job_id, "findings": data, "target": target, "tier": tier})
             push(SCORING_QUEUE, {"job_id": job_id, "findings": data, "tier": tier})
+            # FIX: Also push to REPORT_QUEUE for AI-powered narrative generation.
+            # Previously Professional tier never triggered report_worker — only scoring_worker
+            # called on_report_complete, which skips the AI analysis.
             push(REPORT_QUEUE, {
                 "job_id":    job_id,
                 "findings":  data,
@@ -167,6 +150,10 @@ def on_aggregation_complete(
         db.update_job(job_id, status="failed", progress=100)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# REPORT COMPLETE → DONE
+# ─────────────────────────────────────────────────────────────────────────────
+
 def on_report_complete(
     job_id: str,
     report: Dict[str, Any],
@@ -176,6 +163,7 @@ def on_report_complete(
         db.save_report(job_id, report)
         db.update_job(job_id, status="done", progress=100)
 
+        # Clean up ephemeral state from SQLite KV
         db.kv_delete(f"job:{job_id}:counts")
 
         logger.info("Job successfully completed", job_id, tier=tier)
@@ -184,6 +172,10 @@ def on_report_complete(
         logger.error(f"on_report_complete failed: {e}", job_id)
         db.update_job(job_id, status="failed", progress=100)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CRAWL COMPLETE → SCAN
+# ─────────────────────────────────────────────────────────────────────────────
 
 def on_crawl_complete(
     job_id: str,
@@ -198,29 +190,19 @@ def on_crawl_complete(
             db.add_log(job_id, "[SYSTEM] No URLs discovered during crawl", level="ERROR")
             return
 
-        # FIX: Only push to SCAN_QUEUE, NOT BROWSER_QUEUE.
-        # No browser_worker exists, so BROWSER_QUEUE jobs would never be
-        # consumed, and the counter would never reach zero.
-        unique_urls = list(set(urls))
-
-        set_counter(job_id, "scan", len(unique_urls))
+        set_counter(job_id, "scan", len(urls))
         db.update_job(job_id, status="scanning", progress=25)
 
-        for url in unique_urls:
-            push(SCAN_QUEUE, {
-                "job_id": job_id,
-                "url": url,
-                "auth": auth,
-                "tier": tier
-            })
-
+        for url in urls:
+            push(SCAN_QUEUE, {"job_id": job_id, "url": url, "auth": auth, "tier": tier})
 
         logger.info(
-            f"Crawl complete — {len(unique_urls)} URLs queued for scanning",
+            f"Crawl complete — {len(urls)} URLs queued",
             job_id,
-            details={"url_count": len(unique_urls)},
+            details={"url_count": len(urls)},
         )
 
     except Exception as e:
         logger.error(f"on_crawl_complete failed: {e}", job_id)
         db.update_job(job_id, status="failed", progress=100)
+

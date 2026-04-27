@@ -1,3 +1,4 @@
+
 # scanner/ai_report.py
 # ──────────────────────────────────────────────────────────────────────────────
 # AI REPORT GENERATOR — powered exclusively by local Ollama / qwen2.5-coder.
@@ -148,3 +149,4 @@ OUTPUT STRICTLY AS JSON:
             "findings":         enriched,
             "recommendations":  ai_data.get("recommendations", []),
         }
+

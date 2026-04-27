@@ -1,3 +1,4 @@
+
 # scanner/dast/rate_limiter.py
 import time
 from urllib.parse import urlparse
@@ -29,3 +30,5 @@ class RateLimiter:
             if elapsed < delay:
                 time.sleep(delay - elapsed)
         self.last_request[key] = time.time()
+
+

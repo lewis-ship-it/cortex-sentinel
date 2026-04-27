@@ -1,3 +1,4 @@
+
 # workers/auth_worker.py
 
 from workers.base_worker import worker_loop, push_log
@@ -43,3 +44,4 @@ def handle(job):
 
 if __name__ == "__main__":
     worker_loop(AUTH_QUEUE, handle)
+

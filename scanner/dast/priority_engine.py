@@ -1,3 +1,4 @@
+
 # scanner/dast/priority_engine.py
 class PriorityEngine:
     HIGH_RISK   = ["admin","login","auth","account","api","checkout","user","password","upload","file"]
@@ -30,3 +31,5 @@ class PriorityEngine:
         elif any(k in url_l for k in ["redirect","next","return","dest","url"]):
             attacks = ["open_redirect","xss"]
         return attacks
+
+

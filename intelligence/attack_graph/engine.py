@@ -1,3 +1,4 @@
+
 # intelligence/attack_graph/engine.py
 class AttackGraph:
     def __init__(self):
@@ -50,3 +51,4 @@ class AttackGraph:
             if start["severity"] in ("Critical","High") or end["severity"] in ("Critical","High"):
                 paths.append({"path": [start, end], "impact": edge["type"]})
         return paths
+

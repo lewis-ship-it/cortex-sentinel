@@ -1,3 +1,4 @@
+
 # api/realtime.py - Refactored for SQLite persistence
 import logging
 from fastapi import APIRouter, HTTPException
@@ -107,3 +108,4 @@ async def clear_queues():
     except Exception as e:
         logger.error(f"[API] Failed to reset state: {e}")
         raise HTTPException(status_code=500, detail="State reset failed")
+

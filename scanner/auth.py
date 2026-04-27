@@ -1,3 +1,4 @@
+
 # scanner/auth.py
 # ──────────────────────────────────────────────────────────────────────────────
 # FIXES vs previous version:
@@ -131,3 +132,4 @@ class Authenticator:
             if m:
                 return m.group(1)
         return None
+

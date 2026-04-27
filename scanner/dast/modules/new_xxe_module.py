@@ -1,3 +1,4 @@
+
 # scanner/dast/modules/xxe_module.py
 # ──────────────────────────────────────────────────────────────────────────────
 # XXE (XML External Entity) MODULE
@@ -94,3 +95,4 @@ class XXEModule:
                             return
                 except Exception as e:
                     logger.debug(f"XXE test error at {url}: {e}")
+

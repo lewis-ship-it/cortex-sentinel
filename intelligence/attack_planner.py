@@ -1,3 +1,4 @@
+
 # intelligence/attack_planner.py
 
 import random
@@ -117,3 +118,4 @@ class AttackPlanner:
         tasks = self.generate_tasks(actions)
 
         return tasks
+

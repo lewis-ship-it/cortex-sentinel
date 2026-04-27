@@ -1,3 +1,4 @@
+
 class RiskPrioritizer:
 
     def __init__(self):
@@ -48,3 +49,4 @@ class RiskPrioritizer:
         prioritized.sort(key=lambda x: x["priority_score"], reverse=True)
 
         return prioritized
+

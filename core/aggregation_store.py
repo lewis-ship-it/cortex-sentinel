@@ -1,3 +1,4 @@
+
 import redis
 import os
 import json
@@ -29,3 +30,5 @@ def get_findings(job_id):
 
 def clear(job_id):
     r.delete(f"agg:{job_id}")
+
+

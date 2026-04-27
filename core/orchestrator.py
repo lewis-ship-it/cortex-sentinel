@@ -1,3 +1,4 @@
+
 # core/orchestrator.py
 #
 # FIX: Imports core/database.py (which has self.db) not storage/database.py
@@ -21,64 +22,29 @@ class Orchestrator:
         self.cleanup_interval = 900  # 15 minutes
 
     async def handle_completion(self, job_id: str, current_stage: str, results: dict):
-        try:
-            log_event(job_id, "ORCH", f"Handling completion for stage: {current_stage}")
+        if current_stage == "crawl":
+            urls = results.get("urls", [])
+            if not urls:
+                self._fail_job(job_id, "No URLs discovered during crawl.")
+                return
+            log_event(job_id, "ORCH", f"Crawl done. {len(urls)} targets → Scan queue.")
+            db.update_job_status(job_id, "scanning", 25)
+            for url in set(urls):
+                push(SCAN_QUEUE, {"job_id": job_id, "url": url})
 
-            # ------------------ CRAWL → SCAN ------------------
-            if current_stage == "crawl":
-                urls = results.get("urls", [])
+        elif current_stage == "scan":
+            findings = results.get("findings", [])
+            if not findings:
+                log_event(job_id, "ORCH", "Scan complete. No vulnerabilities found.")
+                db.update_job_status(job_id, "done", 100)
+                return
+            log_event(job_id, "ORCH", f"Scan complete. {len(findings)} vulns → Exploit.")
+            db.update_job_status(job_id, "exploiting", 60)
+            push(EXPLOIT_QUEUE, {"job_id": job_id, "findings": findings})
 
-                if not urls:
-                    self._fail_job(job_id, "No URLs discovered during crawl.")
-                    return
-
-                db.init_job_counter(job_id, len(urls))
-                db.update_job_status(job_id, "scanning", 25)
-
-                log_event(job_id, "ORCH", f"Crawl done. {len(urls)} URLs → Scan queue")
-
-                for url in set(urls):
-                    push(SCAN_QUEUE, {
-                        "job_id": job_id,
-                        "url": url,
-                        "target_url": url
-                    })
-
-            # ------------------ SCAN → EXPLOIT ------------------
-            elif current_stage == "scan":
-                remaining = db.decrement_pending_scans(job_id)
-
-                log_event(job_id, "ORCH", f"Scan task done. Remaining: {remaining}")
-
-                if remaining > 0:
-                    return
-
-                findings = results.get("极findings", [])
-
-                if not findings:
-                    log_event(job_id, "ORCH", "No vulnerabilities found. Completing job.")
-                    db.update_job_status(job_id, "completed", 100)
-                    return
-
-                db.update_job_status(job_id, "exploiting", 60)
-
-                push(EXPLOIT_QUEUE, {
-                    "job_id": job_id,
-                    "findings": findings
-                })
-
-            # ------------------ EXPLOIT → REPORT ------------------
-            elif current_stage == "exploit":
-                db.update_job_status(job_id, "reporting", 90)
-
-                push(REPORT_QUEUE, {
-                    "job_id": job_id,
-                    "data": results
-                })
-
-        except Exception as e:
-            log_event(job_id, "ERROR", f"Orchestrator failure: {str(e)}")
-            self._fail_job(job_id, str(e))
+        elif current_stage == "exploit":
+            db.update_job_status(job_id, "reporting", 90)
+            push(REPORT_QUEUE, {"job_id": job_id, "data": results})
 
     def _fail_job(self, job_id: str, reason: str):
         log_event(job_id, "ERROR", reason)
@@ -88,7 +54,7 @@ class Orchestrator:
         """
         Periodically check for and recover stale jobs.
         Call this in a background task or separate cleanup worker.
-
+        
         Args:
             timeout_minutes: Jobs not updated in this many minutes are considered stale
         """
@@ -111,10 +77,5 @@ class Orchestrator:
                 logger.error(f"[ORCH] Cleanup loop error: {e}")
 
 
-# ✅ global instance
 orchestrator = Orchestrator()
 
-
-# ✅ SAFE WRAPPER (THIS IS WHAT YOUR WORKERS SHOULD CALL)
-def handle_stage_completion(job_id: str, stage: str, results: dict):
-    asyncio.create_task(orchestrator.handle_completion(job_id, stage, results))

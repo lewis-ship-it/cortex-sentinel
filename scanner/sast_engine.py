@@ -1,3 +1,4 @@
+
 import zipfile
 import os
 import re
@@ -86,3 +87,4 @@ class SASTScanner:
             logging.error(f"[SAST ERROR] Could not read {path}: {e}")
             
         return results
+

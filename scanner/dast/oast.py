@@ -1,3 +1,4 @@
+
 # scanner/dast/oast.py
 #
 # FIX: Removed pycryptodome dependency (not in requirements.txt).
@@ -64,3 +65,5 @@ class OASTManager:
             except Exception as e:
                 logger.warning(f"[OAST] Polling failed: {e}")
         return []
+
+

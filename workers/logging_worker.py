@@ -1,15 +1,16 @@
+
 import docker
 import os
 import json
 import time
 from datetime import datetime
+from task_queue.redis_client import get_redis_connection
 
 # Docker and Redis setup
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 client = docker.from_env()
 
-# Import Redis from our task_queue module
-from task_queue.redis_client import get_redis_connection
+
 
 redis_client = get_redis_connection()
 
@@ -108,3 +109,4 @@ def monitor_containers():
 
 if __name__ == "__main__":
     monitor_containers()
+

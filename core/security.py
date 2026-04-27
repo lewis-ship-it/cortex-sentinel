@@ -1,3 +1,4 @@
+
 # core/security.py
 # ──────────────────────────────────────────────────────────────────────────────
 # Security utilities — SQLite edition.
@@ -163,3 +164,4 @@ def get_token_manager() -> TokenManager:
     if _token_manager is None:
         _token_manager = TokenManager()
     return _token_manager
+

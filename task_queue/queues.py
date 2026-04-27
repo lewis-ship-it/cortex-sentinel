@@ -1,3 +1,4 @@
+
 # task_queue/queues.py
 # FIX: Added MEMORY_QUEUE and SCORING_QUEUE that core/pipeline.py imports
 
@@ -15,3 +16,4 @@ PLANNER_QUEUE     = "planner_queue"
 MEMORY_QUEUE      = "memory_queue"
 SCORING_QUEUE     = "scoring_queue"
 AUTH_QUEUE        = "auth_queue"
+

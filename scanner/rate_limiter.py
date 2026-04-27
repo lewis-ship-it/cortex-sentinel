@@ -1,3 +1,4 @@
+
 import time
 from urllib.parse import urlparse
 
@@ -55,3 +56,4 @@ class RateLimiter:
             remaining = delay - (time.time() - self.last_request[key])
             return max(0.0, remaining)
         return 0.0
+

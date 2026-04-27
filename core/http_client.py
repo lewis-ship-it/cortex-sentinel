@@ -1,3 +1,4 @@
+
 """
 core/http_client.py
 
@@ -421,7 +422,7 @@ _default_client: Optional[HTTPClient] = None
 
 
 async def get_http_client(
-    timeout:           int                        = 30,
+    timeout:           int                        = 12,
     max_retries:       int                        = 4,
     rate_limit_config: Optional[RateLimitConfig]  = None,
     proxy:             Optional[str]              = None,
@@ -436,3 +437,4 @@ async def get_http_client(
             proxy=proxy,
         )
     return _default_client
+

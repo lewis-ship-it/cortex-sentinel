@@ -308,3 +308,4 @@ def retry_job(
 
 # Backward-compatible alias — old code calls retry(queue, job, error)
 retry = retry_job
+

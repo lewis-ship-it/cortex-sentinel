@@ -1,3 +1,4 @@
+
 # workers/report_worker.py
 # ──────────────────────────────────────────────────────────────────────────────
 # Uses AIReportGenerator (Ollama-backed). No external AI provider.
@@ -74,3 +75,4 @@ def handle(job: dict) -> None:
 
 if __name__ == "__main__":
     worker_loop(REPORT_QUEUE, handle)
+

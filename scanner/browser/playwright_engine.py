@@ -1,3 +1,4 @@
+
 # scanner/browser/playwright_engine.py
 #
 # PLACEMENT: Replace scanner/browser/playwright_engine.py entirely.
@@ -253,3 +254,5 @@ class PlaywrightScanner:
         logger.info(f"[PLAYWRIGHT] SPA crawl: {len(all_discovered)} URLs "
                     f"({len(api_calls)} API calls intercepted)")
         return all_discovered
+
+

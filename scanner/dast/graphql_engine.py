@@ -1,3 +1,4 @@
+
 # scanner/dast/graphql_engine.py
 # FIX: Removed broken Unicode character (衔) from query string.
 
@@ -78,3 +79,5 @@ async def check_graphql_introspection(client, base_url: str) -> dict | None:
         except Exception:
             continue
     return None
+
+

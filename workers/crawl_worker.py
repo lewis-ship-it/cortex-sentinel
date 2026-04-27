@@ -29,7 +29,7 @@ import re
 from workers.base_worker import worker_loop, push_log
 from task_queue.queues import CRAWL_QUEUE
 from core.pipeline import on_crawl_complete
-from core.orchestrator import handle_stage_completion
+from core.orchestrator import handle_completion
 from core.logger import get_logger
 from task_queue.redis_client import log_event
 from scanner.dast.crawler import Crawler
@@ -42,7 +42,7 @@ HIGH_VALUE_PATHS = [
     "/admin", "/admin/", "/administrator", "/wp-admin", "/phpmyadmin",
     "/api", "/api/v1", "/api/v2", "/graphql", "/swagger", "/swagger-ui",
     "/swagger.json", "/openapi.json", "/api-docs", "/.well-known",
-    "/backup极", "/backup.sql", "/dump.sql", "/.env", "/.git/HEAD",
+    "/backup", "/backup.sql", "/dump.sql", "/.env", "/.git/HEAD",
     "/server-status", "/phpinfo.php", "/actuator", "/actuator/health",
     "/actuator/env", "/metrics", "/debug", "/console", "/shell",
     "/robots.txt", "/sitemap.xml", "/crossdomain.xml", "/security.txt",
@@ -84,7 +84,7 @@ def fetch_sitemap_urls(base_url: str) -> list:
     """Parse sitemap.xml for URL discovery."""
     urls = []
     try:
-        r = requests.get(urljoin(base_url, "/sitemap.xml"), timeout极=5)
+        r = requests.get(urljoin(base_url, "/sitemap.xml"), timeout=5)
         if r.status_code == 200:
             urls = re.findall(r'<loc>([^<]+)</loc>', r.text)
     except Exception:
@@ -225,7 +225,7 @@ async def process(job):
         push_log(job_id, f"[CRAWL] Discovery complete. Found {len(filtered_urls)} endpoints.", tier=tier)
 
         # ✅ ALWAYS pass dict (CRITICAL FIX)
-        handle_stage_completion(job_id, "crawl", {
+        handle_completion(job_id, "crawl", {
             "urls": filtered_urls
         })
 
@@ -285,7 +285,7 @@ def handle(job):
     push_log(job_id, f"[CRAWL] Discovery complete. Found {len(filtered_urls)} endpoints.", tier=tier)
 
     # ✅ ALWAYS pass dict (CRITICAL FIX)
-    handle_stage_completion(job_id, "crawl", {
+    handle_completion(job_id, "crawl", {
         "urls": filtered_urls
     })
 

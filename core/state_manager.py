@@ -1,3 +1,4 @@
+
 """
 core/state_manager.py
 
@@ -299,3 +300,4 @@ def get_state_manager(redis_url: str = REDIS_URL) -> StateManager:
     if _state_manager is None:
         _state_manager = StateManager(redis_url)
     return _state_manager
+

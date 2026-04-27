@@ -1,3 +1,4 @@
+
 """
 scanner/ai_brain.py
 
@@ -323,3 +324,4 @@ def get_ai_brain(job_id: str = "system") -> AIBrain:
     if _brain is None:
         _brain = AIBrain(job_id)
     return _brain
+

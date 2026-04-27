@@ -1,3 +1,4 @@
+
 # scanner/js_parser.py
 # ──────────────────────────────────────────────────────────────────────────────
 # JS PARSER — Extracts API endpoints, auth tokens, secrets, and hidden params
@@ -134,3 +135,4 @@ class JSParser:
             except re.error:
                 continue
         return params
+

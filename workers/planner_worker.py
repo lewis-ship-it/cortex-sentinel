@@ -1,3 +1,4 @@
+
 # workers/planner_worker.py
 # ──────────────────────────────────────────────────────────────────────────────
 # AI-DRIVEN ATTACK PLANNER WORKER — Professional tier only
@@ -84,3 +85,4 @@ def handle(job):
 
 if __name__ == "__main__":
     worker_loop(PLANNER_QUEUE, handle)
+

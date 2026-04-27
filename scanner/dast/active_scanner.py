@@ -11,7 +11,7 @@ import logging
 import random
 import re
 import time
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, quote as url_quote
 
 import httpx
 
@@ -372,14 +372,12 @@ class ActiveScanner:
     async def _run_all_modules(self, client, url: str) -> None:
         params = self.param_engine.extract_params(url)
         if not params:
-            # Try adding common params
+            # Try adding common params to discover injection points
             for variant in self.param_engine.add_param_variants(url)[:5]:
                 params = self.param_engine.extract_params(variant)
                 if params:
                     url = variant
                     break
-        if not params:
-            return
 
         from scanner.dast.modules.injection import InjectionModule
         from scanner.dast.modules.client_side import ClientSideModule
@@ -387,7 +385,12 @@ class ActiveScanner:
         from scanner.dast.modules.access import AccessModule
 
         mods = [InjectionModule(self), ClientSideModule(self), InfraModule(self), AccessModule(self)]
-        await asyncio.gather(*(m.run(client, url, params) for m in mods), return_exceptions=True)
+
+        if params:
+            await asyncio.gather(*(m.run(client, url, params) for m in mods), return_exceptions=True)
+
+        # Always test path-based injection for REST-style URLs
+        await self._test_path_injection(client, url)
 
     async def _run_form_modules(self, client, form: dict) -> None:
         from scanner.dast.modules.injection import InjectionModule
@@ -397,6 +400,98 @@ class ActiveScanner:
             ClientSideModule(self).test_form_xss(client, form),
             return_exceptions=True,
         )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # PATH-BASED INJECTION (REST-style URLs like /product/1, /api/users/5)
+    # ─────────────────────────────────────────────────────────────────────────
+    async def _test_path_injection(self, client, url: str) -> None:
+        """Inject payloads into path segments for REST-style endpoints."""
+        from scanner.dast.payloads import SQLI_PAYLOADS, XSS_PAYLOADS, LFI_PAYLOADS
+
+        parsed = urlparse(url)
+        segments = parsed.path.split("/")
+        path_idx = []
+        for i, seg in enumerate(segments):
+            if seg.isdigit() or re.match(r'^[a-f0-9]{8,}$', seg):
+                path_idx.append(i)
+
+        if not path_idx:
+            return
+
+        for idx in path_idx:
+            original = segments[idx]
+
+            # SQLi in path
+            for payload in ["1'", "1' OR '1'='1", "1'--", "1 UNION SELECT 1,2,3--", "0"]:
+                new_segs = segments[:]
+                new_segs[idx] = url_quote(payload, safe='')
+                test_path = "/".join(new_segs)
+                test_url = urlunparse((parsed.scheme, parsed.netloc, test_path,
+                                       parsed.params, parsed.query, parsed.fragment))
+                res = await self._req(client, "GET", test_url)
+                if not res:
+                    continue
+                body = res.text
+                body_lower = body.lower()
+                found_sig = None
+                for sig in SQLI_ERROR_SIGNATURES:
+                    if sig.lower() in body_lower:
+                        found_sig = sig
+                        break
+                    try:
+                        if re.search(sig, body, re.IGNORECASE | re.DOTALL):
+                            found_sig = sig
+                            break
+                    except re.error:
+                        continue
+                if found_sig:
+                    self._add_finding({
+                        "type": "SQL Injection", "subtype": "Path-Based Error",
+                        "url": test_url, "parameter": f"path[{idx}]",
+                        "payload": payload, "severity": "Critical", "confidence": 0.90,
+                        "evidence": f"DB error in path segment: '{found_sig}'",
+                        "description": f"Path segment '{original}' is injectable — unsanitised input reaches the DB.",
+                    })
+                    return
+
+            # LFI in path
+            for payload in LFI_PAYLOADS[:8]:
+                new_segs = segments[:]
+                new_segs[idx] = url_quote(payload, safe='')
+                test_path = "/".join(new_segs)
+                test_url = urlunparse((parsed.scheme, parsed.netloc, test_path,
+                                       parsed.params, parsed.query, parsed.fragment))
+                res = await self._req(client, "GET", test_url)
+                if not res:
+                    continue
+                for ind in ["root:x:", "root:0:0", "[boot loader]", "PHP Version", "phpinfo()"]:
+                    if ind in res.text:
+                        self._add_finding({
+                            "type": "Local File Inclusion (LFI)", "subtype": "Path-Based",
+                            "url": test_url, "parameter": f"path[{idx}]",
+                            "payload": payload, "severity": "Critical", "confidence": 0.90,
+                            "evidence": f"File marker '{ind}' in response",
+                            "description": f"Path segment '{original}' allows file inclusion.",
+                        })
+                        return
+
+            # XSS in path
+            for payload in ["<script>alert(1)</script>", "<img src=x onerror=alert(1)>"]:
+                new_segs = segments[:]
+                new_segs[idx] = url_quote(payload, safe='')
+                test_path = "/".join(new_segs)
+                test_url = urlunparse((parsed.scheme, parsed.netloc, test_path,
+                                       parsed.params, parsed.query, parsed.fragment))
+                res = await self._req(client, "GET", test_url)
+                if res and payload in res.text:
+                    self._add_finding({
+                        "type": "Cross-Site Scripting (XSS)", "subtype": "Path-Based Reflected",
+                        "url": test_url, "parameter": f"path[{idx}]",
+                        "payload": payload, "severity": "High", "confidence": 0.85,
+                        "evidence": f"Payload reflected in path segment",
+                        "description": f"Path segment '{original}' reflects unsanitised input.",
+                    })
+                    return
 
     # ─────────────────────────────────────────────────────────────────────────
     # HEADER INJECTION / AUTH BYPASS
@@ -648,27 +743,32 @@ class ActiveScanner:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# AI FALSE-POSITIVE FILTER
+# AI FALSE-POSITIVE TAGGER
+# Tags every finding with FP likelihood instead of dropping any.
+# All findings are kept — the UI decides what to highlight.
 # ─────────────────────────────────────────────────────────────────────────────
-async def filter_false_positives(findings: list, brain) -> list:
-    validated = []
+async def tag_false_positives(findings: list, brain) -> list:
+    """Tag each finding with ai_confidence and fp_likelihood. Never drops findings."""
     for f in findings:
+        # OAST-verified or very high confidence → unlikely FP
         if "OAST" in f.get("type","") or f.get("confidence",0) > 0.98:
             f["ai_confidence"]  = 1.0
             f["ai_explanation"] = "Verified via out-of-band interaction."
-            validated.append(f)
+            f["fp_likelihood"]  = "unlikely"
             continue
         try:
             result = await brain.validate_finding(f)
             conf = result.get("confidence", 0)
-            if result.get("valid") and conf >= 0.65:
-                f["ai_confidence"]  = conf
-                f["ai_explanation"] = result.get("reason","")
-                validated.append(f)
+            f["ai_confidence"]  = conf
+            f["ai_explanation"] = result.get("reason","")
+            if conf >= 0.85:
+                f["fp_likelihood"] = "unlikely"
+            elif conf >= 0.60:
+                f["fp_likelihood"] = "possible"
             else:
-                logger.info(f"[AI FILTER] Dropped: {f.get('type')} (conf={conf:.2f})")
+                f["fp_likelihood"] = "likely"
         except Exception as e:
-            logger.warning(f"[AI FILTER] Error: {e}")
+            logger.warning(f"[AI TAGGER] Error: {e}")
             f["ai_confidence"] = 0.5
-            validated.append(f)
-    return validated
+            f["fp_likelihood"] = "possible"
+    return findings

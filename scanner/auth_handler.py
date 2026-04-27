@@ -1,3 +1,4 @@
+
 # scanner/auth_handler.py
 
 import logging
@@ -44,3 +45,4 @@ class AuthHandler:
             client.cookies.set(k, v)
 
         logging.info("[AUTH] Cookies injected")
+
