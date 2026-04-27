@@ -19,7 +19,6 @@
 # ──────────────────────────────────────────────────────────────────────────────
 
 import asyncio
-import logging
 import httpx
 import requests
 from urllib.parse import urljoin, urlparse

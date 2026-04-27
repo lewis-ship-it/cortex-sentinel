@@ -29,8 +29,7 @@ import re
 import html
 import difflib
 import logging
-import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import unquote  # ADDED: URL decoding import
 
@@ -411,14 +410,14 @@ class Validator:
         # Confirm directionality: true response should be closer to baseline
         base_vs_true  = abs(base_len - true_len)
         base_vs_false = abs(base_len - false_len)
-        if base_vs_true >= base极s_false and baseline_body:
+        if base_vs_true >= base_vs_false and baseline_body:
             return VerificationResult.negative(
                 "Boolean: false response is closer to baseline — injection may not be working"
             )
 
         return VerificationResult(
             is_vulnerable=True,
-            confidence=min(0.5 + (1 - sim极 0.90),
+            confidence=min(0.5 + (1 - sim * 0.90), 1.0),  # Added missing parenthesis and cap at 1.0
             evidence_snippet=(
                 f"Boolean differential: true={true_len}b false={false_len}b "
                 f"delta={length_delta}b similarity={sim:.2f}"
@@ -674,9 +673,9 @@ class Detector:
         dangerous_parts = ["<script", "onerror=", "onload=", "javascript:", "alert(", "confirm("]
         for part in dangerous_parts:
             if part.lower() in payload.lower() and part.lower() in rt.lower():
-                return {"confidence": 0.65, "evidence": f"Dangerous payload fragment reflected极 {part}"}
+                return {"confidence": 0.65, "evidence": f"Dangerous payload fragment reflected: {part}"}
 
-        for pat in XSS极INK_PATTERNS:
+        for pat in XSS_SINK_PATTERNS:
             if re.search(pat, rt, re.IGNORECASE | re.DOTALL):
                 if any(c in rt for c in ["alert", "confirm", "prompt"]):
                     return {"confidence": 0.90, "evidence": f"JS sink pattern detected: {pat}"}

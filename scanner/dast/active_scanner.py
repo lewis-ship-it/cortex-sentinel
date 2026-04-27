@@ -6,12 +6,10 @@
 # Modules: Injection, ClientSide, Infra, Access, XXE, NoSQL, API Abuse
 
 import asyncio
-import json
 import logging
 import random
 import re
-import time
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, quote as url_quote
+from urllib.parse import urlparse, urlunparse, quote as url_quote
 
 import httpx
 
@@ -21,6 +19,7 @@ from scanner.dast.context_engine import ContextEngine
 from scanner.dast.waf_detector import WAFDetector
 from scanner.dast.graphql_engine import check_graphql_introspection
 from task_queue.redis_client import log_event
+from scanner.detector import SQLI_ERROR_SIGNATURES
 
 try:
     from scanner.dast.oast import OASTManager
@@ -258,17 +257,28 @@ class ActiveScanner:
         cookies   = str(res.cookies).lower()
         body      = res.text.lower()
         tech = []
-        if "php" in x_powered or ".php" in str(res.url):   tech.append("PHP")
-        if "express" in x_powered or "node" in server:      tech.append("Node.js")
-        if "csrftoken" in cookies or "django" in body:      tech.append("Django")
-        if "flask" in cookies:                               tech.append("Flask")
-        if "asp.net" in x_powered or "iis" in server:       tech.append("ASP.NET")
-        if "wp-content" in body or "wp-json" in body:       tech.append("WordPress")
-        if "laravel" in cookies or "laravel" in body:        tech.append("Laravel")
-        if "angular" in body:                                tech.append("Angular")
-        if "react" in body or "__next" in body:              tech.append("React")
-        if "vue" in body:                                    tech.append("Vue")
-        if "juice" in body or "juiceshop" in body:           tech.append("JuiceShop")
+        if "php" in x_powered or ".php" in str(res.url):
+            tech.append("PHP")
+        if "express" in x_powered or "node" in server:
+            tech.append("Node.js")
+        if "csrf" in cookies or "django" in body:
+            tech.append("Django")
+        if "flask" in cookies:
+            tech.append("Flask")
+        if "asp.net" in x_powered or "iis" in server:
+            tech.append("ASP.NET")
+        if "wp-content" in body or "wp-json" in body:
+            tech.append("WordPress")
+        if "laravel" in cookies or "laravel" in body:
+            tech.append("Laravel")
+        if "angular" in body:
+            tech.append("Angular")
+        if "react" in body or "__next" in body:
+            tech.append("React")
+        if "vue" in body:
+            tech.append("Vue")
+        if "juice" in body or "juiceshop" in body:
+            tech.append("JuiceShop")
         return tech or ["Generic"]
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -284,7 +294,7 @@ class ActiveScanner:
         self.waf_name       = None
         self.target_tech    = ["Generic"]
         self.job_id         = job_id
-        self.target_url     = base_url
+        self.target_url极   = base_url
 
         logger.info(f"[SCAN] Starting: {base_url}")
         log_event(self.job_id, "SCAN", f"Starting scan: {base_url}")
@@ -306,7 +316,7 @@ class ActiveScanner:
             if auth_config:
                 await self._handle_auth(client, auth_config)
 
-            # Phase 0+1: WAF + Tech fingerprint
+            # Phase 0+: WAF + Tech fingerprint
             await self._detect_waf_and_tech(client, base_url)
 
             # Phase 2: Deep Crawl
@@ -397,7 +407,7 @@ class ActiveScanner:
         from scanner.dast.modules.client_side import ClientSideModule
         await asyncio.gather(
             InjectionModule(self).test_form(client, form),
-            ClientSideModule(self).test_form_xss(client, form),
+            ClientSideModule(self).test_form(client, form),
             return_exceptions=True,
         )
 
@@ -406,7 +416,7 @@ class ActiveScanner:
     # ─────────────────────────────────────────────────────────────────────────
     async def _test_path_injection(self, client, url: str) -> None:
         """Inject payloads into path segments for REST-style endpoints."""
-        from scanner.dast.payloads import SQLI_PAYLOADS, XSS_PAYLOADS, LFI_PAYLOADS
+        from scanner.dast.payloads import LFI_PAYLOADS
 
         parsed = urlparse(url)
         segments = parsed.path.split("/")
@@ -488,7 +498,7 @@ class ActiveScanner:
                         "type": "Cross-Site Scripting (XSS)", "subtype": "Path-Based Reflected",
                         "url": test_url, "parameter": f"path[{idx}]",
                         "payload": payload, "severity": "High", "confidence": 0.85,
-                        "evidence": f"Payload reflected in path segment",
+                        "evidence": "Payload reflected in path segment",
                         "description": f"Path segment '{original}' reflects unsanitised input.",
                     })
                     return

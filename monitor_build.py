@@ -47,16 +47,16 @@ class BuildMonitor:
         try:
             containers = json.loads(output)
             return {c["Service"]: c for c in containers}
-        except:
-            return {}
+        except Exception as e:
+            return {"Error": str(e)}
 
     def get_service_logs(self, service, lines=5):
         """Get last N lines of service logs."""
         try:
             output = self.run_cmd(f"docker-compose logs --tail={lines} {service}")
             return output
-        except:
-            return ""
+        except Exception as e:
+            return {"Error": str(e)}
 
     def print_header(self):
         """Print monitor header."""
@@ -197,7 +197,7 @@ class BuildMonitor:
         bar = "█" * filled + "░" * (bar_length - filled)
         
         print(f"│ [{bar}] {progress:>3}%")
-        print(f"│")
+        print("│")
         print(f"│ Running: {self.colors['green']}{states['running']}{self.colors['reset']} │ " +
               f"Building: {self.colors['yellow']}{states['building']}{self.colors['reset']} │ " +
               f"Exited: {states['exited']} │ " +
