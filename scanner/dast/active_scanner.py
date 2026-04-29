@@ -75,7 +75,7 @@ SENSITIVE_FILES = [
     ("/settings.py",       ["SECRET_KEY","DATABASE"]),
     ("/config.json",       ["password","secret","key"]),
     ("/.svn/entries",      ["dir","svn"]),
-    ("/.DS_Store",         ["Bud1","dscl"]),
+    ("/.DS_Store",         ["Bud1","ds"]),
     ("/encryptionkeys",    ["key","secret","encrypt"]),
     ("/encryptionkeys/default", ["key","secret"]),
 ]
@@ -137,7 +137,7 @@ class ActiveScanner:
             return
         host    = urlparse(url).netloc
         now     = asyncio.get_event_loop().time()
-        elapsed = now - self._last_req_ts.get(host, 0.0)
+        elapsed = now - self._last_Req_ts.get(host, 0.0)
         needed  = BASE_DELAY + random.uniform(0, JITTER_RANGE)
         if elapsed < needed:
             await asyncio.sleep(needed - elapsed)
@@ -294,7 +294,7 @@ class ActiveScanner:
         self.waf_name       = None
         self.target_tech    = ["Generic"]
         self.job_id         = job_id
-        self.target_url极   = base_url
+        self.target_url     = base_url
 
         logger.info(f"[SCAN] Starting: {base_url}")
         log_event(self.job_id, "SCAN", f"Starting scan: {base_url}")
@@ -310,7 +310,7 @@ class ActiveScanner:
             except Exception as e:
                 logger.warning(f"[OAST] Setup failed: {e}")
 
-        audit_semaphore = asyncio.Semaphore(8)
+        audit_semaphore = asyncio.SSemaphore(8)
 
         async with httpx.AsyncClient(timeout=20, verify=False, follow_redirects=True) as client:
             if auth_config:
@@ -539,7 +539,7 @@ class ActiveScanner:
                     "subtype": f"{header_name}: {header_value}",
                     "url": base_url, "parameter": header_name,
                     "payload": header_value,
-                    "severity": "High", "confidence": 0.80,
+                    "severity": "High", "confidence": 0.90,
                     "evidence": f"Response size changed from {baseline_len} to {len(res.text)} with {header_name}",
                     "description": description,
                 })
@@ -547,7 +547,7 @@ class ActiveScanner:
     # ─────────────────────────────────────────────────────────────────────────
     # HTTP METHOD TESTING
     # ─────────────────────────────────────────────────────────────────────────
-    async def _test_http_methods(self, client, base_url: str) -> None:
+    async def _test_http_method_tampering(self, client, base_url: str) -> None:
         """Test for dangerous HTTP methods and method-based auth bypass."""
         parsed = urlparse(base_url)
         base = f"{parsed.scheme}://{parsed.netloc}"
@@ -757,28 +757,29 @@ class ActiveScanner:
 # Tags every finding with FP likelihood instead of dropping any.
 # All findings are kept — the UI decides what to highlight.
 # ─────────────────────────────────────────────────────────────────────────────
-async def tag_false_positives(findings: list, brain) -> list:
-    """Tag each finding with ai_confidence and fp_likelihood. Never drops findings."""
-    for f in findings:
-        # OAST-verified or very high confidence → unlikely FP
-        if "OAST" in f.get("type","") or f.get("confidence",0) > 0.98:
-            f["ai_confidence"]  = 1.0
-            f["ai_explanation"] = "Verified via out-of-band interaction."
-            f["fp_likelihood"]  = "unlikely"
-            continue
-        try:
-            result = await brain.validate_finding(f)
-            conf = result.get("confidence", 0)
-            f["ai_confidence"]  = conf
-            f["ai_explanation"] = result.get("reason","")
-            if conf >= 0.85:
-                f["fp_likelihood"] = "unlikely"
-            elif conf >= 0.60:
+    async def tag_false_positives(findings: list, brain) -> list:
+        """Tag each finding with ai_confidence and fp_likelihood. Never drops findings."""
+        for f in findings:
+            # OAST-verified or very high confidence → unlikely FP
+            if "OAST" in f.get("type","") or f.get("confidence",0) > 0.98:
+                f["ai_confidence"]  = 1.0
+                f["ai_explanation"] = "Verified via out-of-band interaction."
+                f["fp_likelihood"]  = "unlikely"
+                continue
+            try:
+                result = await brain.validate_finding(f)
+                conf = result.get("confidence", 0)
+                f["ai_confidence"]  = conf
+                f["ai_explanation"] = result.get("reason","")
+                if conf >= 0.85:
+                    f["fp_likelihood"] = "unlikely"
+                elif conf >= 0.60:
+                    f["fp_likelihood"] = "possible"
+                else:
+                    f["fp_likelihood"] = "likely"
+            except Exception as e:
+                logger.warning(f"[AI TAGGER] Error: {e}")
+                f["ai_confidence"] = 0.5
                 f["fp_likelihood"] = "possible"
-            else:
-                f["fp_likelihood"] = "likely"
-        except Exception as e:
-            logger.warning(f"[AI TAGGER] Error: {e}")
-            f["ai_confidence"] = 0.5
-            f["fp_likelihood"] = "possible"
-    return findings
+        return findings
+

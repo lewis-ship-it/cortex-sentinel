@@ -29,7 +29,7 @@ services:
       - "8000:8000"
     volumes:
       - .:/app
-      - sentinel_data:/app/data
+      - ./sentinel.db:/app/data/sentinel.db
     networks:
       - sentinel_net
     environment:
@@ -52,7 +52,7 @@ services:
     command: python -m workers.scan_worker
     volumes:
       - .:/app
-      - sentinel_data:/app/data
+      - ./sentinel.db:/app/data/sentinel.db
     networks:
       - sentinel_net
     environment:
@@ -71,7 +71,7 @@ services:
     command: python -m workers.exploit_worker
     volumes:
       - .:/app
-      - sentinel_data:/app/data
+      - ./sentinel.db:/app/data/sentinel.db
     networks:
       - sentinel_net
     environment:
@@ -90,7 +90,7 @@ services:
     command: python -m workers.report_worker
     volumes:
       - .:/app
-      - sentinel_data:/app/data
+      - ./sentinel.db:/app/data/sentinel.db
     networks:
       - sentinel_net
     environment:
@@ -111,7 +111,7 @@ services:
     command: python -m workers.memory_worker
     volumes:
       - .:/app
-      - sentinel_data:/app/data
+      - ./sentinel.db:/app/data/sentinel.db
     networks:
       - sentinel_net
     environment:
@@ -132,7 +132,7 @@ services:
     command: python -m workers.scoring_worker
     volumes:
       - .:/app
-      - sentinel_data:/app/data
+      - ./sentinel.db:/app/data/sentinel.db
     networks:
       - sentinel_net
     environment:
@@ -155,7 +155,7 @@ services:
     command: python -m workers.crawl_worker
     volumes:
       - .:/app
-      - sentinel_data:/app/data
+      - ./sentinel.db:/app/data/sentinel.db
     networks:
       - sentinel_net
     environment:
@@ -177,7 +177,7 @@ services:
     command: python -m workers.aggregation_worker
     volumes:
       - .:/app
-      - sentinel_data:/app/data
+      - ./sentinel.db:/app/data/sentinel.db
     networks:
       - sentinel_net
     environment:
@@ -199,7 +199,7 @@ services:
     command: python -m workers.auth_worker
     volumes:
       - .:/app
-      - sentinel_data:/app/data
+      - ./sentinel.db:/app/data/sentinel.db
     networks:
       - sentinel_net
     environment:
@@ -223,7 +223,7 @@ services:
     command: python -m workers.api_worker
     volumes:
       - .:/app
-      - sentinel_data:/app/data
+      - ./sentinel.db:/app/data/sentinel.db
     networks:
       - sentinel_net
     environment:
@@ -245,7 +245,7 @@ services:
     command: python -m workers.planner_worker
     volumes:
       - .:/app
-      - sentinel_data:/app/data
+      - ./sentinel.db:/app/data/sentinel.db
     networks:
       - sentinel_net
     environment:
@@ -269,5 +269,4 @@ networks:
 # Named volumes
 # ───────────────────────────────────────────────────────────────────
 volumes:
-  sentinel_data:
   ollama_data:

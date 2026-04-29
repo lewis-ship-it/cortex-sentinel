@@ -160,7 +160,7 @@ def clear_queues(queues: Optional[List[str]] = None) -> None:
 # QUEUE HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def push(queue_name: str, data: dict) -> None:
+def push(queue_name: str, data: dict) -> bool:
     """
     Push a JSON payload onto the right end of a Redis list queue.
     Now includes internal retry logic to handle transient connection blips.

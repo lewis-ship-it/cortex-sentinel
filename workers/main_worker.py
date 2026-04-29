@@ -1,3 +1,24 @@
+# workers/main_worker.py
+# ──────────────────────────────────────────────────────────────────────────────
+# LEGACY MONOLITHIC WORKER — retained for backward-compatibility only.
+#
+# The current architecture uses dedicated pipeline workers:
+#   crawl_worker → scan_worker → exploit_worker → aggregation_worker
+#   → [memory_worker + scoring_worker] → report_worker
+#
+# This file previously imported `dequeue_scan` from the (missing)
+# task_queue/redis_scanner.py, causing an ImportError on startup.
+# That module now exists.  However this worker should NOT be run alongside
+# the new pipeline workers — it would double-process every job.
+#
+# To use the new pipeline:
+#   docker-compose up  (starts all dedicated workers via docker-compose.yml)
+#
+# To use this legacy worker in standalone mode (e.g. local dev without Docker):
+#   python -m workers.main_worker
+#   (ensure NO other pipeline workers are running against the same Redis)
+# ──────────────────────────────────────────────────────────────────────────────
+
 import sys
 import os
 import asyncio
@@ -6,6 +27,7 @@ import logging
 # Ensure root directory is in path for imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# FIX: dequeue_scan now importable — task_queue/redis_scanner.py was missing.
 from task_queue.redis_scanner import dequeue_scan
 from scanner.dast.active_scanner import ActiveScanner
 from scanner.sast_engine import SASTScanner
@@ -27,6 +49,7 @@ graph_engine   = AttackGraph()
 exploit_engine = ExploitEngine()
 db             = DatabaseManager()
 
+
 def log(job_id: str, message: str):
     print(f"[{job_id}] {message}")
     try:
@@ -36,10 +59,10 @@ def log(job_id: str, message: str):
     except Exception:
         pass
 
+
 async def process(job):
-    job_id   = job["job_id"]
-    # Logic: Use 'target_url' to match your Supabase column name
-    target_url = job.get("target_url") or job.get("url") 
+    job_id     = job["job_id"]
+    target_url = job.get("target_url") or job.get("url")
     zip_path   = job.get("zip_path")
     auth       = job.get("auth")
     budget     = job.get("budget", 2.00)
@@ -61,10 +84,9 @@ async def process(job):
         # 1. Web Scanning (DAST)
         if target_url:
             log(job_id, "Running DAST Engine...")
-            # We pass the target_url here to the scanner
             results = await dast.scan(target_url, auth_config=auth, job_id=job_id)
             findings.extend(results)
-            await dast.finalize_and_report() 
+            await dast.finalize_and_report()
             update_job(job_id, status="running", progress=40)
 
         # 2. Source Code Scanning (SAST)
@@ -78,7 +100,7 @@ async def process(job):
         if findings:
             log(job_id, "Analyzing findings and building attack graph...")
             db.save_vulnerabilities(job_id, findings)
-            
+
             all_findings = await exploit_engine.verify(findings)
             graph = graph_engine.build(all_findings)
             attack_paths = graph_engine.find_attack_paths()
@@ -99,11 +121,10 @@ async def process(job):
                     "total_vulns": len(all_findings)
                 }
             }
-            
-            # Using target_url for the report metadata
+
             full_report = await reporter.generate_report(report_data, target_url or zip_path)
             db.save_report(job_id, full_report)
-        
+
         update_job(job_id, status="done", progress=100)
         log(job_id, "Scan completed successfully.")
 
@@ -112,8 +133,9 @@ async def process(job):
         update_job(job_id, status="failed", progress=100)
         try:
             await dast.finalize_and_report()
-        except:
+        except Exception:
             pass
+
 
 async def main():
     print("Sentinel Worker Online — listening to Redis...")
@@ -125,6 +147,7 @@ async def main():
         except Exception as e:
             print(f"Queue Error: {e}")
         await asyncio.sleep(1)
+
 
 if __name__ == "__main__":
     asyncio.run(main())

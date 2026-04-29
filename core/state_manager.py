@@ -14,6 +14,7 @@ from typing import Optional, Dict, List
 from datetime import datetime
 import os
 
+
 logger = logging.getLogger(__name__)
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")

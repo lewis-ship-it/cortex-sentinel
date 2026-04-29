@@ -711,8 +711,8 @@ async def start_scan(req: ScanIn, key: str = Depends(verify_key)):
         logger.info(f"[API] Auth→Crawl pipeline started  job={job_id}  url={req.url[:70]}")
     else:
         # No auth: go straight to crawl
-        push("crawl_queue", _crawl_payload)
-        logger.info(f"[API] Crawl pipeline started  job={job_id}  url={req.url[:70]}")
+        enqueue_scan(_crawl_payload)  # ✅ USE THE PROPER ENQUEUE FUNCTION
+        logger.info(f"[API] Scan job queued  job={job_id}  url={req.url[:70]}")
     return ScanOut(job_id=job_id, type="web_scan")
 
 

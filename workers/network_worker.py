@@ -1,10 +1,14 @@
-
 # workers/network_worker.py
+# ──────────────────────────────────────────────────────────────────────────────
+# FIX — CPU-spinning busy-loop
+#   Old code used non-blocking pop() + asyncio.sleep(1) in the main loop.
+#   Fixed: replaced with blocking_pop(timeout=5) to eliminate idle CPU burn.
+# ──────────────────────────────────────────────────────────────────────────────
 
 import asyncio
 import logging
 
-from task_queue.redis_client import pop, push, retry_job as retry
+from task_queue.redis_client import blocking_pop, push, retry_job as retry
 from task_queue.queues import NETWORK_QUEUE, AGGREGATION_QUEUE
 from scanner.network_engine import NetworkEngine
 from core.job_tracker import update_stage
@@ -12,12 +16,12 @@ from core.job_tracker import update_stage
 engine = NetworkEngine()
 
 
-async def main():
+async def main() -> None:
     logging.info("[NET WORKER] Ready and listening...")
     while True:
-        job = pop(NETWORK_QUEUE)
+        # FIX: blocking_pop replaces pop() + asyncio.sleep(1) busy-loop
+        job = blocking_pop(NETWORK_QUEUE, timeout=5)
         if not job:
-            await asyncio.sleep(1)
             continue
 
         job_id = job.get("job_id")
@@ -36,10 +40,8 @@ async def main():
 
         except Exception as e:
             logging.error(f"[NET WORKER] Failed for {target}: {e}")
-            # FIX: exponential back-off retry
             retry(NETWORK_QUEUE, job, str(e))
 
 
 if __name__ == "__main__":
     asyncio.run(main())
-
