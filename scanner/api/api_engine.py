@@ -1,4 +1,3 @@
-
 # scanner/api_engine.py
 
 import asyncio
@@ -7,10 +6,19 @@ import json
 import logging
 import base64
 import re
+import sys
 from urllib.parse import urljoin, urlparse, urlencode
+from typing import Dict, List, Set, Optional, Any
 
-logging.basicConfig(level=logging.INFO)
+# Configure structured logging
+logger = logging.getLogger("api_scanner")
+logger.setLevel(logging.INFO)
 
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
 
 # ─────────────────────────────────────────────────────────────
 # KNOWN GRAPHQL INTROSPECTION QUERY
@@ -90,7 +98,12 @@ class APIEngine:
 
     def __init__(self, timeout=10, max_concurrent=20):
         self.timeout = timeout
+        self.max_concurrent = max_concurrent
         self.semaphore = asyncio.Semaphore(max_concurrent)
+        self.client_limits = httpx.Limits(
+            max_connections=max_concurrent,
+            max_keepalive_connections=10
+        )
 
     # ─────────────────────────────────────────
     # MAIN ENTRY POINT
@@ -109,60 +122,115 @@ class APIEngine:
         findings = []
         headers = self._build_headers(auth_token)
 
-        async with httpx.AsyncClient(
-            timeout=self.timeout,
-            verify=False,
-            follow_redirects=True,
-            headers=headers
-        ) as client:
+        logger.info(f"Starting API scan: {base_url}")
 
-            logging.info(f"[API] Starting scan: {base_url}")
+        try:
+            async with httpx.AsyncClient(
+                timeout=self.timeout,
+                verify=True,  # Enabled SSL verification for security
+                follow_redirects=True,
+                headers=headers,
+                limits=self.client_limits
+            ) as client:
 
-            # ── 1. Endpoint discovery ─────────────────
-            endpoints = await self._discover_endpoints(client, base_url, spec_url)
-            logging.info(f"[API] Discovered {len(endpoints)} endpoints")
+                # Health check before proceeding
+                if not await self._health_check(client, base_url):
+                    findings.append(self._finding(
+                        ftype="Target Unreachable",
+                        severity="Low",
+                        url=base_url,
+                        desc="Target did not respond to basic health check",
+                        evidence="HTTP request failed or timed out"
+                    ))
+                    return findings
 
-            # ── 2. GraphQL checks ─────────────────────
-            gql_findings = await self._test_graphql(client, base_url)
-            findings.extend(gql_findings)
+                # ── 1. Endpoint discovery ─────────────────
+                endpoints = await self._discover_endpoints(client, base_url, spec_url)
+                logger.info(f"Discovered {len(endpoints)} endpoints")
 
-            # ── 3. JWT analysis ───────────────────────
-            jwt_findings = await self._test_jwt(client, base_url, auth_token)
-            findings.extend(jwt_findings)
+                # ── 2. GraphQL checks ─────────────────────
+                gql_findings = await self._test_graphql(client, base_url)
+                findings.extend(gql_findings)
 
-            # ── 4. Auth & access control ──────────────
-            auth_findings = await self._test_auth(client, base_url, endpoints)
-            findings.extend(auth_findings)
+                # ── 3. JWT analysis ───────────────────────
+                jwt_findings = await self._test_jwt(client, base_url, auth_token)
+                findings.extend(jwt_findings)
 
-            # ── 5. BOLA / IDOR ────────────────────────
-            bola_findings = await self._test_bola(client, endpoints)
-            findings.extend(bola_findings)
+                # ── 4. Auth & access control ──────────────
+                auth_findings = await self._test_auth(client, base_url, endpoints)
+                findings.extend(auth_findings)
 
-            # ── 6. Rate limiting ──────────────────────
-            rate_findings = await self._test_rate_limiting(client, base_url, endpoints)
-            findings.extend(rate_findings)
+                # ── 5. BOLA / IDOR ────────────────────────
+                bola_findings = await self._test_bola(client, endpoints)
+                findings.extend(bola_findings)
 
-            # ── 7. HTTP method abuse ──────────────────
-            method_findings = await self._test_http_methods(client, endpoints)
-            findings.extend(method_findings)
+                # ── 6. Rate limiting ──────────────────────
+                rate_findings = await self._test_rate_limiting(client, base_url, endpoints)
+                findings.extend(rate_findings)
 
-            # ── 8. Sensitive data in responses ────────
-            leak_findings = await self._test_data_exposure(client, endpoints)
-            findings.extend(leak_findings)
+                # ── 7. HTTP method abuse ──────────────────
+                method_findings = await self._test_http_methods(client, endpoints)
+                findings.extend(method_findings)
 
-            # ── 9. Security headers ───────────────────
-            header_findings = await self._test_security_headers(client, base_url)
-            findings.extend(header_findings)
+                # ── 8. Sensitive data in responses ────────
+                leak_findings = await self._test_data_exposure(client, endpoints)
+                findings.extend(leak_findings)
 
-            # ── 10. Mass assignment ───────────────────
-            mass_findings = await self._test_mass_assignment(client, endpoints)
-            findings.extend(mass_findings)
+                # ── 9. Security headers ───────────────────
+                header_findings = await self._test_security_headers(client, base_url)
+                findings.extend(header_findings)
 
-        logging.info(f"[API] Scan complete. {len(findings)} findings.")
+                # ── 10. Mass assignment ───────────────────
+                mass_findings = await self._test_mass_assignment(client, endpoints)
+                findings.extend(mass_findings)
+
+        except httpx.RequestError as e:
+            logger.error(f"Network request failed: {e}")
+            findings.append(self._finding(
+                ftype="Network Error",
+                severity="Low",
+                url=base_url,
+                desc=f"Network request failed: {e}",
+                evidence="Request exception occurred"
+            ))
+        except Exception as e:
+            logger.error(f"Unexpected error during scan: {e}")
+            findings.append(self._finding(
+                ftype="Scan Error",
+                severity="Low",
+                url=base_url,
+                desc=f"Unexpected error occurred during scan: {e}",
+                evidence="Exception during scanning process"
+            ))
+
+        # Deduplicate findings before returning
+        findings = self._deduplicate_findings(findings)
+        logger.info(f"Scan complete. Found {len(findings)} unique findings.")
         return findings
 
+    async def _health_check(self, client, base_url):
+        """Check if the target is responsive before full scan."""
+        try:
+            response = await client.get(base_url, timeout=5)
+            return response.status_code < 500
+        except (httpx.RequestError, httpx.TimeoutException):
+            return False
+
+    def _deduplicate_findings(self, findings):
+        """Remove duplicate findings based on type and URL."""
+        seen = set()
+        unique_findings = []
+        
+        for finding in findings:
+            key = (finding["type"], finding["url"])
+            if key not in seen:
+                seen.add(key)
+                unique_findings.append(finding)
+        
+        return unique_findings
+
     # ─────────────────────────────────────────
-    # 1. ENDPOINT DISCOVERY
+    # 1. ENDPOINT DISCOVERY (ORIGINAL)
     # ─────────────────────────────────────────
     async def _discover_endpoints(self, client, base_url, spec_url=None):
         """
@@ -176,16 +244,16 @@ class APIEngine:
         spec = await self._fetch_spec(client, base_url, spec_url)
         if spec:
             endpoints.update(self._parse_openapi_spec(spec, base_url))
-            logging.info(f"[API] Loaded {len(endpoints)} endpoints from spec")
+            logger.info(f"Loaded {len(endpoints)} endpoints from spec")
 
         # Probe common paths regardless
         tasks = [
             self._probe_path(client, base_url, path)
             for path in COMMON_API_PATHS
         ]
-        results = await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         for path, alive in zip(COMMON_API_PATHS, results):
-            if alive:
+            if isinstance(alive, bool) and alive:
                 endpoints.add(urljoin(base_url, path))
 
         return list(endpoints)
@@ -208,9 +276,9 @@ class APIEngine:
                 if res.status_code == 200:
                     data = res.json()
                     if "paths" in data or "openapi" in data or "swagger" in data:
-                        logging.info(f"[API] Found spec at {url}")
+                        logger.info(f"Found spec at {url}")
                         return data
-            except Exception:
+            except (httpx.RequestError, json.JSONDecodeError):
                 continue
         return None
 
@@ -232,11 +300,11 @@ class APIEngine:
                 url = urljoin(base_url, path)
                 res = await client.get(url)
                 return res.status_code not in (404, 410)
-            except Exception:
+            except (httpx.RequestError, httpx.TimeoutException):
                 return False
 
     # ─────────────────────────────────────────
-    # 2. GRAPHQL CHECKS
+    # 2. GRAPHQL CHECKS (ORIGINAL)
     # ─────────────────────────────────────────
     async def _test_graphql(self, client, base_url):
         findings = []
@@ -312,13 +380,14 @@ class APIEngine:
                             evidence="Array of queries accepted and executed"
                         ))
 
-                except Exception:
+                except (httpx.RequestError, json.JSONDecodeError) as e:
+                    logger.debug(f"GraphQL test failed for {url}: {e}")
                     continue
 
         return findings
 
     # ─────────────────────────────────────────
-    # 3. JWT ANALYSIS
+    # 3. JWT ANALYSIS (ORIGINAL)
     # ─────────────────────────────────────────
     async def _test_jwt(self, client, base_url, auth_token=None):
         findings = []
@@ -339,7 +408,7 @@ class APIEngine:
         # ── Decode header ────────────────────────
         try:
             header = json.loads(self._b64_decode(header_b64))
-        except Exception:
+        except (json.JSONDecodeError, ValueError):
             return findings
 
         # ── Algorithm: none attack ────────────────
@@ -392,7 +461,7 @@ class APIEngine:
                     evidence="No 'exp' field in JWT payload"
                 ))
 
-        except Exception:
+        except (json.JSONDecodeError, ValueError):
             pass
 
         return findings
@@ -411,7 +480,7 @@ class APIEngine:
                 match = re.search(r'eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+', text)
                 if match:
                     return match.group(0)
-            except Exception:
+            except (httpx.RequestError, httpx.TimeoutException):
                 continue
         return None
 
@@ -441,7 +510,7 @@ class APIEngine:
         return base64.urlsafe_b64decode(s)
 
     # ─────────────────────────────────────────
-    # 4. AUTH & ACCESS CONTROL
+    # 4. AUTH & ACCESS CONTROL (ORIGINAL)
     # ─────────────────────────────────────────
     async def _test_auth(self, client, base_url, endpoints):
         findings = []
@@ -449,7 +518,7 @@ class APIEngine:
         # Build an unauthenticated client
         unauth_client = httpx.AsyncClient(
             timeout=self.timeout,
-            verify=False,
+            verify=True,
             follow_redirects=True
         )
 
@@ -486,7 +555,7 @@ class APIEngine:
                                     evidence=f"GET {url} → {res.status_code}"
                                 ))
 
-                    except Exception:
+                    except (httpx.RequestError, httpx.TimeoutException):
                         continue
         finally:
             await unauth_client.aclose()
@@ -498,7 +567,7 @@ class APIEngine:
         return any(p in url.lower() for p in public)
 
     # ─────────────────────────────────────────
-    # 5. BOLA / IDOR
+    # 5. BOLA / IDOR (ORIGINAL)
     # ─────────────────────────────────────────
     async def _test_bola(self, client, endpoints):
         """
@@ -541,7 +610,7 @@ class APIEngine:
                             ))
                             break  # One confirmed hit is enough per endpoint
 
-                    except Exception:
+                    except (httpx.RequestError, httpx.TimeoutException):
                         continue
 
         return findings
@@ -556,7 +625,7 @@ class APIEngine:
             return ["1", "2", "admin", "test", "00000000-0000-0000-0000-000000000001"]
 
     # ─────────────────────────────────────────
-    # 6. RATE LIMITING
+    # 6. RATE LIMITING (ORIGINAL)
     # ─────────────────────────────────────────
     async def _test_rate_limiting(self, client, base_url, endpoints):
         findings = []
@@ -573,14 +642,17 @@ class APIEngine:
         for url in targets:
             async with self.semaphore:
                 try:
-                    # Send 20 rapid requests
-                    tasks = [client.post(url, json={}) for _ in range(20)]
-                    responses = await asyncio.gather(*tasks, return_exceptions=True)
-
-                    status_codes = [
-                        r.status_code for r in responses
-                        if isinstance(r, httpx.Response)
-                    ]
+                    # Send rapid requests with small delays
+                    status_codes = []
+                    for i in range(20):
+                        try:
+                            res = await client.post(url, json={})
+                            status_codes.append(res.status_code)
+                            # Add small delay to avoid overwhelming
+                            if i % 5 == 0:
+                                await asyncio.sleep(0.1)
+                        except (httpx.RequestError, httpx.TimeoutException):
+                            continue
 
                     # If we never got a 429, rate limiting isn't enforced
                     if status_codes and 429 not in status_codes:
@@ -595,12 +667,12 @@ class APIEngine:
                         ))
 
                 except Exception as e:
-                    logging.debug(f"[API] Rate limit test error: {e}")
+                    logger.debug(f"Rate limit test error: {e}")
 
         return findings
 
     # ─────────────────────────────────────────
-    # 7. HTTP METHOD ABUSE
+    # 7. HTTP METHOD ABUSE (ORIGINAL)
     # ─────────────────────────────────────────
     async def _test_http_methods(self, client, endpoints):
         findings = []
@@ -640,14 +712,14 @@ class APIEngine:
                             evidence="TRACE → HTTP 200"
                         ))
 
-                except Exception:
+                except (httpx.RequestError, httpx.TimeoutException):
                     continue
 
         return findings
 
     # ─────────────────────────────────────────
-    # 8. SENSITIVE DATA EXPOSURE
-    # ─────────────────────────────────────────
+    # 8. SENSITIVE DATA EXPOSURE (ORIGINAL)
+    #极────────────────────────────────────────
     async def _test_data_exposure(self, client, endpoints):
         findings = []
 
@@ -690,13 +762,13 @@ class APIEngine:
                             ))
                             break
 
-                except Exception:
+                except (httpx.RequestError, httpx.TimeoutException):
                     continue
 
         return findings
 
     # ─────────────────────────────────────────
-    # 9. SECURITY HEADERS
+    # 9. SECURITY HEADERS (ORIGINAL)
     # ─────────────────────────────────────────
     async def _test_security_headers(self, client, base_url):
         findings = []
@@ -711,7 +783,7 @@ class APIEngine:
             "Strict-Transport-Security": (None, "High",
                                           "Missing HSTS header. Clients may connect over HTTP, "
                                           "exposing tokens and data to interception."),
-            "Content-Security-Policy":   (None, "Medium",
+            "极ontent-Security-Policy":   (None, "Medium",
                                           "Missing Content-Security-Policy header."),
         }
 
@@ -749,8 +821,8 @@ class APIEngine:
             cors_findings = self._check_cors(res.headers, base_url)
             findings.extend(cors_findings)
 
-        except Exception as e:
-            logging.warning(f"[API] Header check failed: {e}")
+        except (httpx.RequestError, httpx.TimeoutException) as e:
+            logger.warning(f"Header check failed: {e}")
 
         return findings
 
@@ -783,7 +855,7 @@ class APIEngine:
         return findings
 
     # ─────────────────────────────────────────
-    # 10. MASS ASSIGNMENT
+    # 10. MASS ASSIGNMENT (ORIGINAL)
     # ─────────────────────────────────────────
     async def _test_mass_assignment(self, client, endpoints):
         """
@@ -793,7 +865,7 @@ class APIEngine:
         findings = []
         privileged_fields = {
             "is_admin": True,
-            "role": "admin",
+            "极le": "admin",
             "balance": 99999,
             "credits": 99999,
             "verified": True,
@@ -832,13 +904,13 @@ class APIEngine:
                                 evidence=f"Reflected fields: {reflected}"
                             ))
 
-                except Exception:
+                except (httpx.RequestError, httpx.TimeoutException):
                     continue
 
         return findings
 
     # ─────────────────────────────────────────
-    # HELPER: BUILD FINDING DICT
+    # HELPER: BUILD FINDING DICT (ORIGINAL)
     # ─────────────────────────────────────────
     def _finding(self, ftype, severity, url, desc, evidence=""):
         return {
@@ -861,4 +933,3 @@ class APIEngine:
                 else f"Bearer {auth_token}"
             headers["Authorization"] = token
         return headers
-

@@ -1,6 +1,6 @@
 # scanner/dast/modules/client_side.py
 #
-# AGGRESSIVE CLIENT-SIDE MODULE — Deep XSS, Open Redirect, DOM Clobbering,
+# ENHANCED CLIENT-SIDE MODULE — Deep XSS, Open Redirect, DOM Clobbering,
 # Prototype Pollution, PostMessage abuse, CORS misconfiguration
 # Uses context-aware payloads, WAF bypass mutations, and multi-verification
 
@@ -8,307 +8,653 @@ import asyncio
 import logging
 import re
 import urllib.parse
-from urllib.parse import urlparse
-from scanner.dast.payloads import XSS_PAYLOADS, OPEN_REDIRECT_PAYLOADS
+import html as html_lib
+from typing import Dict, List, Optional, Set, Tuple, Any
+from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
+import httpx
 
 logger = logging.getLogger(__name__)
 
-REDIRECT_PARAMS = frozenset({
-    "redirect", "next", "return", "dest", "destination", "url", "goto",
-    "redir", "return_url", "callback", "target", "link", "forward",
-    "location", "continue", "ref", "return_to", "redirect_uri", "redirect_url",
-    "to", "route", "page", "view", "out", "exit", "away",
-})
+# Default configuration
+DEFAULT_CONFIG = {
+    "redirect_params": {
+        "redirect", "next", "return", "dest", "destination", "url", "goto",
+        "redir", "return_url", "callback", "target", "link", "forward",
+        "location", "continue", "ref", "return_to", "redirect_uri", "redirect_url",
+        "to", "route", "page", "view", "out", "exit", "away", "uri", "path",
+    },
+    "dom_reflect_params": {
+        "q", "query", "search", "keyword", "s", "k", "term",
+        "name", "user", "username", "email", "comment", "message",
+        "input", "text", "value", "data", "content", "body",
+        "title", "description", "label", "tag", "category", "id",
+        "code", "filter", "sort", "order", "field", "select",
+    },
+    "max_payloads_per_param": 15,
+    "max_mutations_per_payload": 6,
+    "request_timeout": 15,
+    "concurrent_requests": 5,
+    "min_reflection_length": 3,
+    "confidence_threshold": 0.7,
+}
 
-# Parameters likely to reflect in DOM
-DOM_REFLECT_PARAMS = frozenset({
-    "q", "query", "search", "keyword", "s", "k", "term",
-    "name", "user", "username", "email", "comment", "message",
-    "input", "text", "value", "data", "content", "body",
-    "title", "description", "label", "tag", "category",
-})
+# Enhanced XSS payloads categorized by context
+XSS_PAYLOADS_BY_CONTEXT = {
+    "html": [
+        "<script>alert(1)</script>",
+        "<img src=x onerror=alert(1)>",
+        "<svg onload=alert(1)>",
+        "<body onload=alert(1)>",
+        "<iframe src=javascript:alert(1)>",
+        "<video><source onerror=alert(1)>",
+        "<audio src=x onerror=alert(1)>",
+        "<details open ontoggle=alert(1)>",
+        "<marquee onstart=alert(1)>",
+    ],
+    "attribute": [
+        "\" onload=alert(1) \"",
+        "' onmouseover=alert(1) '",
+        " onfocus=alert(1) autofocus ",
+        " onerror=alert(1) ",
+        " onscroll=alert(1) ",
+        " oninput=alert(1) ",
+    ],
+    "javascript": [
+        "javascript:alert(1)",
+        "javascripT:alert(1)",
+        "java%0ascript:alert(1)",
+        "alert(1)",
+        "confirm(1)",
+        "prompt(1)",
+        "eval('alert(1)')",
+        "setTimeout('alert(1)',0)",
+        "setInterval('alert(1)',0)",
+    ],
+    "url": [
+        "javascript:alert(1)",
+        "data:text/html,<script>alert(1)</script>",
+        "vbscript:alert(1)",
+        "livescript:alert(1)",
+    ]
+}
 
-
-def _xss_mutations(payload: str) -> list:
-    """Generate WAF-bypass variants of an XSS payload."""
-    variants = [payload]
-    # URL encoding
-    variants.append(urllib.parse.quote(payload))
-    # Double URL encoding
-    variants.append(urllib.parse.quote(urllib.parse.quote(payload)))
-    # HTML entity encoding for angle brackets
-    variants.append(payload.replace("<", "%3C").replace(">", "%3E"))
-    # Case alternation
-    if "<script" in payload.lower():
-        variants.append(payload.replace("script", "ScRiPt"))
-    # Tab/newline in tag
-    if "<" in payload:
-        variants.append(payload.replace("<", "<\t"))
-        variants.append(payload.replace("<", "<\n"))
-    # Null byte
-    if "script" in payload.lower():
-        variants.append(payload.replace("script", "scri\x00pt"))
-    # Unicode
-    variants.append(payload.replace("<", "\u003c").replace(">", "\u003e"))
-    return variants[:6]
-
+# Open redirect payloads
+OPEN_REDIRECT_PAYLOADS = [
+    "https://evil.com",
+    "http://evil.com",
+    "//evil.com",
+    "\\evil.com",
+    "javascript:alert(1)",
+    "data:text/html,<script>alert(1)</script>",
+    "//attacker.com",
+    "https://google.com",  # Benign but external
+    "http://example.com",
+]
 
 class ClientSideModule:
-    def __init__(self, scanner):
+    def __init__(self, scanner, config: Optional[Dict] = None):
         self.scanner = scanner
+        self.config = {**DEFAULT_CONFIG, **(config or {})}
+        self.rate_limiter = asyncio.Semaphore(self.config["concurrent_requests"])
 
-    async def run(self, client, url: str, params: list) -> None:
-        tasks = []
-        for param in params:
-            tasks.append(self.test_xss(client, url, param))
-            tasks.append(self.test_open_redirect(client, url, param))
-            tasks.append(self.test_dom_xss(client, url, param))
-            tasks.append(self.test_cors(client, url, param))
-        await asyncio.gather(*tasks, return_exceptions=True)
+    async def run(self, client: httpx.AsyncClient, url: str, params: List[str]) -> None:
+        """Run all client-side tests with enhanced error handling"""
+        try:
+            tasks = []
+            for param in params:
+                if param.lower() in self.config["redirect_params"]:
+                    tasks.append(self.test_open_redirect(client, url, param))
+                if param.lower() in self.config["dom_reflect_params"]:
+                    tasks.append(self.test_xss(client, url, param))
+                    tasks.append(self.test_dom_xss(client, url, param))
+                
+            # Global tests (not parameter-specific)
+            tasks.append(self.test_cors(client, url))
+            tasks.append(self.test_postmessage(client, url))
+            
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Log any exceptions
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.error(f"Client-side test failed: {result}")
+                    
+        except Exception as e:
+            logger.error(f"Client-side module failed for {url}: {e}")
 
-    # ── XSS ───────────────────────────────────────────────────────────────────
-    async def test_xss(self, client, url: str, param: str) -> None:
-        # Phase 1: detect context with neutral canary
-        context = await self.scanner._get_context(client, url, param)
-        payloads = self.scanner.context_engine.get_payloads(context)
-        if not payloads:
-            payloads = XSS_PAYLOADS
+    # ── Enhanced XSS Testing ──────────────────────────────────────────────────
+    async def test_xss(self, client: httpx.AsyncClient, url: str, param: str) -> None:
+        """Comprehensive XSS testing with context detection"""
+        try:
+            # Phase 1: Detect reflection with canary
+            canary = f"xss_test_{param}_{id(url) % 10000}"
+            test_url = self._inject_param(url, param, canary)
+            response = await self._safe_request(client, "GET", test_url)
+            
+            if not response or canary not in response.text:
+                return  # No reflection detected
+                
+            # Phase 2: Detect context
+            context = self._detect_context(response.text, canary)
+            payloads = self._get_contextual_payloads(context)
+            
+            # Phase 3: Test with contextual payloads
+            for payload in payloads[:self.config["max_payloads_per_param"]]:
+                for mutated_payload in self._xss_mutations(payload)[:self.config["max_mutations_per_payload"]]:
+                    if await self._test_xss_payload(client, url, param, mutated_payload, context):
+                        return  # Stop after first successful detection
+                        
+        except Exception as e:
+            logger.error(f"XSS test failed for {url} param {param}: {e}")
 
-        # Phase 2: verify reflection with canary
-        canary = f"ctx_{param}_{id(url) % 10000}"
-        c_url  = self.scanner.param_engine.inject_payload(url, param, canary)
-        c_res  = await self.scanner._req(client, "GET", c_url)
-        if not c_res or canary not in c_res.text:
-            return  # no reflection — skip
+    def _detect_context(self, response_text: str, canary: str) -> str:
+        """Detect the context where the canary is reflected"""
+        # Find the position of the canary
+        pos = response_text.find(canary)
+        if pos == -1:
+            return "unknown"
+            
+        # Extract surrounding context
+        start = max(0, pos - 50)
+        end = min(len(response_text), pos + len(canary) + 50)
+        context = response_text[start:end]
+        
+        # Detect context type
+        if re.search(r'<script[^>]*>.*' + canary, context, re.IGNORECASE):
+            return "javascript"
+        elif re.search(r'<[^>]+\s[^>]*' + canary, context, re.IGNORECASE):
+            return "attribute"
+        elif re.search(r'href=["\']?[^"\']*' + canary, context, re.IGNORECASE):
+            return "url"
+        elif re.search(r'<' + canary + r'[^>]*>', context, re.IGNORECASE):
+            return "html"
+        else:
+            return "text"
 
-        # Phase 3: attack with targeted payloads + mutations
-        for payload in payloads:
-            for mutated in _xss_mutations(payload):
-                test_url = self.scanner.param_engine.inject_payload(url, param, mutated)
-                res = await self.scanner._req(client, "GET", test_url)
-                if not res:
-                    continue
+    def _get_contextual_payloads(self, context: str) -> List[str]:
+        """Get appropriate payloads for the detected context"""
+        return XSS_PAYLOADS_BY_CONTEXT.get(context, XSS_PAYLOADS_BY_CONTEXT["html"])
 
-                # Check for exact reflection (highest confidence)
-                if mutated in res.text:
-                    self.scanner._add_finding({
-                        "type": "Cross-Site Scripting (XSS)", "subtype": f"Reflected ({context})",
-                        "url": test_url, "parameter": param, "payload": mutated,
-                        "severity": "High" if context == "html" else "Critical",
-                        "confidence": 0.95,
-                        "evidence": f"Payload reflected verbatim in '{context}' context",
-                        "description": f"Parameter '{param}' reflects unsanitised input in {context} context.",
-                    })
-                    return
+    def _xss_mutations(self, payload: str) -> List[str]:
+        """Generate WAF-bypass variants of an XSS payload"""
+        mutations = [payload]
+        
+        # URL encoding variants
+        mutations.append(urllib.parse.quote(payload))
+        mutations.append(urllib.parse.quote(urllib.parse.quote(payload)))
+        
+        # HTML entity encoding
+        mutations.append(payload.replace("<", "&lt;").replace(">", "&gt;"))
+        mutations.append(payload.replace("<", "%3C").replace(">", "%3E"))
+        
+        # Case alternation
+        if "script" in payload.lower():
+            mutations.append(payload.replace("script", "ScRiPt"))
+            mutations.append(payload.replace("script", "sCRipt"))
+            
+        # Whitespace variations
+        if "<" in payload:
+            mutations.append(payload.replace("<", "<\t"))
+            mutations.append(payload.replace("<", "<\n"))
+            mutations.append(payload.replace("<", "<\r"))
+            
+        # Null byte injection
+        if any(keyword in payload.lower() for keyword in ["script", "on", "alert"]):
+            mutated = payload.replace("script", "scri\x00pt")
+            mutated = mutated.replace("onload", "on\x00load")
+            mutations.append(mutated)
+            
+        # Unicode variations
+        mutations.append(payload.replace("<", "\u003c").replace(">", "\u003e"))
+        mutations.append(payload.replace("'", "\u0027").replace('"', "\u0022"))
+        
+        return list(set(mutations))  # Remove duplicates
 
-                # Check for partial reflection (dangerous fragments)
-                dangerous_fragments = [
-                    "<script", "onerror=", "onload=", "onclick=",
-                    "onfocus=", "onmouseover=", "javascript:",
-                    "alert(", "confirm(", "prompt(",
-                ]
-                for frag in dangerous_fragments:
-                    if frag.lower() in mutated.lower() and frag.lower() in res.text.lower():
-                        self.scanner._add_finding({
-                            "type": "Cross-Site Scripting (XSS)", "subtype": f"Partial Reflection ({context})",
-                            "url": test_url, "parameter": param, "payload": mutated,
-                            "severity": "High",
-                            "confidence": 0.80,
-                            "evidence": f"Dangerous fragment '{frag}' reflected in '{context}' context",
-                            "description": f"Parameter '{param}' partially reflects dangerous input.",
-                        })
-                        return
+    async def _test_xss_payload(self, client: httpx.AsyncClient, url: str, param: str, 
+                              payload: str, context: str) -> bool:
+        """Test a specific XSS payload"""
+        test_url = self._inject_param(url, param, payload)
+        response = await self._safe_request(client, "GET", test_url)
+        
+        if not response:
+            return False
+            
+        # Check for exact reflection
+        if payload in response.text:
+            self._report_xss(url, param, payload, context, "exact", response)
+            return True
+            
+        # Check for HTML-decoded reflection
+        decoded = html_lib.unescape(payload)
+        if decoded != payload and decoded in response.text:
+            self._report_xss(url, param, payload, context, "html_decoded", response)
+            return True
+            
+        # Check for dangerous fragments
+        dangerous_patterns = [
+            r"<script[^>]*>", r"onerror\s*=", r"onload\s*=", r"onclick\s*=",
+            r"onfocus\s*=", r"onmouseover\s*=", r"javascript:",
+            r"alert\(", r"confirm\(", r"prompt\(", r"eval\(",
+        ]
+        
+        for pattern in dangerous_patterns:
+            if re.search(pattern, response.text, re.IGNORECASE):
+                self._report_xss(url, param, payload, context, "fragment", response)
+                return True
+                
+        return False
 
-                # Check for HTML-decoded reflection
-                import html as _html
-                decoded = _html.unescape(mutated)
-                if decoded != mutated and decoded in res.text:
-                    self.scanner._add_finding({
-                        "type": "Cross-Site Scripting (XSS)", "subtype": f"HTML-Decoded Reflection ({context})",
-                        "url": test_url, "parameter": param, "payload": mutated,
-                        "severity": "High",
-                        "confidence": 0.85,
-                        "evidence": f"Payload reflected after HTML decode in '{context}' context",
-                        "description": f"Parameter '{param}' reflects HTML-decoded input.",
-                    })
-                    return
+    def _report_xss(self, url: str, param: str, payload: str, context: str, 
+                   detection_type: str, response: httpx.Response) -> None:
+        """Report XSS finding"""
+        severity = "Critical" if context in ["html", "javascript"] else "High"
+        confidence = 0.95 if detection_type == "exact" else 0.8
+        
+        self.scanner._add_finding({
+            "type": "Cross-Site Scripting (XSS)",
+            "subtype": f"Reflected ({context}) - {detection_type}",
+            "url": url,
+            "parameter": param,
+            "payload": payload,
+            "severity": severity,
+            "confidence": confidence,
+            "evidence": f"Payload reflected in {context} context",
+            "description": f"Parameter '{param}' reflects unsanitized input in {context} context.",
+        })
 
-    # ── DOM-based XSS ─────────────────────────────────────────────────────────
-    async def test_dom_xss(self, client, url: str, param: str) -> None:
-        """Test for DOM-based XSS by checking if JS sources read the parameter."""
-        if param.lower() not in DOM_REFLECT_PARAMS and param.lower() not in REDIRECT_PARAMS:
-            return
+    # ── Enhanced DOM XSS Testing ──────────────────────────────────────────────
+    async def test_dom_xss(self, client: httpx.AsyncClient, url: str, param: str) -> None:
+        """Comprehensive DOM-based XSS testing"""
+        try:
+            response = await self._safe_request(client, "GET", url)
+            if not response:
+                return
+                
+            # Check for DOM sinks
+            dom_sinks = self._detect_dom_sinks(response.text)
+            if not dom_sinks:
+                return
+                
+            # Test DOM clobbering
+            if await self._test_dom_clobbering(client, url, param):
+                return
+                
+            # Test prototype pollution
+            if await self._test_prototype_pollution(client, url, param):
+                return
+                
+            # Test traditional DOM XSS
+            await self._test_traditional_dom_xss(client, url, param, dom_sinks)
+            
+        except Exception as e:
+            logger.error(f"DOM XSS test failed for {url}: {e}")
 
-        # Check if the page source contains DOM sinks
-        res = await self.scanner._req(client, "GET", url)
-        if not res:
-            return
-
-        dom_sinks = [
+    def _detect_dom_sinks(self, html_content: str) -> List[str]:
+        """Detect potential DOM sinks in HTML content"""
+        sink_patterns = [
             r'\.innerHTML\s*=', r'\.outerHTML\s*=',
             r'document\.write\s*\(', r'document\.writeln\s*\(',
-            r'\.insertAdjacentHTML\s*\(',
-            r'eval\s*\(', r'setTimeout\s*\(["\']',
+            r'\.insertAdjacentHTML\s*\(', r'\.insertAdjacentText\s*\(',
+            r'eval\s*\(', r'setTimeout\s*\(["\']', r'setInterval\s*\(["\']',
+            r'Function\s*\(', r'\.src\s*=\s*[^"\']*\+',
             r'location\s*=', r'location\.href\s*=',
             r'location\.search', r'location\.hash',
             r'document\.URL', r'document\.documentURI',
             r'document\.referrer', r'window\.name',
-            r'\.src\s*=\s*[^"\']*\+',  # dynamic src assignment
+            r'\.setAttribute\s*\([^,]*,[^)]*\)',  # Potential for attribute XSS
         ]
+        
+        detected_sinks = []
+        for pattern in sink_patterns:
+            if re.search(pattern, html_content, re.IGNORECASE):
+                detected_sinks.append(pattern)
+                
+        return detected_sinks
 
-        has_sink = False
-        for sink in dom_sinks:
-            if re.search(sink, res.text):
-                has_sink = True
-                break
-
-        if not has_sink:
-            return
-
-        # If there's a DOM sink, try injecting into the parameter
-        dom_payloads = [
-            f"'><img src=x onerror=alert(1)>",
-            f"'><svg/onload=alert(1)>",
-            f"'><script>alert(1)</script>",
-            f"'><iframe src=javascript:alert(1)>",
-            f"jaVasCript:alert(1)//",
+    async def _test_dom_clobbering(self, client: httpx.AsyncClient, url: str, param: str) -> bool:
+        """Test for DOM clobbering vulnerabilities"""
+        clobbering_payloads = [
+            f"<form id={param}><input name=attributes></form>",
+            f"<a id={param} name=href></a>",
+            f"<div id={param}><div name=parentNode></div></div>",
         ]
-        for payload in dom_payloads:
-            test_url = self.scanner.param_engine.inject_payload(url, param, payload)
-            res2 = await self.scanner._req(client, "GET", test_url)
-            if res2 and payload in res2.text:
+        
+        for payload in clobbering_payloads:
+            test_url = self._inject_param(url, param, payload)
+            response = await self._safe_request(client, "GET", test_url)
+            
+            if response and payload in response.text:
                 self.scanner._add_finding({
-                    "type": "Cross-Site Scripting (XSS)", "subtype": "DOM-Based",
-                    "url": test_url, "parameter": param, "payload": payload,
-                    "severity": "High", "confidence": 0.85,
-                    "evidence": f"DOM sink + parameter reflection — payload in page source",
+                    "type": "DOM Clobbering",
+                    "subtype": f"Parameter: {param}",
+                    "url": test_url,
+                    "parameter": param,
+                    "payload": payload,
+                    "severity": "Medium",
+                    "confidence": 0.75,
+                    "evidence": "DOM clobbering payload reflected",
+                    "description": f"Parameter '{param}' may be vulnerable to DOM clobbering attacks.",
+                })
+                return True
+                
+        return False
+
+    async def _test_prototype_pollution(self, client: httpx.AsyncClient, url: str, param: str) -> bool:
+        """Test for prototype pollution vulnerabilities"""
+        pollution_payloads = [
+            "__proto__.polluted=true",
+            "constructor.prototype.polluted=true",
+            "Object.prototype.polluted=true",
+        ]
+        
+        for payload in pollution_payloads:
+            test_url = self._inject_param(url, param, payload)
+            response = await self._safe_request(client, "GET", test_url)
+            
+            if response and payload in response.text:
+                self.scanner._add_finding({
+                    "type": "Prototype Pollution",
+                    "subtype": f"Parameter: {param}",
+                    "url": test_url,
+                    "parameter": param,
+                    "payload": payload,
+                    "severity": "High",
+                    "confidence": 0.8,
+                    "evidence": "Prototype pollution payload reflected",
+                    "description": f"Parameter '{param}' may be vulnerable to prototype pollution attacks.",
+                })
+                return True
+                
+        return False
+
+    async def _test_traditional_dom_xss(self, client: httpx.AsyncClient, url: str, 
+                                      param: str, dom_sinks: List[str]) -> None:
+        """Test traditional DOM XSS vulnerabilities"""
+        dom_payloads = [
+            "'><img src=x onerror=alert(1)>",
+            "'><svg onload=alert(1)>",
+            "javascript:alert(1)",
+            "data:text/html,<script>alert(1)</script>",
+        ]
+        
+        for payload in dom_payloads:
+            test_url = self._inject_param(url, param, payload)
+            response = await self._safe_request(client, "GET", test_url)
+            
+            if response and payload in response.text:
+                self.scanner._add_finding({
+                    "type": "DOM-based XSS",
+                    "subtype": f"Parameter: {param}",
+                    "url": test_url,
+                    "parameter": param,
+                    "payload": payload,
+                    "severity": "High",
+                    "confidence": 0.85,
+                    "evidence": f"DOM sink detected + payload reflection",
                     "description": f"Parameter '{param}' flows into a DOM sink without sanitization.",
                 })
                 return
 
-    # ── Open Redirect ─────────────────────────────────────────────────────────
-    async def test_open_redirect(self, client, url: str, param: str) -> None:
-        if param.lower() not in REDIRECT_PARAMS:
-            return
-
-        base_host = urlparse(url).netloc
-
-        for payload in OPEN_REDIRECT_PAYLOADS:
-            for mutated in [payload, urllib.parse.quote(payload)]:
-                test_url = self.scanner.param_engine.inject_payload(url, param, mutated)
-                try:
-                    res = await client.get(test_url, follow_redirects=False, timeout=15)
-                except Exception:
-                    continue
-
-                loc = res.headers.get("location", "")
-                if not loc:
-                    continue
-
-                loc_host = urlparse(loc).netloc
-                is_external = (
-                    loc_host and loc_host != base_host
-                    or loc.startswith("//")
-                    or "javascript:" in loc.lower()
-                    or "evil.com" in loc.lower()
-                )
-                if is_external:
-                    self.scanner._add_finding({
-                        "type": "Open Redirect", "subtype": "Unvalidated External Redirect",
-                        "url": test_url, "parameter": param, "payload": payload,
-                        "severity": "Medium", "confidence": 0.92,
-                        "evidence": f"Location: {loc}",
-                        "description": f"Parameter '{param}' redirects to arbitrary external URLs.",
-                    })
-                    return
-
-                # Also check 200 responses that might contain a meta refresh redirect
-                if res.status_code == 200:
-                    if "evil.com" in res.text or "javascript:" in res.text.lower():
-                        self.scanner._add_finding({
-                            "type": "Open Redirect", "subtype": "Meta/JS Redirect",
-                            "url": test_url, "parameter": param, "payload": payload,
-                            "severity": "Medium", "confidence": 0.80,
-                            "evidence": "Redirect target in response body",
-                            "description": f"Parameter '{param}' may allow redirect via meta/JS.",
-                        })
+    # ── Enhanced Open Redirect Testing ────────────────────────────────────────
+    async def test_open_redirect(self, client: httpx.AsyncClient, url: str, param: str) -> None:
+        """Comprehensive open redirect testing"""
+        try:
+            base_host = urlparse(url).netloc
+            
+            for payload in OPEN_REDIRECT_PAYLOADS:
+                for mutated_payload in self._redirect_mutations(payload):
+                    test_url = self._inject_param(url, param, mutated_payload)
+                    response = await self._safe_request(
+                        client, "GET", test_url, follow_redirects=False
+                    )
+                    
+                    if not response:
+                        continue
+                        
+                    if self._is_redirect_vulnerable(response, base_host, mutated_payload):
+                        self._report_open_redirect(url, param, mutated_payload, response)
                         return
+                        
+        except Exception as e:
+            logger.error(f"Open redirect test failed for {url}: {e}")
 
-    # ── CORS Misconfiguration ─────────────────────────────────────────────────
-    async def test_cors(self, client, url: str, param: str) -> None:
-        """Test for CORS misconfiguration by sending requests with different origins."""
-        evil_origins = [
-            "https://evil.com",
-            "https://attacker.com",
-            "null",
-            url,  # Same origin (should be allowed)
+    def _redirect_mutations(self, payload: str) -> List[str]:
+        """Generate redirect payload variations"""
+        mutations = [payload]
+        
+        # URL encoding
+        mutations.append(urllib.parse.quote(payload))
+        mutations.append(urllib.parse.quote(urllib.parse.quote(payload)))
+        
+        # Case variations
+        if "javascript:" in payload.lower():
+            mutations.append(payload.replace("javascript:", "javaScript:"))
+            mutations.append(payload.replace("javascript:", "JAVASCRIPT:"))
+            
+        return mutations
+
+    def _is_redirect_vulnerable(self, response: httpx.Response, base_host: str, payload: str) -> bool:
+        """Determine if redirect response is vulnerable"""
+        # Check HTTP redirect headers
+        location = response.headers.get("location", "")
+        if location and self._is_external_redirect(location, base_host):
+            return True
+            
+        # Check meta refresh redirects
+        if response.status_code == 200:
+            meta_refresh = re.search(
+                r'<meta[^>]*http-equiv=["\']?refresh["\']?[^>]*content=["\'][^"\']*url=([^"\']+)',
+                response.text, re.IGNORECASE
+            )
+            if meta_refresh and self._is_external_redirect(meta_refresh.group(1), base_host):
+                return True
+                
+            # Check JavaScript redirects
+            js_redirects = [
+                r'window\.location\s*=\s*["\']([^"\']+)',
+                r'window\.location\.href\s*=\s*["\']([^"\']+)',
+                r'location\.replace\s*\(["\']([^"\']+)',
+            ]
+            
+            for pattern in js_redirects:
+                js_match = re.search(pattern, response.text, re.IGNORECASE)
+                if js_match and self._is_external_redirect(js_match.group(1), base_host):
+                    return True
+                    
+        return False
+
+    def _is_external_redirect(self, target: str, base_host: str) -> bool:
+        """Check if redirect target is external"""
+        try:
+            target_host = urlparse(target).netloc
+            # Handle protocol-relative URLs
+            if target.startswith("//"):
+                return True
+            # Handle JavaScript URLs
+            if target.lower().startswith("javascript:"):
+                return True
+            # Handle data URLs
+            if target.lower().startswith("data:"):
+                return True
+            # Handle different hosts
+            if target_host and target_host != base_host:
+                return True
+        except Exception:
+            pass
+            
+        return False
+
+    def _report_open_redirect(self, url: str, param: str, payload: str, response: httpx.Response) -> None:
+        """Report open redirect finding"""
+        location = response.headers.get("location", "")
+        evidence = f"Location: {location}" if location else "Meta/JS redirect detected"
+        
+        self.scanner._add_finding({
+            "type": "Open Redirect",
+            "subtype": "Unvalidated Redirect",
+            "url": url,
+            "parameter": param,
+            "payload": payload,
+            "severity": "Medium",
+            "confidence": 0.9,
+            "evidence": evidence,
+            "description": f"Parameter '{param}' allows unvalidated redirects to external URLs.",
+        })
+
+    # ── Enhanced CORS Testing ─────────────────────────────────────────────────
+    async def test_cors(self, client: httpx.AsyncClient, url: str) -> None:
+        """Comprehensive CORS misconfiguration testing"""
+        try:
+            test_origins = [
+                "https://evil.com",
+                "http://attacker.net",
+                "null",
+                "https://" + urlparse(url).netloc,  # Same origin different scheme
+                "https://subdomain.evil.com",
+            ]
+            
+            for origin in test_origins:
+                if await self._test_cors_origin(client, url, origin):
+                    return
+                    
+            # Test pre-flight requests
+            await self._test_cors_preflight(client, url)
+            
+        except Exception as e:
+            logger.error(f"CORS test failed for {url}: {e}")
+
+    async def _test_cors_origin(self, client: httpx.AsyncClient, url: str, origin: str) -> bool:
+        """Test CORS for a specific origin"""
+        try:
+            response = await self._safe_request(
+                client, "GET", url, 
+                headers={"Origin": origin},
+                follow_redirects=True
+            )
+            
+            if not response:
+                return False
+                
+            acao = response.headers.get("access-control-allow-origin", "")
+            acac = response.headers.get("access-control-allow-credentials", "").lower()
+            
+            # Wildcard with credentials (invalid but sometimes implemented)
+            if acao == "*" and acac == "true":
+                self._report_cors_misconfig(url, origin, "Wildcard with credentials", acao, acac)
+                return True
+                
+            # Reflected origin with credentials
+            if acao == origin and acac == "true":
+                self._report_cors_misconfig(url, origin, "Reflected origin with credentials", acao, acac)
+                return True
+                
+            # Reflected origin without credentials
+            if acao == origin and acac != "true":
+                self._report_cors_misconfig(url, origin, "Reflected origin", acao, acac)
+                return True
+                
+            # Null origin
+            if acao == "null":
+                self._report_cors_misconfig(url, origin, "Null origin", acao, acac)
+                return True
+                
+        except Exception as e:
+            logger.debug(f"CORS origin test failed for {origin}: {e}")
+            
+        return False
+
+    async def _test_cors_preflight(self, client: httpx.AsyncClient, url: str) -> None:
+        """Test CORS pre-flight requests"""
+        try:
+            response = await self._safe_request(
+                client, "OPTIONS", url,
+                headers={
+                    "Origin": "https://evil.com",
+                    "Access-Control-Request-Method": "POST",
+                    "Access-Control-Request-Headers": "x-custom-header"
+                }
+            )
+            
+            if response and response.status_code == 200:
+                acao = response.headers.get("access-control-allow-origin", "")
+                acac = response.headers.get("access-control-allow-credentials", "").lower()
+                acam = response.headers.get("access-control-allow-methods", "")
+                acah = response.headers.get("access-control-allow-headers", "")
+                
+                if acao == "*" or acao == "https://evil.com":
+                    self._report_cors_misconfig(url, "https://evil.com", "Pre-flight vulnerable", acao, acac)
+                    
+        except Exception as e:
+            logger.debug(f"CORS pre-flight test failed: {e}")
+
+    def _report_cors_misconfig(self, url: str, origin: str, subtype: str, 
+                             acao: str, acac: str) -> None:
+        """Report CORS misconfiguration"""
+        severity = "Critical" if "credentials" in subtype else "High"
+        
+        self.scanner._add_finding({
+            "type": "CORS Misconfiguration",
+            "subtype": subtype,
+            "url": url,
+            "parameter": "CORS",
+            "payload": f"Origin: {origin}",
+            "severity": severity,
+            "confidence": 0.95,
+            "evidence": f"ACAO={acao}, ACAC={acac}",
+            "description": f"CORS misconfiguration allows cross-origin requests from {origin}.",
+        })
+
+    # ── PostMessage Testing ───────────────────────────────────────────────────
+    async def test_postmessage(self, client: httpx.AsyncClient, url: str) -> None:
+        """Test for PostMessage vulnerabilities"""
+        try:
+            response = await self._safe_request(client, "GET", url)
+            if not response:
+                return
+                
+            # Check for PostMessage usage
+            if not self._detect_postmessage_usage(response.text):
+                return
+                
+            self.scanner._add_finding({
+                "type": "PostMessage Vulnerability",
+                "subtype": "Usage Detected",
+                "url": url,
+                "severity": "Low",
+                "confidence": 0.7,
+                "evidence": "PostMessage API usage detected",
+                "description": "PostMessage API detected. Review for proper origin validation.",
+            })
+            
+        except Exception as e:
+            logger.error(f"PostMessage test failed for {url}: {e}")
+
+    def _detect_postmessage_usage(self, html_content: str) -> bool:
+        """Detect PostMessage API usage"""
+        patterns = [
+            r'window\.postMessage\s*\(',
+            r'window\.addEventListener\s*\(["\']message["\']',
+            r'\.onmessage\s*=',
         ]
+        
+        return any(re.search(pattern, html_content, re.IGNORECASE) for pattern in patterns)
 
-        for origin in evil_origins[:2]:
+    # ── Utility Methods ───────────────────────────────────────────────────────
+    def _inject_param(self, url: str, param: str, value: str) -> str:
+        """Inject parameter value into URL"""
+        parsed = urlparse(url)
+        query_dict = parse_qs(parsed.query, keep_blank_values=True)
+        query_dict[param] = [value]
+        new_query = urlencode(query_dict, doseq=True)
+        return urlunparse(parsed._replace(query=new_query))
+
+    async def _safe_request(self, client: httpx.AsyncClient, method: str, url: str, 
+                          **kwargs) -> Optional[httpx.Response]:
+        """Make a safe HTTP request with timeout and error handling"""
+        async with self.rate_limiter:
             try:
-                res = await client.get(
-                    url,
-                    headers={"Origin": origin},
-                    follow_redirects=True,
-                    timeout=15,
-                )
-                if not res:
-                    continue
-
-                acao = res.headers.get("access-control-allow-origin", "")
-                acac = res.headers.get("access-control-allow-credentials", "").lower()
-
-                if acao == "*" and acac == "true":
-                    self.scanner._add_finding({
-                        "type": "CORS Misconfiguration", "subtype": "Wildcard+Credentials",
-                        "url": url, "parameter": "CORS", "payload": f"Origin: {origin}",
-                        "severity": "Critical", "confidence": 1.0,
-                        "evidence": f"ACAO={acao} ACAC={acac}",
-                        "description": "Any origin can make authenticated cross-origin requests.",
-                    })
-                    return
-
-                if acao == origin and acac == "true" and "evil" in origin:
-                    self.scanner._add_finding({
-                        "type": "CORS Misconfiguration", "subtype": "Reflected Origin",
-                        "url": url, "parameter": "CORS", "payload": f"Origin: {origin}",
-                        "severity": "High", "confidence": 0.95,
-                        "evidence": f"Reflected: ACAO={acao}",
-                        "description": "Server mirrors Origin header — all origins allowed with credentials.",
-                    })
-                    return
-
-                if acao == origin and "evil" in origin and acac != "true":
-                    self.scanner._add_finding({
-                        "type": "CORS Misconfiguration", "subtype": "Reflected Origin (No Creds)",
-                        "url": url, "parameter": "CORS", "payload": f"Origin: {origin}",
-                        "severity": "Medium", "confidence": 0.85,
-                        "evidence": f"Reflected: ACAO={acao} (no credentials)",
-                        "description": "Server mirrors Origin header — data readable cross-origin.",
-                    })
-                    return
-            except Exception:
-                continue
-
-    # ── Form XSS ──────────────────────────────────────────────────────────────
-    async def test_form_xss(self, client, form: dict) -> None:
-        url    = form["url"]
-        method = form["method"]
-        base   = dict(form["inputs"])
-
-        for payload in XSS_PAYLOADS[:12]:
-            for mutated in _xss_mutations(payload)[:2]:
-                data = {k: mutated for k in base}
-                if method == "POST":
-                    res = await self.scanner._req(client, "POST", url, data=data, timeout=15)
-                else:
-                    res = await self.scanner._req(client, "GET", url, params=data, timeout=15)
-                if res and mutated in res.text:
-                    self.scanner._add_finding({
-                        "type": "Cross-Site Scripting (XSS)", "subtype": f"Reflected via Form ({method})",
-                        "url": url, "parameter": "form", "payload": mutated,
-                        "severity": "High", "confidence": 0.88,
-                        "evidence": "Payload reflected after form submission",
-                        "description": f"Form at {url} reflects unsanitised input.",
-                    })
-                    return
+                kwargs.setdefault("timeout", self.config["request_timeout"])
+                return await self.scanner._req(client, method, url, **kwargs)
+            except Exception as e:
+                logger.debug(f"Request failed: {method} {url}: {e}")
+                return None
