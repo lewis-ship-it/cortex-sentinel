@@ -1,11 +1,8 @@
-
-
 import asyncio
 import json
 import logging
 import os
 import sqlite3
-import threading
 import time
 import traceback
 import uuid
@@ -41,8 +38,6 @@ API_KEY  = os.getenv("SENTINEL_API_KEY", "test-key-123")
 PORT     = int(os.getenv("PORT",         "8000"))
 
 # ── Optional worker / queue layer ─────────────────────────────────────────────
-# If the full project tree is on PYTHONPATH the real queue is used;
-# otherwise a no-op stub keeps the API running in standalone mode.
 _HAS_QUEUE = False
 try:
     from task_queue.redis_scanner import enqueue_scan as _enqueue
@@ -228,6 +223,11 @@ class _MinimalDB:
             logger.error(f"[DB] update_job: {e}")
             return False
 
+    def get_job_status(self, job_id) -> Optional[str]:
+        """Return just the status string, or None if the job doesn't exist."""
+        job = self.get_job(job_id)
+        return job["status"] if job else None
+
     def list_jobs(self, limit=50) -> List[Dict]:
         try:
             with self._conn() as c:
@@ -293,7 +293,8 @@ class _MinimalDB:
             evidence = n.get("evidence_snippet") or n.get("evidence", "")
             try:
                 conf = max(0.0, min(1.0, float(n.get("confidence", 0.5) or 0.5)))
-            except: conf = 0.5
+            except Exception:
+                conf = 0.5
             rows.append((job_id, str(n.get("type","Unknown")), str(n.get("severity","Medium")),
                          n.get("target_url"), n.get("param"), n.get("payload"), conf, evidence,
                          json.dumps(n.get("metadata")) if n.get("metadata") else None))
@@ -321,8 +322,9 @@ class _MinimalDB:
                 for r in rows:
                     d = dict(r)
                     if d.get("metadata"):
-                        try: d["metadata"] = json.loads(d["metadata"])
-                        except Exception as e:
+                        try:
+                            d["metadata"] = json.loads(d["metadata"])
+                        except Exception:
                             pass
                     d["confidence_score"] = d.get("confidence", 0.5)
                     result.append(d)
@@ -409,7 +411,6 @@ class _MinimalDB:
 
 
 # ── Singleton factory ─────────────────────────────────────────────────────────
-# Prefer the full project DB if it's importable; otherwise use the minimal one.
 
 _db_instance = None
 
@@ -423,7 +424,7 @@ def get_db():
         logger.info("✅  Using full project DatabaseManager")
     except Exception:
         _db_instance = _MinimalDB(DB_PATH)
-        logger.info("ℹ️   Using built-in minimal DB")
+        logger.info("ℹ   Using built-in minimal DB")
     return _db_instance
 
 
@@ -469,25 +470,30 @@ def _rate_ok(key: str, limit: int = 30) -> bool:
 
 def _norm_logs(raw: List) -> List[Dict]:
     out = []
-    for e in raw:
-        if isinstance(e, str):
+    for entry in raw:
+        # FIX: variable shadowing bug — the loop variable was named `e` and the
+        # except clause also used `e` as both the exception AND the reassigned
+        # dict. On json.loads failure, `e` held the Exception object, which was
+        # then passed to `e.get(...)` below, causing an AttributeError.
+        # Renamed loop variable to `entry` and exception to `exc` throughout.
+        if isinstance(entry, str):
             try:
-                e = json.loads(e)
-            except Exception as e:
-                e = {"message": e}
-        if not isinstance(e, dict):
-            e = {"message": str(e)}
-        ts = e.get("time") or e.get("timestamp") or e.get("created_at","")
+                entry = json.loads(entry)
+            except Exception as exc:
+                entry = {"message": str(exc)}
+        if not isinstance(entry, dict):
+            entry = {"message": str(entry)}
+        ts = entry.get("time") or entry.get("timestamp") or entry.get("created_at","")
         if ts and "T" in ts:
             ts = ts.split("T")[1][:8]
-        comp = e.get("component") or e.get("tier") or "system"
+        comp = entry.get("component") or entry.get("tier") or "system"
         out.append({
-            "message":   e.get("message",""),
+            "message":   entry.get("message",""),
             "time":      ts,
             "timestamp": ts,
-            "level":     e.get("level","INFO"),
+            "level":     entry.get("level","INFO"),
             "component": comp,
-            "stage":     (e.get("stage") or comp).upper(),
+            "stage":     (entry.get("stage") or comp).upper(),
         })
     return out
 
@@ -545,7 +551,6 @@ def _load_dashboard() -> str:
                 return p.read_text(encoding="utf-8")
             except Exception:
                 pass
-    # Inline fallback
     return """<!DOCTYPE html>
 <html>
 <head><title>Cortex Sentinel</title>
@@ -577,7 +582,6 @@ directory as <code>main.py</code> and reload this page.</p>
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db = get_db()
-    # init works for both full and minimal DB
     (getattr(db,"init_db",None) or getattr(db,"init",lambda:None))()
     if hasattr(db, "reset_queues"):
         db.reset_queues()
@@ -649,7 +653,6 @@ async def _global_err(request: Request, exc: Exception):
 
 @app.get("/", include_in_schema=False)
 async def dashboard():
-    """Serve the dashboard. Reads index.html from disk on every request."""
     return HTMLResponse(_load_dashboard())
 
 
@@ -695,9 +698,6 @@ async def start_scan(req: ScanIn, key: str = Depends(verify_key)):
         db.add_log(job_id, f"[API] Scan queued for {req.url}",
                    component="api", tier=req.tier)
 
-    # FIX: push to CRAWL_QUEUE first (correct pipeline start).
-    # Previously enqueue_scan() pushed directly to scan_queue, bypassing crawling entirely.
-    # Pipeline order: auth → crawl → scan → exploit → aggregate → [memory+scoring] → report
     _crawl_payload = {
         "job_id":     job_id,
         "url":        req.url,
@@ -706,12 +706,10 @@ async def start_scan(req: ScanIn, key: str = Depends(verify_key)):
         "auth":       req.auth,
     }
     if req.auth:
-        # Auth step first: auth_worker will call on_crawl_complete once session is established
         push("auth_queue", _crawl_payload)
         logger.info(f"[API] Auth→Crawl pipeline started  job={job_id}  url={req.url[:70]}")
     else:
-        # No auth: go straight to crawl
-        enqueue_scan(_crawl_payload)  # ✅ USE THE PROPER ENQUEUE FUNCTION
+        enqueue_scan(_crawl_payload)
         logger.info(f"[API] Scan job queued  job={job_id}  url={req.url[:70]}")
     return ScanOut(job_id=job_id, type="web_scan")
 
@@ -837,6 +835,3 @@ def admin_stats(key: str = Depends(verify_key)):
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=PORT,
                 reload=True, log_level="info")
-
-
-
